@@ -1,0 +1,653 @@
+import XCTest
+import UserNotifications
+import UIKit
+
+final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
+    private var server: JSONRPCServer?
+    private var app: XCUIApplication!
+    private var actionHandler: ActionHandler?
+    private var pendingAuthCompletions: [String: (Bool) -> Void] = [:]
+    private let authLock = NSLock()
+
+    static let authCategoryID = "AUTH_REQUEST"
+    static let allowActionID = "AUTH_ALLOW"
+    static let denyActionID = "AUTH_DENY"
+
+    static let serverReadyCategoryID = "SERVER_READY"
+    static let serverRemoteCategoryID = "SERVER_REMOTE"
+    static let serverStoppedCategoryID = "SERVER_STOPPED"
+    static let enableRemoteActionID = "ENABLE_REMOTE"
+    static let disableRemoteActionID = "DISABLE_REMOTE"
+    static let stopServerActionID = "STOP_SERVER"
+    static let copyLogsActionID = "COPY_LOGS"
+
+    static let logBuffer = LogBuffer(capacity: 1000)
+
+    /// Persisted preference key. Defaults to false (localhost-only) on a fresh install.
+    static let allowRemoteAccessKey = "allowRemoteAccess"
+
+    private var remoteAccessEnabled = false
+    private var keepRunning = true
+
+    /// Reads the persisted remote-access preference. Absent key → false (local only).
+    private static var persistedRemoteAccess: Bool {
+        get { UserDefaults.standard.bool(forKey: allowRemoteAccessKey) }
+        set { UserDefaults.standard.set(newValue, forKey: allowRemoteAccessKey) }
+    }
+
+    /// Persisted listen port. Absent key → 8200.
+    private static var persistedPort: UInt16 {
+        get {
+            let v = UserDefaults.standard.integer(forKey: "serverPort")
+            return (v > 0 && v <= 65535) ? UInt16(v) : 8200
+        }
+        set { UserDefaults.standard.set(Int(newValue), forKey: "serverPort") }
+    }
+
+    override func setUpWithError() throws {
+        continueAfterFailure = true
+        app = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        app.activate()
+
+        URLSchemeHandler.installURLHandler()
+        setupNotifications()
+    }
+
+    override func tearDownWithError() throws {
+        server?.stop()
+        server = nil
+        actionHandler = nil
+    }
+
+    func testStartServer() throws {
+        actionHandler = ActionHandler(app: app)
+
+        // Restore persisted preferences (fresh install → local only, port 8200)
+        remoteAccessEnabled = Self.persistedRemoteAccess
+        let port = Self.persistedPort
+        server = JSONRPCServer(port: port, localOnly: !remoteAccessEnabled)
+
+        // Wire up auth: send notification instead of auto-approve
+        AuthManager.shared.setAutoApprove(false)
+        AuthManager.shared.delegate = self
+
+        if let s = server { configureServerCallbacks(s) }
+
+        do {
+            try server?.start()
+            if remoteAccessEnabled {
+                let address = getDeviceAddress()
+                Self.logBuffer.append("🌐 Server started on \(address):8200 (remote access)")
+                sendNotification(
+                    title: "🟢 iCTRL Server Ready",
+                    body: "Running on \(address):8200 (remote access)\nLong press to Disable Remote or Stop Server",
+                    category: Self.serverRemoteCategoryID
+                )
+            } else {
+                Self.logBuffer.append("🔒 Server started on 127.0.0.1:8200 (local only)")
+                sendNotification(
+                    title: "🟢 iCTRL Server Ready",
+                    body: "Running on 127.0.0.1:8200 (local only)\nLong press for Remote Access or Stop Server",
+                    category: Self.serverReadyCategoryID
+                )
+            }
+        } catch {
+            Self.logBuffer.append("🔴 Failed to start server: \(error)")
+            sendNotification(
+                title: "🔴 iCTRL Server Failed",
+                body: error.localizedDescription
+            )
+        }
+
+        keepRunning = true
+        wireServerStateChange()
+
+        // If launched via ictrl://start?callback=..., jump back to the caller now.
+        handlePendingCallbackIfAny()
+
+        let runLoop = RunLoop.current
+        while keepRunning {
+            autoreleasepool {
+                runLoop.run(until: Date(timeIntervalSinceNow: 1.0))
+                // A URL may also arrive after startup (app already running).
+                handlePendingCallbackIfAny()
+            }
+        }
+    }
+
+    // MARK: - URL Scheme Callback
+
+    /// If a pending ictrl:// URL carries a callback, open it with the server status.
+    private func handlePendingCallbackIfAny() {
+        guard let url = URLSchemeHandler.shared.takePendingURL() else { return }
+
+        let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let items = comps?.queryItems ?? []
+
+        // Only the "start" host triggers a callback jump; others are ignored.
+        let host = url.host?.lowercased()
+        guard host == "start" || host == nil else {
+            Self.logBuffer.append("🔗 Ignored ictrl:// host: \(host ?? "")")
+            return
+        }
+
+        guard let callbackRaw = items.first(where: { $0.name == "callback" })?.value,
+              let callbackURL = URL(string: callbackRaw) else {
+            Self.logBuffer.append("🔗 ictrl://start with no callback — server is running")
+            return
+        }
+
+        let address = remoteAccessEnabled ? "\(getDeviceAddress()):\(server?.port ?? 8200)"
+                                          : "127.0.0.1:\(server?.port ?? 8200)"
+        let status = (server?.isRunning ?? false) ? "ready" : "failed"
+
+        // Append status + address to the callback URL.
+        var cb = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)
+        var q = cb?.queryItems ?? []
+        q.append(URLQueryItem(name: "status", value: status))
+        q.append(URLQueryItem(name: "address", value: address))
+        cb?.queryItems = q
+
+        guard let finalURL = cb?.url else {
+            Self.logBuffer.append("🔗 Failed to build callback URL")
+            return
+        }
+
+        Self.logBuffer.append("🔙 Callback → \(callbackURL.scheme ?? "")://…?status=\(status)")
+        DispatchQueue.main.async {
+            UIApplication.shared.open(finalURL, options: [:]) { ok in
+                Self.logBuffer.append(ok ? "🔙 Callback opened" : "🔙 Callback open failed")
+            }
+        }
+    }
+
+    // MARK: - Notifications Setup
+
+    private func setupNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+
+        // Register auth category with Allow/Deny actions
+        let allowAction = UNNotificationAction(
+            identifier: Self.allowActionID,
+            title: "Allow",
+            options: [.authenticationRequired]
+        )
+        let denyAction = UNNotificationAction(
+            identifier: Self.denyActionID,
+            title: "Deny",
+            options: [.destructive]
+        )
+        let authCategory = UNNotificationCategory(
+            identifier: Self.authCategoryID,
+            actions: [allowAction, denyAction],
+            intentIdentifiers: [],
+            options: []
+        )
+
+        // Register server-ready category with actions
+        let enableRemoteAction = UNNotificationAction(
+            identifier: Self.enableRemoteActionID,
+            title: "Enable Remote Access",
+            options: [.authenticationRequired]
+        )
+        let stopServerAction = UNNotificationAction(
+            identifier: Self.stopServerActionID,
+            title: "Stop Server",
+            options: [.destructive, .authenticationRequired]
+        )
+        let serverReadyCategory = UNNotificationCategory(
+            identifier: Self.serverReadyCategoryID,
+            actions: [enableRemoteAction, stopServerAction],
+            intentIdentifiers: [],
+            options: []
+        )
+
+        // Remote-enabled category: Disable Remote + Stop
+        let disableRemoteAction = UNNotificationAction(
+            identifier: Self.disableRemoteActionID,
+            title: "Disable Remote Access",
+            options: [.authenticationRequired]
+        )
+        let serverRemoteCategory = UNNotificationCategory(
+            identifier: Self.serverRemoteCategoryID,
+            actions: [disableRemoteAction, stopServerAction],
+            intentIdentifiers: [],
+            options: []
+        )
+
+        // Stopped category: Copy Logs
+        let copyLogsAction = UNNotificationAction(
+            identifier: Self.copyLogsActionID,
+            title: "Copy Logs",
+            options: []
+        )
+        let serverStoppedCategory = UNNotificationCategory(
+            identifier: Self.serverStoppedCategoryID,
+            actions: [copyLogsAction],
+            intentIdentifiers: [],
+            options: []
+        )
+
+        center.setNotificationCategories([authCategory, serverReadyCategory, serverRemoteCategory, serverStoppedCategory])
+
+        // Request permission
+        let semaphore = DispatchSemaphore(value: 0)
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+            print(granted ? "🔔 Notifications enabled" : "🔕 Notifications denied")
+            semaphore.signal()
+        }
+        semaphore.wait()
+    }
+
+    // MARK: - UNUserNotificationCenterDelegate
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let actionID = response.actionIdentifier
+        let requestID = response.notification.request.identifier
+
+        // Handle "Copy Logs"
+        if actionID == Self.copyLogsActionID {
+            let logs = Self.logBuffer.dump()
+            UIPasteboard.general.string = logs
+            print("📋 Copied \(Self.logBuffer.count) log entries to clipboard")
+            completionHandler()
+            return
+        }
+
+        // Handle "Disable Remote Access"
+        if actionID == Self.disableRemoteActionID {
+            print("🔒 Remote access disabled via notification")
+            disableRemoteAccess()
+            completionHandler()
+            return
+        }
+
+        // Handle "Stop Server"
+        if actionID == Self.stopServerActionID {
+            print("🛑 Server stopped via notification")
+            server?.stop()
+            completionHandler()
+            return
+        }
+
+        // Handle "Enable Remote Access" from server-ready notification
+        if actionID == Self.enableRemoteActionID {
+            print("🌐 Remote access enabled via notification")
+            enableRemoteAccess()
+            completionHandler()
+            return
+        }
+
+        // Handle auth request responses
+        guard requestID.hasPrefix("auth-") else {
+            completionHandler()
+            return
+        }
+
+        authLock.lock()
+        let authCompletion = pendingAuthCompletions.removeValue(forKey: requestID)
+        authLock.unlock()
+
+        switch actionID {
+        case Self.allowActionID:
+            Self.logBuffer.append("✅ Auth approved")
+            authCompletion?(true)
+        case Self.denyActionID:
+            Self.logBuffer.append("❌ Auth denied")
+            authCompletion?(false)
+        case UNNotificationDefaultActionIdentifier:
+            Self.logBuffer.append("✅ Auth approved (tap)")
+            authCompletion?(true)
+        case UNNotificationDismissActionIdentifier:
+            Self.logBuffer.append("❌ Auth denied (dismiss)")
+            authCompletion?(false)
+        default:
+            authCompletion?(false)
+        }
+
+        completionHandler()
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    // MARK: - Helpers
+
+    private func wireServerStateChange() {
+        server?.onStateChange = { [weak self] running in
+            if !running {
+                Self.logBuffer.append("Server stopped")
+                self?.keepRunning = false
+                self?.sendNotification(
+                    title: "⏹️ iCTRL Server Stopped",
+                    body: "The automation server has stopped.\nLong press to Copy Logs",
+                    category: Self.serverStoppedCategoryID
+                )
+            }
+        }
+    }
+
+    /// Serial queue for RPC execution — OFF the main thread so a slow/blocking
+    /// XCUITest call can't freeze the network listener (which would drop the whole
+    /// service). Serial so actions still run one-at-a-time in order.
+    private let rpcQueue = DispatchQueue(label: "com.openminis.ictrl.rpc")
+
+    /// Hard ceiling for a single RPC. With quiescence disabled + fast defaults,
+    /// real actions finish in well under a second; anything approaching this is a
+    /// hang. We report a timeout to the client but the work continues in the
+    /// background (XCUITest calls can't be force-cancelled) — the next request
+    /// still runs on the serial queue once the stuck one returns.
+    private static let rpcTimeout: TimeInterval = 20
+
+    /// Wire RPC dispatch + public logs onto a server instance.
+    private func configureServerCallbacks(_ srv: JSONRPCServer) {
+        srv.onRPCRequest = { [weak self] method, params, completion in
+            guard let self = self else {
+                completion(nil, .internalError)
+                return
+            }
+
+            // Run the work on the serial RPC queue with a watchdog timeout so a
+            // hung call reports back to the client instead of stalling forever.
+            let done = DispatchSemaphore(value: 0)
+            var out: ([String: JSONValue]?, JSONRPCError?)? = nil
+            var replied = false
+            let replyLock = NSLock()
+
+            func replyOnce(_ result: ([String: JSONValue]?, JSONRPCError?)) {
+                replyLock.lock()
+                let first = !replied
+                replied = true
+                replyLock.unlock()
+                if first { completion(result.0, result.1) }
+            }
+
+            self.rpcQueue.async {
+                let start = ProcessInfo.processInfo.systemUptime
+                let result: ([String: JSONValue]?, JSONRPCError?)
+                if method == "config" {
+                    result = self.handleConfig(params)
+                } else if let handler = self.actionHandler {
+                    result = handler.dispatch(method: method, params: params)
+                } else {
+                    result = (nil, .internalError)
+                }
+                let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000
+                Self.logBuffer.recordTiming(method: method, ms: ms, ok: result.1 == nil)
+                if let err = result.1 { Self.logBuffer.append("← ERR \(method): \(err.message)") }
+                out = result
+                done.signal()
+                replyOnce(result)  // may be a no-op if the watchdog already replied
+            }
+
+            // Watchdog: if the work doesn't finish in time, tell the client now.
+            DispatchQueue.global().async {
+                if done.wait(timeout: .now() + Self.rpcTimeout) == .timedOut {
+                    Self.logBuffer.append("⏱ TIMEOUT \(method) (>\(Int(Self.rpcTimeout))s) — still running in background")
+                    replyOnce((nil, .serverError(
+                        "\(method) exceeded \(Int(Self.rpcTimeout))s and may still be running on the device. " +
+                        "Do NOT blindly retry — check GET /logs for a '✓ \(method)' entry first; the action may have already succeeded."
+                    )))
+                }
+                _ = out  // keep capture alive
+            }
+        }
+        srv.onLogsRequest = {
+            let logs = Self.logBuffer.dumpRedacted()
+            let timing = Self.logBuffer.timingSummary()
+            return logs + "\n\n=== Timing summary (ms) ===\n" + timing
+        }
+    }
+
+    // MARK: - Config RPC
+
+    /// Read (no params) or update basic settings.
+    /// Params: {allow_remote_access?: bool, listen_port?: int}
+    /// Returns current effective config. Changing settings restarts the server.
+    private func handleConfig(_ params: [String: JSONValue]?) -> ([String: JSONValue]?, JSONRPCError?) {
+        var restartNeeded = false
+        var newPort = UInt16(server?.port ?? 8200)
+        var clearedSessions = 0
+        var revokedSession: String?
+
+        // Revoke a specific session by id.
+        if let sid = params?["revoke_session_id"]?.stringValue {
+            let existed = AuthManager.shared.activeSessions.contains { $0.id == sid }
+            AuthManager.shared.revokeSession(id: sid)
+            revokedSession = existed ? sid : nil
+            Self.logBuffer.append(existed ? "🧹 Revoked session \(sid)" : "⚠️ revoke_session_id not found")
+        }
+
+        // Clear all authorized sessions (revoke every token) if requested.
+        if params?["clear_sessions"]?.boolValue == true {
+            clearedSessions = AuthManager.shared.activeSessions.count
+            AuthManager.shared.revokeAll()
+            Self.logBuffer.append("🧹 Cleared all authorized sessions (\(clearedSessions))")
+        }
+
+        if let remote = params?["allow_remote_access"]?.boolValue {
+            if remote != remoteAccessEnabled {
+                remoteAccessEnabled = remote
+                Self.persistedRemoteAccess = remote
+                restartNeeded = true
+            }
+        }
+
+        if let portValue = params?["listen_port"]?.intValue {
+            guard portValue > 0, portValue <= 65535 else {
+                return (nil, JSONRPCError(code: -32602, message: "listen_port must be 1..65535", data: nil))
+            }
+            if UInt16(portValue) != newPort {
+                newPort = UInt16(portValue)
+                UserDefaults.standard.set(portValue, forKey: "serverPort")
+                restartNeeded = true
+            }
+        }
+
+        if restartNeeded {
+            server?.onStateChange = nil
+            server?.stop()
+            let newServer = JSONRPCServer(port: newPort, localOnly: !remoteAccessEnabled)
+            wireNewServer(newServer)
+            do {
+                try newServer.start()
+                Self.logBuffer.append("⚙️ Config applied, server restarted on port \(newPort)")
+            } catch {
+                Self.logBuffer.append("🔴 Config restart failed: \(error)")
+                return (nil, .serverError("Failed to restart server with new config: \(error.localizedDescription)"))
+            }
+        }
+
+        let address = remoteAccessEnabled ? getDeviceAddress() : "127.0.0.1"
+        let sessions = AuthManager.shared.activeSessions
+        let iso = ISO8601DateFormatter()
+
+        // Session list with the token masked (only a short prefix shown).
+        let sessionList: [JSONValue] = sessions.map { s in
+            let masked = String(s.token.prefix(8)) + "…"
+            return .object([
+                "session_id": .string(s.id),
+                "client_name": .string(s.clientName),
+                "token_prefix": .string(masked),
+                "granted_at": .string(iso.string(from: s.grantedAt)),
+                "last_active_at": .string(iso.string(from: s.lastActiveAt)),
+                "expires_at": .string(iso.string(from: s.expiresAt)),
+            ])
+        }
+
+        var result: [String: JSONValue] = [
+            "allow_remote_access": .bool(remoteAccessEnabled),
+            "listen_port": .int(Int(newPort)),
+            "address": .string("\(address):\(newPort)"),
+            "restarted": .bool(restartNeeded),
+            "device_name": .string(UIDevice.current.name),
+            "active_sessions": .int(sessions.count),
+            "sessions": .array(sessionList),
+            "cleared_sessions": .int(clearedSessions),
+        ]
+        if let revoked = revokedSession {
+            result["revoked_session_id"] = .string(revoked)
+        }
+
+        // Per-action timing stats (ms).
+        let timing: [JSONValue] = Self.logBuffer.timingStats().map { s in
+            .object([
+                "method": .string(s["method"] as? String ?? ""),
+                "count": .int(s["count"] as? Int ?? 0),
+                "avg_ms": .int(s["avg_ms"] as? Int ?? 0),
+                "min_ms": .int(s["min_ms"] as? Int ?? 0),
+                "max_ms": .int(s["max_ms"] as? Int ?? 0),
+            ])
+        }
+        result["timing"] = .array(timing)
+
+        return (result, nil)
+    }
+
+    private func wireNewServer(_ newServer: JSONRPCServer) {
+        configureServerCallbacks(newServer)
+        self.server = newServer
+        wireServerStateChange()
+    }
+
+    private func sendNotification(title: String, body: String, category: String? = nil) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        if let category = category {
+            content.categoryIdentifier = category
+        }
+
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false)
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    private func enableRemoteAccess() {
+        guard !remoteAccessEnabled else { return }
+        server?.onStateChange = nil
+        server?.stop()
+        remoteAccessEnabled = true
+        Self.persistedRemoteAccess = true  // remember for next launch
+
+        let newServer = JSONRPCServer(port: 8200, localOnly: false)
+        wireNewServer(newServer)
+
+        do {
+            try newServer.start()
+            let address = getDeviceAddress()
+            Self.logBuffer.append("🌐 Remote access enabled on \(address):8200")
+            sendNotification(
+                title: "🌐 Remote Access Enabled",
+                body: "Now accessible at \(address):8200\nLong press to Disable or Stop Server",
+                category: Self.serverRemoteCategoryID
+            )
+        } catch {
+            Self.logBuffer.append("🔴 Failed to enable remote access: \(error)")
+        }
+    }
+
+    private func disableRemoteAccess() {
+        guard remoteAccessEnabled else { return }
+        server?.onStateChange = nil
+        server?.stop()
+        remoteAccessEnabled = false
+        Self.persistedRemoteAccess = false  // remember for next launch
+
+        let newServer = JSONRPCServer(port: 8200, localOnly: true)
+        wireNewServer(newServer)
+
+        do {
+            try newServer.start()
+            Self.logBuffer.append("🔒 Remote access disabled, local only")
+            sendNotification(
+                title: "🔒 Remote Access Disabled",
+                body: "Now local only at 127.0.0.1:8200\nLong press for Remote Access or Stop Server",
+                category: Self.serverReadyCategoryID
+            )
+        } catch {
+            Self.logBuffer.append("🔴 Failed to disable remote access: \(error)")
+        }
+    }
+
+    private func sendAuthNotification(clientName: String, requestID: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "🔐 Authorization Request"
+        content.body = "\"\(clientName)\" wants to control this device.\nLong press to Allow or Deny"
+        content.sound = .default
+        content.categoryIdentifier = Self.authCategoryID
+
+        let request = UNNotificationRequest(
+            identifier: requestID,
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.1, repeats: false)
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    private func getDeviceAddress() -> String {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return "127.0.0.1" }
+        defer { freeifaddrs(ifaddr) }
+
+        // Prefer en0 (Wi-Fi), fall back to any non-loopback IPv4
+        var wifiAddr: String?
+        var fallbackAddr: String?
+
+        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let interface = ptr.pointee
+            guard interface.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                        &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+            let addr = String(cString: hostname)
+
+            guard addr != "127.0.0.1" else { continue }
+
+            let name = String(cString: interface.ifa_name)
+            if name == "en0" {
+                wifiAddr = addr
+            } else if name.hasPrefix("en") || name.hasPrefix("pdp_ip") || name.hasPrefix("bridge") {
+                fallbackAddr = fallbackAddr ?? addr
+            }
+        }
+
+        return wifiAddr ?? fallbackAddr ?? "127.0.0.1"
+    }
+}
+
+// MARK: - AuthManagerDelegate
+
+extension iCTRLUITests: AuthManagerDelegate {
+    func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String, completion: @escaping (Bool) -> Void) {
+        let requestID = "auth-\(UUID().uuidString)"
+
+        authLock.lock()
+        pendingAuthCompletions[requestID] = completion
+        authLock.unlock()
+
+        Self.logBuffer.append("🔐 Auth request from \"\(clientName)\"")
+        sendAuthNotification(clientName: clientName, requestID: requestID)
+    }
+}
+
+extension String {
+    static func * (lhs: String, rhs: Int) -> String {
+        String(repeating: lhs, count: rhs)
+    }
+}

@@ -1,0 +1,456 @@
+import Foundation
+
+struct RPCParamDef: Encodable {
+    let name: String
+    let type: String
+    let required: Bool
+    let description: String
+}
+
+struct RPCMethodDef: Encodable {
+    let name: String
+    let description: String
+    let params: [RPCParamDef]
+    let returns: String
+}
+
+struct RPCMethodRegistry {
+    static let methods: [RPCMethodDef] = [
+        RPCMethodDef(
+            name: "config",
+            description: "Read or update server settings and manage authorized sessions. With no params: returns current config plus the list of authorized sessions (client name, masked token prefix, granted/expiry times). Pass allow_remote_access and/or listen_port to change settings (persisted; server restarts, dropping the connection — reconnect at the returned address). Pass revoke_session_id to remove one session, or clear_sessions=true to revoke ALL tokens (including your own).",
+            params: [
+                RPCParamDef(name: "allow_remote_access", type: "boolean", required: false, description: "true = listen on all interfaces (LAN reachable); false = 127.0.0.1 only"),
+                RPCParamDef(name: "listen_port", type: "number", required: false, description: "TCP port to listen on (1..65535, default 8200)"),
+                RPCParamDef(name: "revoke_session_id", type: "string", required: false, description: "session_id of a single authorization to revoke"),
+                RPCParamDef(name: "clear_sessions", type: "boolean", required: false, description: "true = revoke all authorized tokens immediately"),
+            ],
+            returns: "{allow_remote_access, listen_port, address, restarted, device_name, active_sessions, sessions:[{session_id, client_name, token_prefix, granted_at, last_active_at, expires_at}], cleared_sessions}"
+        ),
+        RPCMethodDef(
+            name: "device_info",
+            description: "Get device name, model, OS version, and — importantly — the coordinate space: point size (used by tap/swipe), pixel size (of screenshots), and scale. CALL THIS FIRST before any coordinate-based action.",
+            params: [],
+            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, and a 'hint' string explaining the conversion."
+        ),
+        RPCMethodDef(
+            name: "page_source",
+            description: "PREFERRED way to inspect the current UI: returns the accessibility/view hierarchy as text (element types, labels, identifiers, and frames in POINTS). Parse this to locate elements and tap their frame center. On rich pages the full tree can be large and the FIRST call (right after an app launches) can be slow while the UI settles — scope it: pass filter to return only matching nodes (plus their ancestors), max_depth for just the top structure, or max_elements to cap the count. A hard cap of 500 nodes applies by default; if truncated, narrow with filter/max_depth. Use screenshot only when an element is missing here or you need visual detail.",
+            params: [
+                RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Inspect this app's tree; omit for the detected foreground app"),
+                RPCParamDef(name: "filter", type: "object", required: false, description: "Return only matching nodes + their ancestors. {label:'待收货'} (label/value substring, case-insensitive), {type:'button'} (element type), or {text:'…'} (label+value+id substring). e.g. filter:{label:\"待收货\"}"),
+                RPCParamDef(name: "max_depth", type: "number", required: false, description: "Max tree depth to traverse (e.g. 3-4 for top-level structure only)"),
+                RPCParamDef(name: "max_elements", type: "number", required: false, description: "Max nodes to return (default 500, hard cap 2000). If hit, response is truncated:true"),
+            ],
+            returns: "{source: text tree, truncated, total_returned, filtered?, coordinate_space:'points', hint}"
+        ),
+        RPCMethodDef(
+            name: "screenshot",
+            description: "Capture a screenshot as base64 PNG. SECOND CHOICE after page_source — use when you need visual detail or an element is absent from the view tree. Image is in PIXELS; tap coordinates are in POINTS. Optional 'scale' controls output resolution (default 2, max 3, e.g. 1, 0.5) — the server resizes before sending to cut size/transfer time. Response includes pixel_width/pixel_height, point_width/point_height, scale, requested_scale, and a hint.",
+            params: [
+                RPCParamDef(name: "scale", type: "number", required: false, description: "Output pixels-per-point (default 2, max 3; smaller = faster/less detail, e.g. 1 or 0.5)"),
+            ],
+            returns: "Object: {data: base64 PNG, pixel_width, pixel_height, point_width, point_height, scale, hint}"
+        ),
+        RPCMethodDef(
+            name: "tap",
+            description: "Tap either by a stable 'ref' (from find_element/scroll_to_element — RECOMMENDED, re-resolves the live element and won't drift) OR by x,y coordinates in POINTS. If reading from a screenshot, convert: point = pixel / scale. Out-of-range coords return the valid range. Bottom tab bars sit just above the home-indicator safe area.",
+            params: [
+                RPCParamDef(name: "ref", type: "string", required: false, description: "Element ref from find_element/scroll_to_element (preferred over x,y)"),
+                RPCParamDef(name: "x", type: "number", required: false, description: "X in points (0..point_width) — required if no ref"),
+                RPCParamDef(name: "y", type: "number", required: false, description: "Y in points (0..point_height) — required if no ref"),
+                RPCParamDef(name: "fast", type: "boolean", required: false, description: "Use fast mode (bypasses quiescence waiting)"),
+            ],
+            returns: "{message, screen:{coordinate_space, point_width, point_height, scale}}"
+        ),
+        RPCMethodDef(
+            name: "double_tap",
+            description: "Double tap by a 'ref' (from find_element/scroll_to_element — preferred) OR by x,y in POINTS.",
+            params: [
+                RPCParamDef(name: "ref", type: "string", required: false, description: "Element ref (preferred over x,y)"),
+                RPCParamDef(name: "x", type: "number", required: false, description: "X in points — required if no ref"),
+                RPCParamDef(name: "y", type: "number", required: false, description: "Y in points — required if no ref"),
+            ],
+            returns: "{message, screen?}"
+        ),
+        RPCMethodDef(
+            name: "long_press",
+            description: "Long press by a 'ref' (from find_element/scroll_to_element — preferred) OR by x,y in POINTS.",
+            params: [
+                RPCParamDef(name: "ref", type: "string", required: false, description: "Element ref (preferred over x,y)"),
+                RPCParamDef(name: "x", type: "number", required: false, description: "X in points — required if no ref"),
+                RPCParamDef(name: "y", type: "number", required: false, description: "Y in points — required if no ref"),
+                RPCParamDef(name: "duration", type: "number", required: false, description: "Press duration in seconds (default: 2.0)"),
+            ],
+            returns: "{message, screen?}"
+        ),
+        RPCMethodDef(
+            name: "swipe",
+            description: "Swipe/scroll. x,y are OPTIONAL — default start is the screen center, so {\"direction\":\"up\"} scrolls the middle of the screen. 'distance' is the finger travel in points (default 100). 'velocity' tunes how far the CONTENT scrolls: 'fast'/'flick' adds iOS momentum (scrolls far beyond finger travel — best for jumping through long pages), 'normal' (default), 'slow'/'precise' = exact drag with no momentum. To reach a known element in one call, prefer scroll_to_element.",
+            params: [
+                RPCParamDef(name: "x", type: "number", required: false, description: "Start X (default: screen center)"),
+                RPCParamDef(name: "y", type: "number", required: false, description: "Start Y (default: screen center)"),
+                RPCParamDef(name: "direction", type: "string", required: false, description: "Finger direction: up/down/left/right (default: up). 'up' reveals content below."),
+                RPCParamDef(name: "distance", type: "number", required: false, description: "Finger travel in points (default: 100)"),
+                RPCParamDef(name: "velocity", type: "string", required: false, description: "fast/flick (momentum, far), normal (default), slow/precise (exact, no momentum)"),
+                RPCParamDef(name: "fast", type: "boolean", required: false, description: "Use synthesized fast path (default true); set false for legacy XCUITest swipe"),
+            ],
+            returns: "{message, from:{x,y}, velocity, note}"
+        ),
+        RPCMethodDef(
+            name: "scroll_to_element",
+            description: "Auto-scroll until an element becomes visible, then return a stable 'ref' plus its tap point. Matching is EXACT by default (label == element_id, or accessibility id) to avoid hitting the wrong element — pass match:'contains' for a loose substring match. Narrow further with element_type. IMPORTANT: element_id must be the ACCESSIBILITY LABEL (from page_source), which may differ from on-screen text (e.g. a button showing '添加至购物袋' may have label '添加'). Prefer this over manual swipe loops.",
+            params: [
+                RPCParamDef(name: "element_id", type: "string", required: true, description: "Exact accessibility label or identifier (see page_source)"),
+                RPCParamDef(name: "match", type: "string", required: false, description: "'exact' (default) or 'contains' (substring)"),
+                RPCParamDef(name: "element_type", type: "string", required: false, description: "Restrict to a type: button/textfield/label/image/cell/switch/icon"),
+                RPCParamDef(name: "direction", type: "string", required: false, description: "Finger direction to scroll: up/down/left/right (default: up = reveal below)"),
+                RPCParamDef(name: "distance", type: "number", required: false, description: "Max swipe attempts (default: 12). Each swipe is ~40% of the screen (small, to avoid scrolling past short targets). Stops early if the end of the content is reached."),
+                RPCParamDef(name: "bundle_id", type: "string", required: false, description: "App to search; default = detected foreground app"),
+            ],
+            returns: "{found, swipes, ref, x, y, center_x, center_y, label, hint} — then tap by {ref}. Label matching ignores invisible formatting characters."
+        ),
+        RPCMethodDef(
+            name: "scroll",
+            description: "DEPRECATED — use 'swipe' instead (it supports velocity/momentum, custom distance, and start point), or 'scroll_to_element' to reach a specific element. This coarse full-screen scroll is kept only for compatibility.",
+            params: [
+                RPCParamDef(name: "direction", type: "string", required: false, description: "Direction: up/down/left/right (default: down)"),
+            ],
+            returns: "{message}"
+        ),
+        RPCMethodDef(
+            name: "type",
+            description: "Type text via keyboard (an input field must have focus). Set submit:true to append a Return/Search keystroke that fires the field's action (search/go/send) — synthesized text alone often won't make the keyboard's Search button actionable, so submit:true is the reliable way to run a search after typing.",
+            params: [
+                RPCParamDef(name: "text", type: "string", required: true, description: "Text to type"),
+                RPCParamDef(name: "submit", type: "boolean", required: false, description: "Append Return/Search to submit the field (recommended for search boxes)"),
+                RPCParamDef(name: "x", type: "number", required: false, description: "Tap X to focus before typing"),
+                RPCParamDef(name: "y", type: "number", required: false, description: "Tap Y to focus before typing"),
+                RPCParamDef(name: "fast", type: "boolean", required: false, description: "Use fast mode"),
+            ],
+            returns: "{message}"
+        ),
+        RPCMethodDef(
+            name: "home",
+            description: "Press the home button",
+            params: [],
+            returns: "{message}"
+        ),
+        RPCMethodDef(
+            name: "lock",
+            description: "Lock the screen",
+            params: [],
+            returns: "{message}"
+        ),
+        RPCMethodDef(
+            name: "unlock",
+            description: "Unlock the screen (may fail if passcode is set)",
+            params: [],
+            returns: "{message}"
+        ),
+        RPCMethodDef(
+            name: "is_locked",
+            description: "Check if the screen is locked",
+            params: [],
+            returns: "Lock state boolean"
+        ),
+        RPCMethodDef(
+            name: "list_apps",
+            description: "List installed apps with their bundle_id and name. Use this to find the correct bundle_id before launch_app (don't guess). Pass text to filter by name or bundle substring (case-insensitive), e.g. {\"text\":\"大麦\"}. By default only user apps are returned; pass element_type:\"all\" to include system apps.",
+            params: [
+                RPCParamDef(name: "text", type: "string", required: false, description: "Filter by name/bundle_id substring"),
+                RPCParamDef(name: "element_type", type: "string", required: false, description: "'all' to include system apps (default: user apps only)"),
+            ],
+            returns: "{count, apps:[{bundle_id, name}], hint}"
+        ),
+        RPCMethodDef(
+            name: "search_app",
+            description: "Search the App Store (iTunes Search API) by keyword to find an app's bundle_id and info — the reliable way to get a bundle_id you don't know (e.g. search '大麦' → cn.damai.iphone). Returns name, bundle_id, developer, rating, category. Then use the bundle_id with launch_app IF the app is installed on this device.",
+            params: [
+                RPCParamDef(name: "text", type: "string", required: true, description: "App name or keyword to search"),
+                RPCParamDef(name: "country", type: "string", required: false, description: "Store country code (default: cn)"),
+                RPCParamDef(name: "distance", type: "number", required: false, description: "Max results (default: 5, max 25)"),
+            ],
+            returns: "{count, term, apps:[{name, bundle_id, developer, category, rating, rating_count, price, version}], hint}"
+        ),
+        RPCMethodDef(
+            name: "launch_app",
+            description: "Open an app by bundle identifier (non-blocking, via LSApplicationWorkspace). If you don't know the bundle_id, use search_app to find it (e.g. '大麦' → cn.damai.iphone).",
+            params: [
+                RPCParamDef(name: "bundle_id", type: "string", required: true, description: "App bundle identifier (from list_apps)"),
+            ],
+            returns: "{message}"
+        ),
+        RPCMethodDef(
+            name: "activate_app",
+            description: "Bring an app to foreground",
+            params: [
+                RPCParamDef(name: "bundle_id", type: "string", required: true, description: "App bundle identifier"),
+            ],
+            returns: "{message}"
+        ),
+        RPCMethodDef(
+            name: "terminate_app",
+            description: "Terminate a running app",
+            params: [
+                RPCParamDef(name: "bundle_id", type: "string", required: true, description: "App bundle identifier"),
+            ],
+            returns: "{message}"
+        ),
+        RPCMethodDef(
+            name: "find_element",
+            description: "Find an on-screen element by its accessibility LABEL (exact by default) or identifier, and get a stable 'ref' + frame back. Matching order: exact label → accessibility id → (if match:'contains') substring; returns the first HITTABLE match. Use match:'contains' for loose matching, element_type to disambiguate. If the element needs scrolling to appear, use scroll_to_element instead. The returned ref is the reliable way to then tap/double_tap/long_press it.",
+            params: [
+                RPCParamDef(name: "element_id", type: "string", required: true, description: "Accessibility label (from page_source) or identifier"),
+                RPCParamDef(name: "match", type: "string", required: false, description: "'exact' (default) or 'contains' (substring)"),
+                RPCParamDef(name: "element_type", type: "string", required: false, description: "button/textfield/label/image/cell/switch/icon/any"),
+                RPCParamDef(name: "bundle_id", type: "string", required: false, description: "App to search; default = detected foreground app"),
+            ],
+            returns: "{exists, hittable, ref, x, y, width, height, center_x, center_y, label, value} — then act by {ref}"
+        ),
+        RPCMethodDef(
+            name: "tap_element",
+            description: "Convenience: find an element by label/id and tap it in one call. Equivalent to find_element + tap{ref}. Prefer find_element when you also need the frame or want to double_tap/long_press.",
+            params: [
+                RPCParamDef(name: "element_id", type: "string", required: true, description: "Accessibility label or identifier"),
+                RPCParamDef(name: "match", type: "string", required: false, description: "'exact' (default) or 'contains'"),
+                RPCParamDef(name: "element_type", type: "string", required: false, description: "Element type filter"),
+            ],
+            returns: "{message}"
+        ),
+        RPCMethodDef(
+            name: "drag",
+            description: "Drag between two points. Endpoints may be coordinates (from_x/from_y/to_x/to_y in POINTS) OR element refs (from_ref/to_ref, which resolve to the element center). Use for reordering/sliders; for a simple scroll flick use swipe.",
+            params: [
+                RPCParamDef(name: "from_ref", type: "string", required: false, description: "Start element ref (alternative to from_x/from_y)"),
+                RPCParamDef(name: "to_ref", type: "string", required: false, description: "End element ref (alternative to to_x/to_y)"),
+                RPCParamDef(name: "from_x", type: "number", required: false, description: "Start X (points)"),
+                RPCParamDef(name: "from_y", type: "number", required: false, description: "Start Y (points)"),
+                RPCParamDef(name: "to_x", type: "number", required: false, description: "End X (points)"),
+                RPCParamDef(name: "to_y", type: "number", required: false, description: "End Y (points)"),
+                RPCParamDef(name: "duration", type: "number", required: false, description: "Drag duration in seconds (default: 0.5)"),
+            ],
+            returns: "{message, screen}"
+        ),
+        RPCMethodDef(
+            name: "wait",
+            description: "Wait for a specified duration",
+            params: [
+                RPCParamDef(name: "duration", type: "number", required: false, description: "Duration in seconds (default: 1.0)"),
+            ],
+            returns: "{message}"
+        ),
+    ]
+
+    static func generateJSONSchema() -> [[String: Any]] {
+        methods.map { m in
+            var dict: [String: Any] = [
+                "name": m.name,
+                "description": m.description,
+                "returns": m.returns,
+            ]
+            dict["params"] = m.params.map { p in
+                [
+                    "name": p.name,
+                    "type": p.type,
+                    "required": p.required,
+                    "description": p.description,
+                ] as [String: Any]
+            }
+            return dict
+        }
+    }
+
+    /// A self-describing document for models: top-level guidance + methods.
+    /// Returned from GET /schema and GET / (Accept: application/json).
+    static func generateSchemaDocument() -> [String: Any] {
+        [
+            "protocol": "JSON-RPC 2.0",
+            "endpoints": [
+                "auth": "POST /auth  {client_name} → {token}. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. Returns 403 if denied.",
+                "rpc": "POST /rpc   {jsonrpc, method, params, id}  (Authorization: Bearer <token>)",
+                "logs": "GET /logs   plain-text recent logs, no auth, sensitive values redacted",
+                "schema": "GET /schema  this document",
+            ],
+            "guidance": [
+                "authorization":
+                    "Before any /rpc call you need a token from POST /auth {client_name}. " +
+                    "Authorization REQUIRES the device user to manually approve your request on an on-screen prompt, " +
+                    "so the /auth request can take a while to return — set a client-side timeout of AT LEAST 60 seconds " +
+                    "and wait patiently; do not retry early (each retry pops another prompt). " +
+                    "On approval you get a token (valid 30 days, survives app restarts); on denial you get HTTP 403. " +
+                    "Send the token as 'Authorization: Bearer <token>' on every /rpc call. " +
+                    "If the service restarts (see 'connection_reliability'), re-run /auth to get a fresh token before continuing.",
+                "client_timeouts":
+                    "Set generous client timeouts for /rpc: at least 30s, ideally 60-120s. " +
+                    "/schema and /logs are static and reply instantly, but /rpc drives the real device — a cold app " +
+                    "launch or heavy page can make a single call take many seconds. " +
+                    "CRITICAL: a client-side curl timeout does NOT mean the action failed — the device keeps executing " +
+                    "and the call usually completes. Before retrying a timed-out /rpc, GET /logs and look for a " +
+                    "'⏱ ✓ <method>' entry — if it's there, the action already succeeded and retrying would DOUBLE it " +
+                    "(e.g. a tap fires twice). Only retry if /logs shows no success and no in-flight entry.",
+                "connection_reliability":
+                    "The service runs inside an XCUITest process on the phone and can occasionally drop (iOS backgrounding " +
+                    "limits, or a stuck long-running call). Treat 8200 as possibly-transient: " +
+                    "(1) Before a session, probe with a SHORT timeout: GET /schema (1-2s) — 200 means ready. " +
+                    "(2) If the app was just woken via the ictrl:// URL scheme, note the returned 'opened' flag is UNRELIABLE " +
+                    "(it only means the URL was handed to the system, NOT that the server is up) — always confirm by polling " +
+                    "GET /schema for a few seconds. " +
+                    "(3) If /rpc starts failing AND /logs is also unreachable, the service died — re-wake via ictrl:// and " +
+                    "poll /schema until it returns 200, then re-/auth for a fresh token. " +
+                    "(4) Space out ictrl:// re-wakes by a couple seconds; rapid repeats may be throttled.",
+                "inspecting_ui":
+                    "PREFER page_source (the accessibility/view hierarchy as text) to understand layout — " +
+                    "it gives element types, labels, identifiers, and exact frames in POINTS, is far smaller " +
+                    "than an image, and needs no pixel→point conversion. Use screenshot only as a SECOND choice: " +
+                    "when an element is missing from the tree or you need visual detail. To go even lighter, " +
+                    "request a smaller screenshot with scale (e.g. 1 or 0.5).",
+                "locating_elements_decision_tree": [
+                    "Pick the locate method by situation — each returns a stable 'ref' you then act on:",
+                    "1. Element has a clear text/label AND is on screen → find_element{element_id:<label>} → tap{ref}. Fastest, precise.",
+                    "2. Element is off-screen (need to scroll to it) → scroll_to_element{element_id:<label>} — it scrolls then returns the ref in one call. Don't hand-roll swipe loops.",
+                    "3. App exposes accessibility identifiers (look for 'identifier:' in page_source, e.g. big apps use them for their own UI tests) → use that id as element_id — the most stable key.",
+                    "4. The on-screen text ≠ accessibility label (common!), or label is truncated → read the EXACT label from page_source first, or use match:'contains'.",
+                    "5. Pure icon / image / canvas with no useful label (games, webviews, custom-drawn UI) → screenshot, find it visually, tap by COORDINATE (pixel/scale). This is the fallback, not the default.",
+                    "6. Multiple elements share a label → add element_type (button/cell/…) to disambiguate; the matcher returns the first HITTABLE one.",
+                    "Prefer ref over coordinates whenever you have one: a ref re-resolves the live element and won't drift if the layout shifts; a coordinate is a fixed point that breaks after any scroll/animation.",
+                ],
+                "coordinate_space":
+                    "tap, double_tap, long_press, swipe, drag and type(x,y) all use POINTS, not pixels. " +
+                    "page_source frames are already in points. Screenshots are PIXELS: point = pixel / scale. " +
+                    "Get scale and the valid point range from device_info (point_width/point_height).",
+                "recommended_flow":
+                    "1) call device_info once to learn point_width/point_height/scale. " +
+                    "2) call page_source to read the current layout (types, labels, ids, frames in points). " +
+                    "3) locate the target: find_element (on screen) or scroll_to_element (needs scrolling) → get a ref. " +
+                    "4) act by ref: tap/double_tap/long_press{ref}, or drag{from_ref,to_ref}. " +
+                    "5) only fall back to screenshot + coordinate tap when the element has no usable label. " +
+                    "6) re-check with page_source (or screenshot) to verify the result.",
+                "common_pitfalls": [
+                    "Reaching for screenshot first when page_source + find_element would locate the element more precisely and cheaply.",
+                    "Using a coordinate when a ref is available — the coordinate breaks after any scroll/animation; a ref re-resolves the live element.",
+                    "Passing raw pixel coordinates to tap → taps land off-target or out of bounds. Convert pixel/scale first.",
+                    "Bottom tab bars/buttons live just above the home-indicator safe area; if a tap seems ignored, aim slightly higher (smaller y).",
+                    "Searching by the ON-SCREEN text when the accessibility label differs (e.g. a button reads '添加至购物袋' but its label is '添加') — read the exact label from page_source, or use match:'contains'.",
+                    "type requires an input field to already have keyboard focus — tap the field first (or pass x,y). To run a search, use type{submit:true} instead of hunting for the keyboard's Search key.",
+                    "unlock only wakes the screen; a passcode-locked device must be unlocked by the user.",
+                ],
+            ],
+            "methods": generateJSONSchema(),
+        ]
+    }
+
+    static func generateHTMLDoc() -> String {
+        var html = """
+        <!DOCTYPE html>
+        <html><head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>iCTRL API</title>
+        <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, system-ui, sans-serif; background: #f5f5f7; color: #1d1d1f; padding: 20px; }
+        h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
+        .subtitle { color: #86868b; margin-bottom: 24px; }
+        .endpoint { background: #fff; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+        .endpoint-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .method-name { font-size: 17px; font-weight: 600; font-family: SF Mono, monospace; color: #0071e3; }
+        .desc { color: #6e6e73; font-size: 14px; margin-bottom: 8px; }
+        .params { font-size: 13px; }
+        .param { display: flex; gap: 8px; padding: 4px 0; border-top: 1px solid #f5f5f7; }
+        .param-name { font-family: SF Mono, monospace; font-weight: 500; min-width: 100px; }
+        .param-type { color: #86868b; min-width: 60px; }
+        .param-req { color: #bf4040; font-size: 11px; }
+        .section { margin-top: 24px; margin-bottom: 12px; font-size: 20px; font-weight: 600; }
+        .info { background: #fff; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+        code { background: #f5f5f7; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+        pre { background: #1d1d1f; color: #f5f5f7; padding: 12px; border-radius: 8px; font-size: 13px; overflow-x: auto; margin-top: 8px; }
+        </style>
+        </head><body>
+        <h1>iCTRL API</h1>
+        <p class="subtitle">JSON-RPC 2.0 &middot; iOS Automation Server</p>
+
+        <div class="info">
+        <p><strong>RPC Endpoint:</strong> <code>POST /rpc</code></p>
+        <p style="margin-top:4px"><strong>Auth Endpoint:</strong> <code>POST /auth</code> — <code>{client_name}</code> → <code>{token}</code></p>
+        <p style="margin-top:8px">All <code>/rpc</code> calls require the <code>Authorization: Bearer &lt;token&gt;</code> header.</p>
+        <pre>{"jsonrpc": "2.0", "method": "tap", "params": {"x": 100, "y": 200}, "id": 1}</pre>
+        </div>
+
+        <div class="info" style="border-left:4px solid #ff9500">
+        <p><strong>⏳ First, get a token — the user must approve it.</strong></p>
+        <p style="margin-top:6px;color:#6e6e73;font-size:14px">
+        <code>POST /auth {client_name}</code> shows an <em>Allow / Deny</em> prompt on the device and BLOCKS until the user responds.
+        Use a client timeout of <strong>at least 60 seconds</strong> and wait — do not retry early (each retry pops another prompt).
+        On approval you receive a token (valid 30 days); on denial, HTTP 403.
+        </p>
+        </div>
+
+        <div class="info" style="border-left:4px solid #ff3b30">
+        <p><strong>⚠️ Reliability &amp; timeouts — read before automating.</strong></p>
+        <ul style="margin:6px 0 0 18px;color:#6e6e73;font-size:14px;line-height:1.6">
+        <li><strong>Use long <code>/rpc</code> timeouts (≥30s, ideally 60–120s).</strong> <code>/schema</code> and <code>/logs</code> reply instantly, but <code>/rpc</code> drives the real device and a call can take seconds.</li>
+        <li><strong>A client timeout ≠ failure.</strong> The device keeps executing. Before retrying, <code>GET /logs</code> and look for <code>⏱ ✓ &lt;method&gt;</code> — if present, it already succeeded and retrying would double the action.</li>
+        <li><strong>Probe readiness with <code>GET /schema</code> (short timeout).</strong> If you woke the service via the <code>ictrl://</code> URL scheme, the <code>opened</code> flag is NOT proof the server is up — the runner cold-starts and needs a few seconds to bind :8200. Poll <code>/schema</code> until it returns 200.</li>
+        <li><strong>If <code>/rpc</code> and <code>/logs</code> both go unreachable</strong>, the runner process died — re-wake via <code>ictrl://</code>, poll <code>/schema</code> until ready, then re-run <code>/auth</code> for a fresh token.</li>
+        </ul>
+        </div>
+
+        <div class="info" style="border-left:4px solid #34c759">
+        <p><strong>👁 Inspect the UI with <code>page_source</code> first.</strong></p>
+        <p style="margin-top:6px;color:#6e6e73;font-size:14px">
+        <code>page_source</code> returns the view hierarchy as text (types, labels, identifiers, and frames
+        already in <em>points</em>) — smaller, faster and more precise than an image. Use <code>screenshot</code>
+        only when an element is missing from the tree or you need visual detail (and you can shrink it with <code>scale</code>).
+        </p>
+        <p style="margin-top:8px;color:#6e6e73;font-size:14px">
+        Rich pages can be big and the first call after a launch can be slow. <strong>Scope it:</strong>
+        <code>page_source({"filter":{"label":"待收货"}})</code> returns only matching nodes + ancestors;
+        <code>{"max_depth":3}</code> gives just the top structure; <code>{"max_elements":200}</code> caps the count.
+        A 500-node hard cap applies by default (<code>truncated:true</code> when hit).
+        </p>
+        </div>
+
+        <div class="info" style="border-left:4px solid #0071e3">
+        <p><strong>⚠️ Coordinates use POINTS, not pixels.</strong></p>
+        <p style="margin-top:6px;color:#6e6e73;font-size:14px">
+        Screenshots come back in <em>pixels</em>; <code>tap</code>/<code>swipe</code>/<code>drag</code> take <em>points</em>.
+        Convert: <code>point = pixel / scale</code>. Get <code>scale</code> and the valid range
+        (<code>point_width</code> × <code>point_height</code>) from <code>device_info</code>.
+        </p>
+        <p style="margin-top:6px;color:#6e6e73;font-size:14px">
+        Recommended flow: <code>device_info</code> → <code>page_source</code> → tap frame center → verify.
+        Fetch <code>GET /schema</code> for machine-readable guidance.
+        </p>
+        </div>
+
+        <p class="section">Methods</p>
+        """
+
+        for m in methods {
+            html += """
+            <div class="endpoint">
+            <div class="endpoint-header"><span class="method-name">\(m.name)</span></div>
+            <p class="desc">\(m.description)</p>
+            """
+            if !m.params.isEmpty {
+                html += "<div class=\"params\">"
+                for p in m.params {
+                    let req = p.required ? "<span class=\"param-req\">required</span>" : ""
+                    html += """
+                    <div class="param">
+                    <span class="param-name">\(p.name)</span>
+                    <span class="param-type">\(p.type)</span>
+                    <span>\(p.description) \(req)</span>
+                    </div>
+                    """
+                }
+                html += "</div>"
+            }
+            html += "</div>"
+        }
+
+        html += "</body></html>"
+        return html
+    }
+}

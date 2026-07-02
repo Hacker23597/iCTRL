@@ -1,0 +1,74 @@
+name: iCTRL
+options:
+  bundleIdPrefix: com.openminis
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    DEVELOPMENT_TEAM: 7P798DM2MY
+
+targets:
+  iCTRL:
+    type: application
+    platform: iOS
+    sources:
+      - path: iCTRLApp
+      - path: iCTRLKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.openminis.ictrl
+        GENERATE_INFOPLIST_FILE: YES
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: 1
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "iCTRL needs local network access to serve the automation API."
+
+  iCTRLUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: iCTRLUITests
+      - path: iCTRLKit
+    dependencies:
+      - target: iCTRL
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.openminis.ictrl.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_OBJC_BRIDGING_HEADER: iCTRLUITests/XCTestPrivate-Bridging-Header.h
+        TEST_HOST: ""
+    postBuildScripts:
+      - name: "Strip unnecessary XCTest frameworks"
+        script: |
+          RUNNER_APP="${BUILT_PRODUCTS_DIR}/iCTRLUITests-Runner.app"
+          echo "🔧 Stripping XCTest frameworks from Runner.app..."
+          rm -rf "${RUNNER_APP}/Frameworks/XCTAutomationSupport.framework"
+          rm -rf "${RUNNER_APP}/Frameworks/XCTest.framework"
+          rm -rf "${RUNNER_APP}/Frameworks/XCTestCore.framework"
+          rm -rf "${RUNNER_APP}/Frameworks/XCTestSupport.framework"
+          rm -rf "${RUNNER_APP}/Frameworks/XCUIAutomation.framework"
+          rm -rf "${RUNNER_APP}/Frameworks/XCUnit.framework"
+          rm -rf "${RUNNER_APP}/Frameworks/Testing.framework"
+          rm -f  "${RUNNER_APP}/Frameworks/libXCTestSwiftSupport.dylib"
+          rmdir  "${RUNNER_APP}/Frameworks" 2>/dev/null || true
+          echo "✅ Frameworks stripped"
+
+schemes:
+  iCTRL:
+    build:
+      targets:
+        iCTRL: all
+        iCTRLUITests: [test]
+    test:
+      targets:
+        - iCTRLUITests
+      testPlans: []

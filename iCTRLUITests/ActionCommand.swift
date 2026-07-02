@@ -1,0 +1,67 @@
+import Foundation
+
+struct ActionCommand {
+    let name: String
+    var x: Double?
+    var y: Double?
+    var direction: String?
+    var distance: Double?
+    var text: String?
+    var duration: Double?
+    var elementId: String?
+    var elementType: String?
+    var bundleId: String?
+    var fast: Bool?
+    var fromX: Double?
+    var fromY: Double?
+    var toX: Double?
+    var toY: Double?
+    var scale: Double?
+    var velocity: String?
+    var matchMode: String?
+    var ref: String?
+    var fromRef: String?
+    var toRef: String?
+    var submit: Bool?
+    var country: String?
+    // page_source scoping
+    var maxDepth: Int?
+    var maxElements: Int?
+    var filterType: String?
+    var filterLabel: String?
+    var filterText: String?
+
+    init(method: String, params: [String: JSONValue]?) {
+        self.name = method
+        self.x = params?["x"]?.doubleValue
+        self.y = params?["y"]?.doubleValue
+        self.direction = params?["direction"]?.stringValue
+        self.distance = params?["distance"]?.doubleValue
+        self.text = params?["text"]?.stringValue
+        self.duration = params?["duration"]?.doubleValue
+        self.elementId = params?["element_id"]?.stringValue
+        self.elementType = params?["element_type"]?.stringValue
+        self.bundleId = params?["bundle_id"]?.stringValue
+        self.fast = params?["fast"]?.boolValue
+        self.fromX = params?["from_x"]?.doubleValue
+        self.fromY = params?["from_y"]?.doubleValue
+        self.toX = params?["to_x"]?.doubleValue
+        self.toY = params?["to_y"]?.doubleValue
+        self.scale = params?["scale"]?.doubleValue
+        self.velocity = params?["velocity"]?.stringValue
+        self.matchMode = params?["match"]?.stringValue
+        self.ref = params?["ref"]?.stringValue
+        self.fromRef = params?["from_ref"]?.stringValue
+        self.toRef = params?["to_ref"]?.stringValue
+        self.submit = params?["submit"]?.boolValue
+        self.country = params?["country"]?.stringValue
+
+        self.maxDepth = params?["max_depth"]?.intValue
+        self.maxElements = params?["max_elements"]?.intValue
+        // filter can be a nested object {type,label,text} or top-level keys.
+        let filter = params?["filter"]?.objectValue
+        self.filterType = filter?["type"]?.stringValue ?? params?["filter_type"]?.stringValue
+        self.filterLabel = filter?["label"]?.stringValue ?? params?["filter_label"]?.stringValue
+        self.filterText = filter?["text"]?.stringValue ?? params?["filter_text"]?.stringValue
+    }
+}
