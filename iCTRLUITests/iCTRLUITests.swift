@@ -45,12 +45,32 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     }
 
     override func setUpWithError() throws {
+        // Make the test "failure-proof" — like WebDriverAgent's FBFailureProofTestCase.
+        // A hung/slow XCUITest call (tap/snapshot on an animating page) makes XCTest
+        // record a failure and tear the test down, which kills the server. We keep
+        // running through failures and swallow the failure reporting so XCTest never
+        // decides to stop the long-running server test.
         continueAfterFailure = true
+        // Don't halt when XCTest signals control interruptions (see appium#13949).
+        if responds(to: Selector(("setShouldSetShouldHaltWhenReceivesControl:"))) {
+            setValue(false, forKey: "shouldSetShouldHaltWhenReceivesControl")
+        }
+        if responds(to: Selector(("setShouldHaltWhenReceivesControl:"))) {
+            setValue(false, forKey: "shouldHaltWhenReceivesControl")
+        }
+
         app = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         app.activate()
 
         URLSchemeHandler.installURLHandler()
         setupNotifications()
+    }
+
+    /// Swallow XCTest failure reports so a slow/hung interaction can't tear the
+    /// test (and the server) down. (WebDriverAgent overrides the same path.)
+    override func record(_ issue: XCTIssue) {
+        Self.logBuffer.append("⚠️ XCTest issue swallowed: \(issue.compactDescription.prefix(120))")
+        // Intentionally NOT calling super — do not propagate the failure.
     }
 
     override func tearDownWithError() throws {

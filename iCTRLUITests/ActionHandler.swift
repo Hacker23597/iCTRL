@@ -177,14 +177,18 @@ class ActionHandler {
     /// in the foreground — so a coordinate tap / element query lands on it even if
     /// the user drifted to another app. No-op when nothing is bound or the target
     /// is already foreground.
-    // NOTE: 'type' is deliberately EXCLUDED — re-activating the bound app right
-    // before typing dismisses the keyboard / drops the text field's focus, so the
-    // text would be lost. type() acts on whatever currently has focus.
+    // Methods that we re-focus the bound app for before running. Only INTERACTIONS
+    // are here. Deliberately EXCLUDED:
+    //  - 'type' — re-activating dismisses the keyboard / drops focus.
+    //  - 'page_source'/'screenshot'/'find_element' — READ-ONLY. WDA doesn't
+    //    activate the app to read its source; it just resolves the active app and
+    //    snapshots. Activating here triggers a foreground transition/animation that
+    //    the snapshot then blocks on (observed 13-16s snapshot hangs). Reads use the
+    //    resolved target app WITHOUT forcing it forward.
     private static let uiActionMethods: Set<String> = [
         "tap", "double_tap", "long_press", "swipe", "scroll", "drag",
         "page", "page_down", "page_up",
-        "page_source", "view_tree", "ui_tree", "scroll_to_element", "scroll_to",
-        "find_element", "tap_element", "screenshot",
+        "scroll_to_element", "scroll_to", "tap_element",
     ]
 
     /// XCUIApplication.State raw values (see ForegroundApp.appStateForBundleID).
