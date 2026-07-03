@@ -114,7 +114,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         let runLoop = RunLoop.current
         while keepRunning {
             autoreleasepool {
-                runLoop.run(until: Date(timeIntervalSinceNow: 1.0))
+                // Short slice so main-queue work (the main.sync from the RPC queue)
+                // and pending ictrl:// callbacks are serviced promptly. The runloop
+                // also wakes early on dispatch, so this mainly bounds callback polling.
+                runLoop.run(until: Date(timeIntervalSinceNow: 0.2))
                 // A URL may also arrive after startup (app already running).
                 handlePendingCallbackIfAny()
             }
@@ -393,6 +396,19 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// Methods that drive XCUITest and therefore MUST run on the main thread.
+    /// Anything else (config, resolve_app, device_info, list_apps, is_locked, …)
+    /// runs directly on the RPC queue — no main-thread hop, so it can't be delayed
+    /// by (or delay) a slow UI action.
+    private static let mainThreadMethods: Set<String> = [
+        "tap", "double_tap", "long_press", "swipe", "scroll", "drag",
+        "page", "page_down", "page_up",
+        "type", "screenshot", "page_source", "view_tree", "ui_tree",
+        "scroll_to_element", "scroll_to", "find_element", "tap_element",
+        "launch_app", "activate_app", "terminate_app",
+        "home", "lock", "unlock",
+    ]
+
     /// Compact one-line summary of the most useful params for the request log.
     /// Keeps element_id/x/y/bundle_id/direction/text-length so a crash post-mortem
     /// shows what an action targeted, without dumping the whole payload.
@@ -440,7 +456,6 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             // Run the work on the serial RPC queue with a watchdog timeout so a
             // hung call reports back to the client instead of stalling forever.
             let done = DispatchSemaphore(value: 0)
-            var out: ([String: JSONValue]?, JSONRPCError?)? = nil
             var replied = false
             let replyLock = NSLock()
 
@@ -484,16 +499,19 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                         result = (nil, .internalError)
                     }
                 }
-                if Thread.isMainThread {
-                    work()
-                } else {
+                // Only XCUITest UI interactions must run on the main thread. Pure
+                // data/network methods (config, resolve_app, device_info, list_apps,
+                // logs, lock state) run directly on the RPC queue — no reason to
+                // hop to (and potentially block) the main thread for them.
+                if Self.mainThreadMethods.contains(method) && !Thread.isMainThread {
                     DispatchQueue.main.sync(execute: work)
+                } else {
+                    work()
                 }
 
                 let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000
                 Self.logBuffer.recordTiming(method: method, ms: ms, ok: result.1 == nil)
                 if let err = result.1 { Self.logBuffer.append("← ERR \(method): \(err.message)") }
-                out = result
                 done.signal()
                 replyOnce(result)  // may be a no-op if the watchdog already replied
             }
@@ -507,7 +525,6 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                         "Do NOT blindly retry — check GET /logs for a '✓ \(method)' entry first; the action may have already succeeded."
                     )))
                 }
-                _ = out  // keep capture alive
             }
         }
         srv.onLogsRequest = {
