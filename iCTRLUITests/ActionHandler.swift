@@ -999,19 +999,22 @@ class ActionHandler {
         let maxElements = min(cmd.maxElements ?? 500, 2000)
         let filter = SnapshotFilter(type: cmd.filterType, label: cmd.filterLabel, text: cmd.filterText)
 
-        // Collect the snapshots to render. A single application.snapshot() can MISS
-        // floating overlay layers that live in separate windows (e.g. Taobao's
-        // fixed "加入购物车/立即购买" bottom bar). So we snapshot the application AND
-        // each of its windows, and render whichever roots we got — deduping by the
-        // window frames we've already covered.
+        // Collect the snapshots to render. By DEFAULT we take a single
+        // application.snapshot() — fast (~0.5-1s). That can MISS floating overlay
+        // layers in separate windows (e.g. Taobao's fixed "加入购物车/立即购买" bar),
+        // so pass include_overlays:true to ALSO snapshot each window. Overlay
+        // traversal is bounded by a hard TIME BUDGET: on complex pages, snapshotting
+        // every window serially could take 15s+ and trip XCTest's own watchdog,
+        // terminating the test (observed). We stop early once the budget is spent.
         var roots: [XCUIElementSnapshot] = []
         if let appSnap = try? target.snapshot() {
             roots.append(appSnap)
         }
-        // Additional windows (overlays). windows.count doesn't wait for quiescence.
-        let windowCount = min(target.windows.count, 8)
-        if windowCount > 0 {
+        if cmd.includeOverlays == true {
+            let budgetDeadline = nowMonotonic + 3.0   // total overlay budget
+            let windowCount = min(target.windows.count, 8)
             for i in 0..<windowCount {
+                if nowMonotonic >= budgetDeadline { break }   // don't risk the XCTest watchdog
                 if let ws = try? target.windows.element(boundBy: i).snapshot() {
                     roots.append(ws)
                 }
@@ -1041,7 +1044,8 @@ class ActionHandler {
 
         var hint = "Accessibility tree (types, labels, identifiers, frames in POINTS). " +
             "Frames are {{x,y},{w,h}} — tap an element at its frame center (or use find_element to get a ref). " +
-            "If an element is missing, the app may not expose it; fall back to screenshot + coordinate tap."
+            "If a FIXED bottom/overlay bar (e.g. a buy/submit button) seems missing, retry with include_overlays:true " +
+            "(it also snapshots overlay windows). Otherwise the app may not expose the element — fall back to screenshot + coordinate tap."
         if truncated {
             hint = "⚠️ Tree truncated at \(count) nodes (page has more). Narrow the query: " +
                 "pass filter:{label:\"…\"} or filter:{type:\"button\"} to return only matching nodes (with their ancestor path), " +

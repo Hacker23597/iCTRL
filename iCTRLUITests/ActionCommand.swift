@@ -30,6 +30,7 @@ struct ActionCommand {
     var filterType: String?
     var filterLabel: String?
     var filterText: String?
+    var includeOverlays: Bool?
 
     init(method: String, params: [String: JSONValue]?) {
         self.name = method
@@ -63,5 +64,6 @@ struct ActionCommand {
         self.filterType = filter?["type"]?.stringValue ?? params?["filter_type"]?.stringValue
         self.filterLabel = filter?["label"]?.stringValue ?? params?["filter_label"]?.stringValue
         self.filterText = filter?["text"]?.stringValue ?? params?["filter_text"]?.stringValue
+        self.includeOverlays = params?["include_overlays"]?.boolValue
     }
 }
