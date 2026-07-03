@@ -177,8 +177,11 @@ class ActionHandler {
     /// in the foreground — so a coordinate tap / element query lands on it even if
     /// the user drifted to another app. No-op when nothing is bound or the target
     /// is already foreground.
+    // NOTE: 'type' is deliberately EXCLUDED — re-activating the bound app right
+    // before typing dismisses the keyboard / drops the text field's focus, so the
+    // text would be lost. type() acts on whatever currently has focus.
     private static let uiActionMethods: Set<String> = [
-        "tap", "double_tap", "long_press", "swipe", "scroll", "type", "drag",
+        "tap", "double_tap", "long_press", "swipe", "scroll", "drag",
         "page_source", "view_tree", "ui_tree", "scroll_to_element", "scroll_to",
         "find_element", "tap_element", "screenshot",
     ]
@@ -558,17 +561,19 @@ class ActionHandler {
 
     // MARK: - Type
 
-    /// Best-effort check that a keyboard is on screen — i.e. some text field has
-    /// focus so typed text will actually land somewhere. Without this, type()
-    /// "succeeds" at the API level but the characters go nowhere (a common trap
-    /// when the caller typed into a fake search bar that never gained focus).
+    /// Best-effort detection of an on-screen keyboard. NOTE: this is unreliable —
+    /// third-party keyboards (Google/Sogou/…) and many apps render the keyboard in
+    /// a process whose elements don't appear in the app's OR SpringBoard's
+    /// accessibility tree, so a visible keyboard can still report count == 0.
+    /// Because of that we use this only for a SOFT warning, never to block typing.
     private func hasKeyboardFocus() -> Bool {
         let bid = resolveForegroundBundleId()
         let target: XCUIApplication = bid.map { XCUIApplication(bundleIdentifier: $0) } ?? app
-        // keyboards.count is cheap and doesn't wait for quiescence (disabled).
         if target.keyboards.count > 0 { return true }
-        // Fall back to the system keyboard (some apps host it out of their tree).
-        return app.keyboards.count > 0
+        if app.keyboards.count > 0 { return true }
+        // SpringBoard hosts the system keyboard on some setups.
+        if XCUIApplication(bundleIdentifier: "com.apple.springboard").keyboards.count > 0 { return true }
+        return false
     }
 
     private func typeText(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
@@ -586,18 +591,15 @@ class ActionHandler {
             focusedByTap = true
         }
 
-        // Focus guard: if no keyboard is visible, nothing has input focus, so the
-        // text would be silently dropped. Fail loudly with recovery guidance
-        // instead of returning a misleading success.
-        if !hasKeyboardFocus() {
-            return (nil, JSONRPCError(
-                code: -32602,
-                message: "type aborted: no keyboard is visible, so no text field has focus and the text would be lost. " +
-                    "First tap a real text field to focus it (find_element{element_type:\"textfield\"} → tap{ref}), wait ~1s for the keyboard to appear, then type. " +
-                    "Note: a home-screen 'search bar' is often a button — tapping it opens a search page where the actual textfield lives.",
-                data: nil
-            ))
-        }
+        // Focus check is a SOFT signal only — keyboard detection can't see
+        // third-party keyboards, so we must NOT block typing on it (that produced
+        // false "no keyboard" errors even when the keyboard was clearly up). We
+        // type regardless and, if we couldn't confirm a keyboard, attach a warning
+        // so the caller verifies the text landed (e.g. screenshot after).
+        let keyboardConfirmed = hasKeyboardFocus()
+        let focusWarning = keyboardConfirmed ? nil :
+            "Could not confirm a focused text field / visible keyboard (detection can't see all keyboards). " +
+            "If the text didn't appear, tap a real textfield first (find_element{element_type:\"textfield\"} → tap{ref}), wait ~1s, then type again. A home-screen 'search bar' is often a button that opens a separate search page."
 
         // submit:true appends a Return/Search keystroke so the field's action
         // (search/go/send) fires — synthesized text alone often doesn't trigger it.
@@ -608,6 +610,7 @@ class ActionHandler {
             if submit, r.1 == nil { sendReturnKey() }
             if var data = r.0 {
                 data["message"] = .string("Typed: \(text)" + (submit ? " + Return" : ""))
+                if let w = focusWarning { data["warning"] = .string(w) }
                 return (data, r.1)
             }
             return r
@@ -621,7 +624,9 @@ class ActionHandler {
         do {
             try eventRecord.synthesize()
             if submit { sendReturnKey() }
-            return (["message": .string("Typed: \(text)" + (submit ? " + Return" : ""))], nil)
+            var out: [String: JSONValue] = ["message": .string("Typed: \(text)" + (submit ? " + Return" : ""))]
+            if let w = focusWarning { out["warning"] = .string(w) }
+            return (out, nil)
         } catch {
             let guidance = focusedByTap
                 ? "Typing failed even after tapping to focus. The tapped point may not be a text field, or the keyboard did not appear. Take a screenshot to confirm a text field is focused (keyboard visible), then retry."
