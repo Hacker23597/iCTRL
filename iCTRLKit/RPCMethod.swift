@@ -49,9 +49,9 @@ struct RPCMethodRegistry {
             description: "Capture a screenshot as base64 PNG. SECOND CHOICE after page_source — use when you need visual detail or an element is absent from the view tree. By default captures the WHOLE SCREEN (fast, ~0.4s). Pass bundle_id ONLY if you specifically want just one app's window cropped out (slower; time-bounded with a full-screen fallback). Image is in PIXELS; tap coordinates are in POINTS. Optional 'scale' controls output resolution (default 2, max 3, e.g. 1, 0.5).",
             params: [
                 RPCParamDef(name: "scale", type: "number", required: false, description: "Output pixels-per-point (default 2, max 3; smaller = faster/less detail, e.g. 1 or 0.5)"),
-                RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Capture this app's window; default = sticky target app, else whole screen"),
+                RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Crop to just this app's window (slower, time-bounded). OMIT for the default full-screen capture (fast) — the default is NOT scoped to the launched app."),
             ],
-            returns: "Object: {data: base64 PNG, pixel_width, pixel_height, point_width, point_height, scale, hint}"
+            returns: "Object: {data: base64 PNG, pixel_width, pixel_height, point_width, point_height, scale, scope:'screen'|'app', scoped_to?, hint}"
         ),
         RPCMethodDef(
             name: "tap",
@@ -130,7 +130,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "type",
-            description: "Type text into the focused input field. A text field MUST already have keyboard focus — tap a real textfield first (see 'searching_and_typing'). If no keyboard is visible, type REFUSES to run and returns an error (rather than silently dropping the text), so a failed type means 'focus a field first', not 'retry'. Set submit:true to append Return/Search so the field's action fires. See searching_and_typing guidance for the full search flow.",
+            description: "Type text into the focused input field. A text field must already have keyboard focus — tap a real textfield first (see 'searching_and_typing'). Type always runs, but if no keyboard could be confirmed the response includes a 'warning' (keyboard detection can't see all third-party keyboards, so this is advisory, not a failure) — if the text didn't land, re-focus the field and type again. Set submit:true to append Return/Search so the field's action (search/go/send) fires. See searching_and_typing guidance for the full search flow.",
             params: [
                 RPCParamDef(name: "text", type: "string", required: true, description: "Text to type"),
                 RPCParamDef(name: "submit", type: "boolean", required: false, description: "Append Return/Search to submit the field (recommended for search boxes)"),
@@ -138,7 +138,7 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "y", type: "number", required: false, description: "Tap Y to focus before typing"),
                 RPCParamDef(name: "fast", type: "boolean", required: false, description: "Use fast mode"),
             ],
-            returns: "{message}"
+            returns: "{message, warning?} — warning present when a focused keyboard couldn't be confirmed"
         ),
         RPCMethodDef(
             name: "home",
@@ -166,7 +166,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "list_apps",
-            description: "List installed apps with their bundle_id and name. Use this to find the correct bundle_id before launch_app (don't guess). Pass text to filter by name or bundle substring (case-insensitive), e.g. {\"text\":\"大麦\"}. By default only user apps are returned; pass element_type:\"all\" to include system apps.",
+            description: "List installed apps with their bundle_id and name. NOTE: this relies on a private API that often returns an EMPTY list inside the XCTest sandbox — if count is 0, that's the sandbox limitation, not 'no apps'. Prefer resolve_app to get a bundle_id from an app name. Pass text to filter by name or bundle substring (case-insensitive). By default only user apps are returned; pass element_type:\"all\" to include system apps.",
             params: [
                 RPCParamDef(name: "text", type: "string", required: false, description: "Filter by name/bundle_id substring"),
                 RPCParamDef(name: "element_type", type: "string", required: false, description: "'all' to include system apps (default: user apps only)"),
@@ -185,15 +185,15 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "launch_app",
-            description: "Open an app by bundle identifier (non-blocking, via LSApplicationWorkspace). If you don't know the bundle_id, use resolve_app to find it (e.g. '大麦' → cn.damai.iphone). The opened app becomes the sticky target for subsequent UI actions (see app_binding).",
+            description: "Open an app by bundle identifier (non-blocking, via LSApplicationWorkspace). If you don't know the bundle_id, use resolve_app to find it (e.g. '大麦' → cn.damai.iphone). The opened app becomes the STICKY TARGET for subsequent UI actions (see app_binding). NOTE: the app is still launching/rendering when this returns — wait 2-3s (call wait) before page_source, or you'll match splash/placeholder elements.",
             params: [
-                RPCParamDef(name: "bundle_id", type: "string", required: true, description: "App bundle identifier (from list_apps)"),
+                RPCParamDef(name: "bundle_id", type: "string", required: true, description: "App bundle identifier (from resolve_app)"),
             ],
-            returns: "{message}"
+            returns: "{message, bound_app, advice}"
         ),
         RPCMethodDef(
             name: "activate_app",
-            description: "Bring an app to foreground",
+            description: "Bring an already-installed app to the foreground and make it the STICKY TARGET (see app_binding). Like launch_app but uses XCUIApplication.activate. Errors if the app isn't installed / can't be activated.",
             params: [
                 RPCParamDef(name: "bundle_id", type: "string", required: true, description: "App bundle identifier"),
             ],
@@ -319,7 +319,7 @@ struct RPCMethodRegistry {
                     "4. Locate the REAL input with find_element{element_type:\"textfield\"} (or searchField). Confirm is_text_input:true.",
                     "5. Tap that textfield's ref to focus it. Verify the keyboard is up (screenshot or page_source shows a Keyboard).",
                     "6. Only now type{text:\"…\", submit:true}. If type returns a 'no keyboard/focus' error, go back to step 4-5 — do NOT assume the text went in.",
-                    "Key trap: type() into an unfocused field silently loses the text and submit:true then searches an empty/garbage query. type() now refuses to run when no keyboard is visible — treat that error as 'refocus the field', not 'retry blindly'.",
+                    "Key trap: type() into an unfocused field silently loses the text and submit:true then searches an empty/garbage query. type() returns a 'warning' when it can't confirm a focused keyboard — heed it: verify the text landed (screenshot/page_source) and, if not, re-focus a real textfield before typing again.",
                 ],
                 "app_binding":
                     "After you open an app with launch_app/activate_app it becomes the STICKY TARGET (see 'bound_app' " +
