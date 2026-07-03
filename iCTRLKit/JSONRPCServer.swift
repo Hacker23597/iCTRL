@@ -14,6 +14,13 @@ class JSONRPCServer {
     /// Returns redacted log text for the public (no-auth) GET /logs endpoint.
     var onLogsRequest: (() -> String)?
 
+    /// Lists persisted daily log files (names + sizes) for GET /logs/files.
+    var onLogFilesRequest: (() -> String)?
+
+    /// Returns the redacted contents of a persisted log file for
+    /// GET /logs/history?date=YYYY-MM-DD (defaults to today if absent).
+    var onLogHistoryRequest: ((String?) -> String)?
+
     /// Routes internal server-lifecycle messages to the host's log sink so they
     /// land in the persisted log file, not just the console.
     var onLog: ((String) -> Void)?
@@ -164,12 +171,23 @@ class JSONRPCServer {
     // MARK: - Routing
 
     private func route(method: String, path: String, headers: [String: String], body: Data?, connection: NWConnection) {
-        switch (method, path) {
+        // Split off any query string so path matching is exact.
+        let rawPath = path
+        let pathOnly = path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? path
+        let query = rawPath.contains("?") ? String(rawPath.split(separator: "?", maxSplits: 1).dropFirst().first ?? "") : ""
+
+        switch (method, pathOnly) {
         case ("GET", "/"):
             handleDocPage(connection: connection, headers: headers)
 
         case ("GET", "/schema"):
             handleSchema(connection: connection)
+
+        case ("GET", "/logs/files"):
+            handleLogFiles(connection: connection)
+
+        case ("GET", "/logs/history"):
+            handleLogHistory(connection: connection, query: query)
 
         case ("GET", "/logs"):
             handleLogs(connection: connection)
@@ -221,6 +239,30 @@ class JSONRPCServer {
         let logs = onLogsRequest?() ?? "(no logs available)"
         let header = "# iCTRL logs (redacted — sensitive values masked)\n\n"
         sendHTTPResponse(connection: connection, status: 200, contentType: "text/plain; charset=utf-8", body: header + logs)
+    }
+
+    /// GET /logs/files — list persisted daily log files (survive crashes/restarts).
+    private func handleLogFiles(connection: NWConnection) {
+        let listing = onLogFilesRequest?() ?? "(no log files)"
+        let header = "# iCTRL persisted log files\n# GET /logs/history?date=YYYY-MM-DD to read one\n\n"
+        sendHTTPResponse(connection: connection, status: 200, contentType: "text/plain; charset=utf-8", body: header + listing)
+    }
+
+    /// GET /logs/history?date=YYYY-MM-DD — dump a persisted day's log (redacted).
+    /// This is how you recover the log from BEFORE a crash/restart, since /logs
+    /// only holds the current process's in-memory buffer.
+    private func handleLogHistory(connection: NWConnection, query: String) {
+        // Parse date=... from the query string.
+        var date: String? = nil
+        for pair in query.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1)
+            if kv.count == 2, kv[0] == "date" {
+                date = String(kv[1]).removingPercentEncoding ?? String(kv[1])
+            }
+        }
+        let content = onLogHistoryRequest?(date) ?? "(no history log available)"
+        let header = "# iCTRL persisted log (redacted)\(date.map { " — \($0)" } ?? " — today")\n\n"
+        sendHTTPResponse(connection: connection, status: 200, contentType: "text/plain; charset=utf-8", body: header + content)
     }
 
     private func handleAuth(body: Data?, connection: NWConnection) {

@@ -487,6 +487,9 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
         // Route the server's internal lifecycle messages into the persisted log.
         srv.onLog = { Self.logBuffer.append($0) }
+        // Persisted-log endpoints (crash recovery — survive process restarts).
+        srv.onLogFilesRequest = { Self.logBuffer.listLogFiles() }
+        srv.onLogHistoryRequest = { Self.logBuffer.readLogFile(date: $0) }
     }
 
     // MARK: - Config RPC

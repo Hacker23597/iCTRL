@@ -184,6 +184,45 @@ class LogBuffer {
         return entries.count
     }
 
+    // MARK: - Persisted file access (crash recovery)
+
+    /// Lists persisted daily log files as "name  size" lines, newest first.
+    /// These survive process crashes/restarts, unlike the in-memory buffer.
+    func listLogFiles() -> String {
+        guard let dir = logsDirectory,
+              let files = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.fileSizeKey]) else {
+            return "(no log files)"
+        }
+        let logs = files.filter { $0.pathExtension == "log" }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }  // newest date first
+        if logs.isEmpty { return "(no log files)" }
+        return logs.map { url -> String in
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            let kb = Double(size) / 1024.0
+            return String(format: "%@  (%.1f KB)", url.lastPathComponent, kb)
+        }.joined(separator: "\n")
+    }
+
+    /// Returns the (already-redacted-on-write) contents of a day's log file.
+    /// `date` is "YYYY-MM-DD"; nil = today. Files are written redacted, so this is
+    /// safe for the public endpoint.
+    func readLogFile(date: String?) -> String {
+        guard let dir = logsDirectory else { return "(logs directory unavailable)" }
+        let day = date ?? fileDateFormatter.string(from: Date())
+        let url = dir.appendingPathComponent("ictrl-\(day).log")
+        guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else {
+            return "(no log file for \(day) — try GET /logs/files to list available dates)"
+        }
+        // Files may be large; cap the response to the last ~256 KB.
+        let maxBytes = 256 * 1024
+        if text.utf8.count > maxBytes {
+            let tail = String(text.suffix(maxBytes / 2))
+            return "…(truncated to last portion)…\n" + tail
+        }
+        return text
+    }
+
     // MARK: - Redaction
 
     private static let uuidRegex = try? NSRegularExpression(

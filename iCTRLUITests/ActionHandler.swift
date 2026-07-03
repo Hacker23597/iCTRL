@@ -318,11 +318,24 @@ class ActionHandler {
         // App-scoped shots capture just that app's UI (no status bar / other apps)
         // and work even if it isn't the frontmost app.
         let targetBundleId = cmd.bundleId ?? boundBundleId
-        let fullImage: UIImage
+        var fullImage: UIImage
         let scopedTo: String?
         if let bid = targetBundleId, !bid.isEmpty {
-            fullImage = XCUIApplication(bundleIdentifier: bid).screenshot().image
-            scopedTo = bid
+            // App-scoped screenshot can throw an NSException (app terminated /
+            // window not renderable) or return a black frame when the app is
+            // backgrounded. Guard it and fall back to a full-screen shot.
+            var appImage: UIImage?
+            let reason = ObjCException.catching {
+                appImage = XCUIApplication(bundleIdentifier: bid).screenshot().image
+            }
+            if let img = appImage, reason == nil {
+                fullImage = img
+                scopedTo = bid
+            } else {
+                fullImage = XCUIScreen.main.screenshot().image
+                scopedTo = nil
+                iCTRLUITests.logBuffer.append("📸 app-scoped screenshot for \(bid) failed (\(reason ?? "nil image")) — fell back to full screen")
+            }
         } else {
             fullImage = XCUIScreen.main.screenshot().image
             scopedTo = nil

@@ -270,7 +270,9 @@ struct RPCMethodRegistry {
             "endpoints": [
                 "auth": "POST /auth  {client_name} → {token}. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. Returns 403 if denied.",
                 "rpc": "POST /rpc   {jsonrpc, method, params, id}  (Authorization: Bearer <token>)",
-                "logs": "GET /logs   plain-text recent logs, no auth, sensitive values redacted",
+                "logs": "GET /logs   plain-text recent logs (current process, in-memory), no auth, sensitive values redacted",
+                "logs_files": "GET /logs/files   list persisted daily log files (survive crashes/restarts)",
+                "logs_history": "GET /logs/history?date=YYYY-MM-DD   dump a persisted day's log (redacted). Use this to recover logs from BEFORE a crash — /logs only holds the current process's memory",
                 "schema": "GET /schema  this document",
             ],
             "guidance": [
