@@ -1426,14 +1426,18 @@ class ActionHandler {
         let q = elementQuery(in: target, type: type)
 
         func firstHittable(_ query: XCUIElementQuery) -> (XCUIElement, Int)? {
-            let n = query.count
-            guard n > 0 else { return nil }
-            for i in 0..<min(n, 20) {
-                let el = query.element(boundBy: i)
-                if el.exists && el.isHittable { return (el, i) }
-            }
+            // Avoid query.count (it waits for idle and is expensive). Probe element
+            // 0 first; if nothing matches, return fast. Only scan a few when a match
+            // exists. isHittable implies exists, so we skip the extra .exists query.
             let first = query.element(boundBy: 0)
-            return first.exists ? (first, 0) : nil
+            guard first.exists else { return nil }
+            if first.isHittable { return (first, 0) }
+            for i in 1..<10 {
+                let el = query.element(boundBy: i)
+                if !el.exists { break }
+                if el.isHittable { return (el, i) }
+            }
+            return (first, 0)   // exists but not hittable — caller decides
         }
 
         if let (el, idx) = firstHittable(q.matching(NSPredicate(format: "label == %@", query))) {
@@ -1449,28 +1453,25 @@ class ActionHandler {
 
         // Fallback: some labels carry invisible bidi/format chars (e.g. U+2066/2068
         // directional isolates around CJK), so a strict "label == query" misses.
-        // Scan all elements and compare with those characters stripped.
+        // Scan elements with those characters stripped. This is the most expensive
+        // path (per-element .label/.isHittable queries), so cap it tight and stop
+        // early once we walk past the populated range.
         let wantExact = Self.normalizeLabel(query)
-        let all = q
-        let n = min(all.count, 60)
-        if n > 0 {
-            // Prefer exact normalized equality; remember a contains fallback too.
-            var containsHit: (XCUIElement, Int)?
-            for i in 0..<n {
-                let el = all.element(boundBy: i)
-                guard el.exists else { continue }
-                let norm = Self.normalizeLabel(el.label)
-                if norm == wantExact, el.isHittable {
-                    return (el, .exactLabel(query), i)
-                }
-                if matchMode == "contains", containsHit == nil,
-                   norm.localizedCaseInsensitiveContains(wantExact), el.isHittable {
-                    containsHit = (el, i)
-                }
+        var containsHit: (XCUIElement, Int)?
+        for i in 0..<30 {
+            let el = q.element(boundBy: i)
+            if !el.exists { break }        // ran off the end — stop
+            let norm = Self.normalizeLabel(el.label)
+            if norm == wantExact, el.isHittable {
+                return (el, .exactLabel(query), i)
             }
-            if let (el, idx) = containsHit {
-                return (el, .containsLabel(query), idx)
+            if matchMode == "contains", containsHit == nil,
+               norm.localizedCaseInsensitiveContains(wantExact), el.isHittable {
+                containsHit = (el, i)
             }
+        }
+        if let (el, idx) = containsHit {
+            return (el, .containsLabel(query), idx)
         }
         return nil
     }
