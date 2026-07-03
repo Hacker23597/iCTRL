@@ -1453,25 +1453,42 @@ class ActionHandler {
 
         // Fallback: some labels carry invisible bidi/format chars (e.g. U+2066/2068
         // directional isolates around CJK), so a strict "label == query" misses.
-        // Scan elements with those characters stripped. This is the most expensive
-        // path (per-element .label/.isHittable queries), so cap it tight and stop
-        // early once we walk past the populated range.
+        // Instead of querying each element's .label individually (N accessibility
+        // round-trips), take ONE snapshot of the tree and walk it IN MEMORY (like
+        // WebDriverAgent), then re-resolve only the single winning element to an
+        // XCUIElement. This turns ~30-90 queries into 1 snapshot + 1 resolve.
         let wantExact = Self.normalizeLabel(query)
-        var containsHit: (XCUIElement, Int)?
-        for i in 0..<30 {
-            let el = q.element(boundBy: i)
-            if !el.exists { break }        // ran off the end — stop
-            let norm = Self.normalizeLabel(el.label)
-            if norm == wantExact, el.isHittable {
-                return (el, .exactLabel(query), i)
+        guard let root = try? target.snapshot() else { return nil }
+
+        // Depth-first walk collecting the first exact-normalized match and, for
+        // contains mode, the first substring match. We match on label OR value.
+        var exactSnap: XCUIElementSnapshot?
+        var containsSnap: XCUIElementSnapshot?
+        var stack: [XCUIElementSnapshot] = [root]
+        var visited = 0
+        while let s = stack.popLast(), visited < 4000 {
+            visited += 1
+            let hay = Self.normalizeLabel(s.label + " " + ((s.value as? String) ?? ""))
+            if exactSnap == nil, Self.normalizeLabel(s.label) == wantExact {
+                exactSnap = s
+                break   // exact wins immediately
             }
-            if matchMode == "contains", containsHit == nil,
-               norm.localizedCaseInsensitiveContains(wantExact), el.isHittable {
-                containsHit = (el, i)
+            if matchMode == "contains", containsSnap == nil,
+               hay.localizedCaseInsensitiveContains(wantExact) {
+                containsSnap = s
             }
+            stack.append(contentsOf: s.children)
         }
-        if let (el, idx) = containsHit {
-            return (el, .containsLabel(query), idx)
+
+        // Re-resolve the matched snapshot to a live XCUIElement by its label (the
+        // query layer re-finds it; index 0 of the type-filtered label query).
+        if let m = exactSnap {
+            let re = q.matching(NSPredicate(format: "label == %@", m.label)).element(boundBy: 0)
+            if re.exists { return (re, .exactLabel(m.label), 0) }
+        }
+        if let m = containsSnap {
+            let re = q.matching(NSPredicate(format: "label == %@", m.label)).element(boundBy: 0)
+            if re.exists { return (re, .exactLabel(m.label), 0) }
         }
         return nil
     }
