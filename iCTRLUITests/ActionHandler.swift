@@ -1425,6 +1425,17 @@ class ActionHandler {
         let target: XCUIApplication = bid.map { XCUIApplication(bundleIdentifier: $0) } ?? app
         let q = elementQuery(in: target, type: type)
 
+        // Phased timing: log how long each match stage takes so slow lookups can be
+        // attributed (which stage, and snapshot node count for the fallback).
+        let t0 = nowMonotonic
+        var phases: [String] = []
+        func lap(_ name: String, from: TimeInterval) {
+            phases.append("\(name)=\(Int((nowMonotonic - from) * 1000))ms")
+        }
+        func done(_ hit: String) {
+            iCTRLUITests.logBuffer.append("🔎 locate '\(query)' \(hit) [\(phases.joined(separator: " "))] total=\(Int((nowMonotonic - t0) * 1000))ms")
+        }
+
         func firstHittable(_ query: XCUIElementQuery) -> (XCUIElement, Int)? {
             // Avoid query.count (it waits for idle and is expensive). Probe element
             // 0 first; if nothing matches, return fast. Only scan a few when a match
@@ -1440,15 +1451,27 @@ class ActionHandler {
             return (first, 0)   // exists but not hittable — caller decides
         }
 
+        var s = nowMonotonic
         if let (el, idx) = firstHittable(q.matching(NSPredicate(format: "label == %@", query))) {
+            lap("exact", from: s); done("→exact")
             return (el, .exactLabel(query), idx)
         }
+        lap("exact", from: s)
+
+        s = nowMonotonic
         if let (el, idx) = firstHittable(q.matching(identifier: query)) {
+            lap("id", from: s); done("→id")
             return (el, .identifier(query), idx)
         }
-        if matchMode == "contains",
-           let (el, idx) = firstHittable(q.matching(NSPredicate(format: "label CONTAINS[c] %@", query))) {
-            return (el, .containsLabel(query), idx)
+        lap("id", from: s)
+
+        if matchMode == "contains" {
+            s = nowMonotonic
+            if let (el, idx) = firstHittable(q.matching(NSPredicate(format: "label CONTAINS[c] %@", query))) {
+                lap("contains", from: s); done("→contains")
+                return (el, .containsLabel(query), idx)
+            }
+            lap("contains", from: s)
         }
 
         // Fallback: some labels carry invisible bidi/format chars (e.g. U+2066/2068
@@ -1458,38 +1481,48 @@ class ActionHandler {
         // WebDriverAgent), then re-resolve only the single winning element to an
         // XCUIElement. This turns ~30-90 queries into 1 snapshot + 1 resolve.
         let wantExact = Self.normalizeLabel(query)
-        guard let root = try? target.snapshot() else { return nil }
+        s = nowMonotonic
+        guard let root = try? target.snapshot() else {
+            lap("snapshot", from: s); done("✗no-snapshot")
+            return nil
+        }
+        lap("snapshot", from: s)
 
         // Depth-first walk collecting the first exact-normalized match and, for
         // contains mode, the first substring match. We match on label OR value.
+        s = nowMonotonic
         var exactSnap: XCUIElementSnapshot?
         var containsSnap: XCUIElementSnapshot?
         var stack: [XCUIElementSnapshot] = [root]
         var visited = 0
-        while let s = stack.popLast(), visited < 4000 {
+        while let node = stack.popLast(), visited < 4000 {
             visited += 1
-            let hay = Self.normalizeLabel(s.label + " " + ((s.value as? String) ?? ""))
-            if exactSnap == nil, Self.normalizeLabel(s.label) == wantExact {
-                exactSnap = s
+            let hay = Self.normalizeLabel(node.label + " " + ((node.value as? String) ?? ""))
+            if exactSnap == nil, Self.normalizeLabel(node.label) == wantExact {
+                exactSnap = node
                 break   // exact wins immediately
             }
             if matchMode == "contains", containsSnap == nil,
                hay.localizedCaseInsensitiveContains(wantExact) {
-                containsSnap = s
+                containsSnap = node
             }
-            stack.append(contentsOf: s.children)
+            stack.append(contentsOf: node.children)
         }
+        phases.append("walk=\(Int((nowMonotonic - s) * 1000))ms/\(visited)nodes")
 
         // Re-resolve the matched snapshot to a live XCUIElement by its label (the
         // query layer re-finds it; index 0 of the type-filtered label query).
+        s = nowMonotonic
         if let m = exactSnap {
             let re = q.matching(NSPredicate(format: "label == %@", m.label)).element(boundBy: 0)
-            if re.exists { return (re, .exactLabel(m.label), 0) }
+            if re.exists { lap("resolve", from: s); done("→snapshot-exact"); return (re, .exactLabel(m.label), 0) }
         }
         if let m = containsSnap {
             let re = q.matching(NSPredicate(format: "label == %@", m.label)).element(boundBy: 0)
-            if re.exists { return (re, .exactLabel(m.label), 0) }
+            if re.exists { lap("resolve", from: s); done("→snapshot-contains"); return (re, .exactLabel(m.label), 0) }
         }
+        lap("resolve", from: s)
+        done("✗not-found")
         return nil
     }
 
