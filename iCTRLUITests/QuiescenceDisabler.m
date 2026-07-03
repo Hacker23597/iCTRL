@@ -9,6 +9,14 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
+// Private XCTest globals that bound how long internal idle/state waits can run.
+// XCUIElement.tap()/isHittable/etc. wait for the app to reach an idle state via
+// this timeout; XCTest's default can be very long, which is how an element tap
+// that navigates blocked ~4-8s. WebDriverAgent bounds it the same way
+// (_XCTSetApplicationStateTimeout, see XCUIApplicationProcess+FBQuiescence).
+extern void _XCTSetApplicationStateTimeout(NSTimeInterval timeout) __attribute__((weak_import));
+extern NSTimeInterval _XCTApplicationStateTimeout(void) __attribute__((weak_import));
+
 @interface QuiescenceDisabler : NSObject
 @end
 
@@ -19,6 +27,15 @@ static void noopQuiescence(id self, SEL _cmd, BOOL includingAnimations) {}
 static void noopQuiescencePreEvent(id self, SEL _cmd, BOOL includingAnimations, BOOL isPreEvent) {}
 
 + (void)load {
+    // Bound XCTest's internal idle/state wait so XCUIElement.tap()/isHittable/etc.
+    // can't block for many seconds when a tap navigates (observed ~4-8s, which
+    // coincided with the test being torn down). WDA sets this to seconds; we use a
+    // tight 2s cap. Safe if the symbol is missing (weak import).
+    if (_XCTSetApplicationStateTimeout != NULL) {
+        _XCTSetApplicationStateTimeout(2.0);
+        NSLog(@"iCTRL: XCTest application-state timeout capped at 2s");
+    }
+
     Class cls = NSClassFromString(@"XCUIApplicationProcess");
     if (!cls) { return; }
 
