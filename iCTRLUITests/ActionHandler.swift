@@ -482,8 +482,20 @@ class ActionHandler {
         if let refId = cmd.ref {
             let (el, err) = resolveRefForAction(refId)
             if let err = err { return (nil, err) }
-            el!.tap()
-            return (["message": .string("Tapped ref \(refId) ('\(el!.label)')")], nil)
+            // Resolve the element to its frame center and tap by SYNTHESIZED event
+            // (fastTap) instead of XCUIElement.tap(). XCUIElement.tap() does its own
+            // waiting and post-event settling; when the tap navigates to a new page
+            // that settling ran ~4s and coincided with the test being torn down.
+            // A coordinate synthesized tap is fast (<1s) and doesn't wait.
+            let f = el!.frame
+            let label = el!.label
+            let cx = Double(f.midX), cy = Double(f.midY)
+            let r = fastHandler.fastTap(x: cx, y: cy)
+            if r.1 != nil {
+                // Fallback to element tap only if the synthesized tap failed.
+                el!.tap()
+            }
+            return (["message": .string("Tapped ref \(refId) ('\(label)') at (\(Int(cx)),\(Int(cy)))")], nil)
         }
 
         guard let x = cmd.x, let y = cmd.y else {
@@ -1524,8 +1536,14 @@ class ActionHandler {
             ))
         }
 
-        element.tap()
-        return (["message": .string("Tapped element '\(element.label.isEmpty ? elementId : element.label)'")], nil)
+        // Tap by synthesized event at the element's center (fast, no post-event
+        // settling) rather than XCUIElement.tap(), which can run ~4s when the tap
+        // navigates and has coincided with the test being torn down.
+        let f = element.frame
+        let label = element.label
+        let r = fastHandler.fastTap(x: Double(f.midX), y: Double(f.midY))
+        if r.1 != nil { element.tap() }   // fallback only if synthesized tap failed
+        return (["message": .string("Tapped element '\(label.isEmpty ? elementId : label)' at (\(Int(f.midX)),\(Int(f.midY)))")], nil)
     }
 
     private func findElement(id: String, type: String?) -> XCUIElement {
