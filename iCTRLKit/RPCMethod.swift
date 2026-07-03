@@ -87,7 +87,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "swipe",
-            description: "Swipe/scroll. x,y are OPTIONAL — default start is the screen center, so {\"direction\":\"up\"} scrolls the middle of the screen. 'distance' is the finger travel in points (default 100). 'velocity' tunes how far the CONTENT scrolls: 'fast'/'flick' adds iOS momentum (scrolls far beyond finger travel — best for jumping through long pages), 'normal' (default), 'slow'/'precise' = exact drag with no momentum. To reach a known element in one call, prefer scroll_to_element.",
+            description: "Low-level swipe/scroll gesture. x,y are OPTIONAL — default start is the screen center. 'distance' is finger travel in points (default 100). 'velocity': 'fast'/'flick' adds iOS momentum (scrolls FAR beyond finger travel — easy to overshoot/skip content), 'normal' (default), 'slow'/'precise' = exact drag, no momentum. NOTE: to READ through a long page use 'page' (precise Page Down/Up, won't overshoot); to reach a known element use 'scroll_to_element'. Reserve swipe for custom gestures (partial drags, horizontal carousels, etc.).",
             params: [
                 RPCParamDef(name: "x", type: "number", required: false, description: "Start X (default: screen center)"),
                 RPCParamDef(name: "y", type: "number", required: false, description: "Start Y (default: screen center)"),
@@ -97,6 +97,15 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "fast", type: "boolean", required: false, description: "Use synthesized fast path (default true); set false for legacy XCUITest swipe"),
             ],
             returns: "{message, from:{x,y}, velocity, note}"
+        ),
+        RPCMethodDef(
+            name: "page",
+            description: "Scroll by one screenful — like Page Down / Page Up on a keyboard. This is the RECOMMENDED way to read through a long page: it's PRECISE (no momentum/overshoot), so you won't skip content the way swipe with velocity:'fast' does. Use {\"direction\":\"down\"} (default, reveal content below) or {\"direction\":\"up\"}; the aliases page_down / page_up force the direction. After paging, re-read with page_source or screenshot. To jump straight to a known element, prefer scroll_to_element.",
+            params: [
+                RPCParamDef(name: "direction", type: "string", required: false, description: "'down' (default, reveal below) or 'up'"),
+                RPCParamDef(name: "distance", type: "number", required: false, description: "Number of screenfuls (default 1; e.g. 0.5 = half a page, 2 = two pages)"),
+            ],
+            returns: "{message, screen}"
         ),
         RPCMethodDef(
             name: "scroll_to_element",

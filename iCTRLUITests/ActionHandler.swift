@@ -182,6 +182,7 @@ class ActionHandler {
     // text would be lost. type() acts on whatever currently has focus.
     private static let uiActionMethods: Set<String> = [
         "tap", "double_tap", "long_press", "swipe", "scroll", "drag",
+        "page", "page_down", "page_up",
         "page_source", "view_tree", "ui_tree", "scroll_to_element", "scroll_to",
         "find_element", "tap_element", "screenshot",
     ]
@@ -282,6 +283,8 @@ class ActionHandler {
             return longPress(cmd)
         case "swipe":
             return swipe(cmd)
+        case "page", "page_down", "page_up":
+            return pageScroll(cmd, method: method)
         case "scroll":
             return scroll(cmd)
         case "type":
@@ -541,6 +544,48 @@ class ActionHandler {
     }
 
     // MARK: - Swipe & Scroll
+
+    /// Page-scroll: move by (about) one screenful, like Page Down / Page Up on a
+    /// keyboard. Precise (no momentum) so you can read content page by page without
+    /// the overshoot that swipe+velocity:fast causes. Params:
+    ///   direction: "down" (default, reveal content below) / "up"; page_down/page_up
+    ///     methods force the direction.
+    ///   pages: how many screenfuls (default 1; e.g. 0.5 for half a page).
+    private func pageScroll(_ cmd: ActionCommand, method: String) -> ([String: JSONValue]?, JSONRPCError?) {
+        let size = pointSize
+        let cx = size.width / 2
+
+        // Direction: explicit method wins, else the `direction` param, else down.
+        var goingDown = true
+        if method == "page_up" { goingDown = false }
+        else if method == "page_down" { goingDown = true }
+        else if let d = cmd.direction?.lowercased() { goingDown = (d != "up") }
+
+        // Number of screenfuls (default 1). One "page" moves ~85% of the height so
+        // a sliver of overlap remains for reading continuity.
+        let pages = max(0.1, min(cmd.distance ?? 1.0, 5.0))   // reuse `distance` as page count
+        let pageTravel = size.height * 0.85 * pages
+
+        // Scroll within the middle band, away from the very top/bottom (nav bars,
+        // home indicator, pull-to-refresh zones).
+        let fromY: Double, toY: Double
+        if goingDown {
+            fromY = size.height * 0.78
+            toY = max(size.height * 0.12, fromY - pageTravel)
+        } else {
+            fromY = size.height * 0.22
+            toY = min(size.height * 0.88, fromY + pageTravel)
+        }
+
+        // Precise drag: a long moveDuration means NO iOS momentum — content moves
+        // ~exactly the finger travel, page by page.
+        let r = fastHandler.fastSwipe(fromX: cx, fromY: fromY, toX: cx, toY: toY, duration: 0.45)
+        if r.1 != nil { return r }
+        return ([
+            "message": .string("Paged \(goingDown ? "down" : "up") \(pages) screenful(s). Precise scroll (no momentum). Re-read with page_source/screenshot."),
+            "screen": coordinateHint,
+        ], nil)
+    }
 
     private func swipe(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         // x/y are OPTIONAL. Default start point is the screen center, so a bare
