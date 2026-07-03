@@ -186,28 +186,61 @@ class ActionHandler {
         "find_element", "tap_element", "screenshot",
     ]
 
-    /// Re-activate the bound app if it isn't the current foreground app. Bounded
-    /// by a short timeout so a hung activate can't stall the action.
-    private func ensureBoundAppForeground() {
-        guard let bound = boundBundleId, !bound.isEmpty else { return }
-        // An explicit-per-call bundle_id is handled by the individual method; here
-        // we only enforce the sticky default target.
-        // Just opened/activated it — skip the (possibly slow) re-activation; the
-        // app is already coming to the front. Avoids a redundant activate right
-        // after launch_app that cost ~5s on the first post-launch action.
-        if nowMonotonic - lastBoundActivateAt < 4.0 { return }
+    /// XCUIApplication.State raw values (see ForegroundApp.appStateForBundleID).
+    private enum AppState: Int {
+        case unknown = 0, notRunning = 1, backgroundSuspended = 2
+        case background = 3, foreground = 4
+    }
 
-        let current = ForegroundApp.currentBundleID()
-        if current == bound { return }
-        // Use the Obj-C safe activate: XCUIApplication.activate() can throw an
-        // XCTest NSException that Swift CANNOT catch — off the main thread that
-        // exception reaches XCTest's terminate handler and aborts the whole runner
-        // (observed crash). @try/@catch in Obj-C contains it.
-        _ = runWithTimeout(seconds: 3) {
-            _ = ForegroundApp.safeActivateBundleID(bound)
+    /// Prepare the target app for a UI action, mirroring WebDriverAgent's
+    /// `activeApplication` logic but returning an AI-friendly diagnostic instead
+    /// of silently doing the wrong thing:
+    ///   - if a SYSTEM ALERT is up, stop and tell the caller to handle it first;
+    ///   - if the bound app has CRASHED/EXITED, stop and tell the caller to relaunch;
+    ///   - if it's merely backgrounded, bring it forward (bounded, exception-safe);
+    ///   - if it's already frontmost (or was just launched), no-op.
+    /// Returns an error to abort the action, or nil to proceed. `note` (if set) is
+    /// attached to the successful response so the model learns what happened.
+    private func ensureBoundAppForeground() -> (error: JSONRPCError?, note: String?) {
+        // A system alert (permission prompt, etc.) sits above the app — acting on
+        // the app underneath silently misbehaves. Surface it. (WDA: shouldRespectSystemAlerts)
+        if ForegroundApp.hasSystemAlert() {
+            return (JSONRPCError(code: -32000, message:
+                "A system alert/permission dialog is currently on screen, covering the app. Handle it first: " +
+                "page_source{bundle_id:\"com.apple.springboard\"} to read it, then tap its button (Allow/OK/Don't Allow). " +
+                "Actions on the app underneath won't work until it's dismissed.", data: nil), nil)
         }
-        lastBoundActivateAt = nowMonotonic
-        usleep(300_000)  // let the switch settle before we act
+
+        guard let bound = boundBundleId, !bound.isEmpty else { return (nil, nil) }
+
+        // Just opened/activated it — skip the (possibly slow) re-check; the app is
+        // already coming to the front. Avoids a redundant ~3-5s activate right
+        // after launch_app.
+        if nowMonotonic - lastBoundActivateAt < 4.0 { return (nil, nil) }
+
+        // If it's already frontmost, nothing to do.
+        if ForegroundApp.currentBundleID() == bound { return (nil, nil) }
+
+        // Check the bound app's actual state before touching it. (WDA throws
+        // FBApplicationCrashedException here; we return a clear, recoverable error.)
+        let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bound)) ?? .unknown
+        switch state {
+        case .notRunning:
+            return (JSONRPCError(code: -32001, message:
+                "The bound app '\(bound)' is no longer running (it was closed or the system reclaimed it). " +
+                "Re-open it with launch_app{bundle_id:\"\(bound)\"} before continuing. " +
+                "(Actions stay bound to the app you launched; when it exits you must relaunch.)", data: nil), nil)
+        case .background, .backgroundSuspended, .unknown:
+            // Bring it forward — exception-safe, bounded.
+            _ = runWithTimeout(seconds: 3) {
+                _ = ForegroundApp.safeActivateBundleID(bound)
+            }
+            lastBoundActivateAt = nowMonotonic
+            usleep(300_000)  // let the switch settle
+            return (nil, "Re-focused '\(bound)' (it had gone to the background) before this action.")
+        case .foreground:
+            return (nil, nil)
+        }
     }
 
     /// Monotonic time of the last activate of the bound app (launch/activate or a
@@ -219,10 +252,23 @@ class ActionHandler {
 
         // Keep the sticky target app in front for UI actions — unless the caller
         // passed an explicit bundle_id for this call (they want that app instead).
+        var foregroundNote: String? = nil
         if Self.uiActionMethods.contains(method), cmd.bundleId == nil {
-            ensureBoundAppForeground()
+            let prep = ensureBoundAppForeground()
+            if let err = prep.error { return (nil, err) }   // alert up / app crashed → abort with guidance
+            foregroundNote = prep.note
         }
 
+        let result = dispatchInner(method: method, cmd: cmd)
+        // Surface the re-focus note so the model learns the app had drifted.
+        if let note = foregroundNote, var data = result.0 {
+            data["app_note"] = .string(note)
+            return (data, result.1)
+        }
+        return result
+    }
+
+    private func dispatchInner(method: String, cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         switch method {
         case "device_info":
             return deviceInfo()
@@ -882,6 +928,7 @@ class ActionHandler {
         lastBoundActivateAt = nowMonotonic  // just brought forward — skip redundant re-activate
         return ([
             "message": .string("Opened \(bundleId). Actions now target this app until you open another. IMPORTANT: the app is still launching/rendering — wait 2-3s (call wait), THEN page_source to confirm the UI is stable before locating elements. Acting too early matches placeholder/splash elements or is very slow (cold-start element queries can take 6s+)."),
+            "bound_app": .string(bundleId),
             "advice": .string("wait 2-3s, then page_source"),
         ], nil)
     }

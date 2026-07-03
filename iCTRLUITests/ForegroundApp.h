@@ -32,6 +32,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// termination was attempted without throwing.
 + (BOOL)safeTerminateBundleID:(NSString *)bundleId;
 
+/// Returns the XCUIApplicationState raw value for a bundle id, caught safely:
+///   0 = unknown, 1 = notRunning, 2 = runningBackgroundSuspended,
+///   3 = runningBackground, 4 = runningForeground.
+/// Used to tell "app crashed/closed" from "app just not frontmost".
++ (NSInteger)appStateForBundleID:(NSString *)bundleId;
+
+/// Whether a system alert / permission dialog is currently on screen (owned by
+/// SpringBoard, covering the app). When true, actions should target the system
+/// UI to dismiss it first. Caught safely; returns NO on any error.
++ (BOOL)hasSystemAlert;
+
 @end
 
 NS_ASSUME_NONNULL_END

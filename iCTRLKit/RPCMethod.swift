@@ -313,13 +313,17 @@ struct RPCMethodRegistry {
                     "Key trap: type() into an unfocused field silently loses the text and submit:true then searches an empty/garbage query. type() now refuses to run when no keyboard is visible — treat that error as 'refocus the field', not 'retry blindly'.",
                 ],
                 "app_binding":
-                    "After you open an app with launch_app/activate_app, it becomes the STICKY TARGET: all " +
-                    "subsequent UI actions (tap, swipe, type, page_source, find_element, screenshot, …) operate on " +
-                    "that app, and the server re-focuses it automatically if the foreground drifted. So 'open Taobao' " +
-                    "then 'tap …' always acts on Taobao, even if another app came to the front in between. " +
-                    "To act on a DIFFERENT app for a single call, pass an explicit bundle_id on that call (it does not " +
-                    "change the sticky target). Opening another app with launch_app/activate_app moves the target; " +
-                    "terminate_app on the target clears it (actions then fall back to the live foreground app).",
+                    "After you open an app with launch_app/activate_app it becomes the STICKY TARGET (see 'bound_app' " +
+                    "in the launch_app response): all subsequent UI actions (tap, swipe, type, page_source, " +
+                    "find_element, screenshot, …) operate on that app, and the server re-focuses it automatically if " +
+                    "the foreground drifted (the response then carries an 'app_note' saying it was re-focused). So " +
+                    "'open Taobao' then 'tap …' always acts on Taobao even if another app came to the front. " +
+                    "Two situations abort the action with a clear error instead of doing the wrong thing: " +
+                    "(1) the bound app has CRASHED/EXITED (state notRunning) → error tells you to launch_app again; " +
+                    "(2) a SYSTEM ALERT/permission dialog is covering the app → error tells you to read it via " +
+                    "page_source{bundle_id:'com.apple.springboard'} and tap its button first. " +
+                    "To act on a DIFFERENT app for one call, pass an explicit bundle_id (does not change the sticky " +
+                    "target). Opening another app moves the target; terminate_app on the target clears it.",
                 "inspecting_ui":
                     "PREFER page_source (the accessibility/view hierarchy as text) to understand layout — " +
                     "it gives element types, labels, identifiers, and exact frames in POINTS, is far smaller " +

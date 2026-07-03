@@ -218,6 +218,42 @@
     }
 }
 
++ (NSInteger)appStateForBundleID:(NSString *)bundleId {
+    if (bundleId.length == 0) { return 0; }
+    @try {
+        Class appClass = NSClassFromString(@"XCUIApplication");
+        if (!appClass) { return 0; }
+        id (*initFn)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+        id app = initFn([appClass alloc], @selector(initWithBundleIdentifier:), bundleId);
+        if (!app || ![app respondsToSelector:@selector(state)]) { return 0; }
+        NSInteger (*stateFn)(id, SEL) = (NSInteger (*)(id, SEL))objc_msgSend;
+        return stateFn(app, @selector(state));
+    } @catch (__unused NSException *e) {
+        return 0;
+    }
+}
+
++ (BOOL)hasSystemAlert {
+    @try {
+        Class appClass = NSClassFromString(@"XCUIApplication");
+        if (!appClass) { return NO; }
+        // -[XCUIApplication springboardApplication] / systemApplication varies by
+        // OS; construct SpringBoard directly and look for an alert element.
+        id (*initFn)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+        id sb = initFn([appClass alloc], @selector(initWithBundleIdentifier:), @"com.apple.springboard");
+        if (!sb) { return NO; }
+        // sb.alerts.count > 0  → a system alert is present.
+        id alerts = [sb performSelector:@selector(alerts)];
+        if (alerts && [alerts respondsToSelector:@selector(count)]) {
+            NSUInteger (*countFn)(id, SEL) = (NSUInteger (*)(id, SEL))objc_msgSend;
+            return countFn(alerts, @selector(count)) > 0;
+        }
+        return NO;
+    } @catch (__unused NSException *e) {
+        return NO;
+    }
+}
+
 + (BOOL)openURL:(NSURL *)url {
     // 1) XCTest daemon session — the sanctioned path from a runner (iOS 16.4+).
     //    This is what WebDriverAgent uses; UIApplication/LSApplicationWorkspace
