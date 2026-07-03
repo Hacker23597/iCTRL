@@ -1040,6 +1040,9 @@ class ActionHandler {
         lines.append(indent + describeSnapshot(s))
         localCount += 1
         globalCount += 1
+        // Append the rendered child subtree AFTER this node — without this the
+        // whole descendant tree was silently dropped (only the root was emitted).
+        lines.append(contentsOf: childLines)
         return true
     }
 
