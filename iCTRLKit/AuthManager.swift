@@ -88,13 +88,33 @@ class AuthManager {
         lock.unlock()
     }
 
-    /// Remove expired sessions. Safe to call frequently.
+    /// Max tokens to keep; beyond this, the least-recently-active are dropped.
+    static let maxSessions = 100
+    /// Drop tokens not used within this window (independent of the 30-day TTL).
+    static let inactivityWindow: TimeInterval = 30 * 24 * 60 * 60  // 1 month
+
+    /// Remove expired / long-inactive sessions and cap the count. Safe to call often.
     @discardableResult
     func pruneExpired() -> Int {
         lock.lock()
         defer { lock.unlock() }
         let before = sessions.count
-        sessions = sessions.filter { !$0.value.isExpired }
+        let now = Date()
+
+        // 1) Drop hard-expired tokens (past expiresAt) and tokens not accessed in
+        //    the inactivity window (last_active_at older than 1 month).
+        sessions = sessions.filter { _, s in
+            !s.isExpired && now.timeIntervalSince(s.lastActiveAt) < Self.inactivityWindow
+        }
+
+        // 2) Cap the count: if still over the limit, drop the least-recently-active.
+        if sessions.count > Self.maxSessions {
+            let keep = sessions.values
+                .sorted { $0.lastActiveAt > $1.lastActiveAt }   // most recent first
+                .prefix(Self.maxSessions)
+            sessions = Dictionary(uniqueKeysWithValues: keep.map { ($0.id, $0) })
+        }
+
         let removed = before - sessions.count
         if removed > 0 {
             persistLocked()
@@ -126,12 +146,20 @@ class AuthManager {
     private func persistLocked() {
         let list = Array(sessions.values)
         if let data = try? JSONEncoder.iso.encode(list) {
-            KeychainStore.save(data)
+            TokenFileStore.save(data)
         }
     }
 
     private func loadFromKeychain() {
-        guard let data = KeychainStore.load(),
+        // (Kept name for call sites.) Loads from the sandbox file now; also
+        // migrates any legacy Keychain blob once so existing users don't get
+        // logged out on upgrade.
+        var data = TokenFileStore.load()
+        if data == nil, let legacy = KeychainStore.load() {
+            data = legacy
+            if let legacy = data { TokenFileStore.save(legacy) }  // migrate forward
+        }
+        guard let data = data,
               let list = try? JSONDecoder.iso.decode([AuthSession].self, from: data) else {
             return
         }
