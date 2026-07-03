@@ -371,29 +371,35 @@ class ActionHandler {
         let targetScale = min(max(requested, 0.05), 3.0)
 
         // Target selection:
-        //   - explicit bundle_id → screenshot ONLY that app's window
-        //   - else the sticky target app (bound via launch_app/activate_app)
-        //   - else the whole screen (XCUIScreen)
-        // App-scoped shots capture just that app's UI (no status bar / other apps)
-        // and work even if it isn't the frontmost app.
-        let targetBundleId = cmd.bundleId ?? boundBundleId
+        //   - explicit bundle_id → screenshot ONLY that app's window (opt-in)
+        //   - otherwise → the WHOLE SCREEN (XCUIScreen) — always fast (~0.4s).
+        // IMPORTANT: we DO NOT use the sticky boundBundleId here. App-scoped
+        // XCUIApplication.screenshot() can block for 8s+ while the app is in a
+        // transition (page switch / loading), which blocked the main thread long
+        // enough for XCTest to terminate the test (observed crash, twice).
+        // XCUIScreen.screenshot() is always fast and captures whatever's on screen,
+        // which is what you want by default anyway.
         var fullImage: UIImage
         let scopedTo: String?
-        if let bid = targetBundleId, !bid.isEmpty {
-            // App-scoped screenshot can throw an NSException (app terminated /
-            // window not renderable) or return a black frame when the app is
-            // backgrounded. Guard it and fall back to a full-screen shot.
+        if let bid = cmd.bundleId, !bid.isEmpty {
+            // Explicit opt-in: app-scoped, but time-bounded (fall back to the fast
+            // full-screen shot if it's slow/throws/black). This is the ONLY path
+            // that can be slow, and only when the caller explicitly asked for it.
             var appImage: UIImage?
-            let reason = ObjCException.catching {
-                appImage = XCUIApplication(bundleIdentifier: bid).screenshot().image
+            var finished = false
+            let done = runWithTimeout(seconds: 3) {
+                _ = ObjCException.catching {
+                    appImage = XCUIApplication(bundleIdentifier: bid).screenshot().image
+                }
+                finished = true
             }
-            if let img = appImage, reason == nil {
+            if done, finished, let img = appImage {
                 fullImage = img
                 scopedTo = bid
             } else {
                 fullImage = XCUIScreen.main.screenshot().image
                 scopedTo = nil
-                iCTRLUITests.logBuffer.append("📸 app-scoped screenshot for \(bid) failed (\(reason ?? "nil image")) — fell back to full screen")
+                iCTRLUITests.logBuffer.append("📸 app-scoped screenshot for \(bid) slow/failed — fell back to full screen")
             }
         } else {
             fullImage = XCUIScreen.main.screenshot().image

@@ -46,7 +46,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "screenshot",
-            description: "Capture a screenshot as base64 PNG. SECOND CHOICE after page_source — use when you need visual detail or an element is absent from the view tree. By default captures the sticky target app's window (the app you opened with launch_app/activate_app), or the whole screen if none is bound. Pass bundle_id to capture a specific app's window (works even if it isn't frontmost); the capture is scoped to that app (no status bar / other apps). Image is in PIXELS; tap coordinates are in POINTS. Optional 'scale' controls output resolution (default 2, max 3, e.g. 1, 0.5).",
+            description: "Capture a screenshot as base64 PNG. SECOND CHOICE after page_source — use when you need visual detail or an element is absent from the view tree. By default captures the WHOLE SCREEN (fast, ~0.4s). Pass bundle_id ONLY if you specifically want just one app's window cropped out (slower; time-bounded with a full-screen fallback). Image is in PIXELS; tap coordinates are in POINTS. Optional 'scale' controls output resolution (default 2, max 3, e.g. 1, 0.5).",
             params: [
                 RPCParamDef(name: "scale", type: "number", required: false, description: "Output pixels-per-point (default 2, max 3; smaller = faster/less detail, e.g. 1 or 0.5)"),
                 RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Capture this app's window; default = sticky target app, else whole screen"),
