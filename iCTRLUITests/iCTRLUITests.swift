@@ -398,12 +398,14 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// service). Serial so actions still run one-at-a-time in order.
     private let rpcQueue = DispatchQueue(label: "com.openminis.ictrl.rpc")
 
-    /// Hard ceiling for a single RPC. With quiescence disabled + fast defaults,
-    /// real actions finish in well under a second; anything approaching this is a
-    /// hang. We report a timeout to the client but the work continues in the
-    /// background (XCUITest calls can't be force-cancelled) — the next request
-    /// still runs on the serial queue once the stuck one returns.
-    private static let rpcTimeout: TimeInterval = 20
+    /// Hard ceiling for a single RPC before we report failure to the client. With
+    /// quiescence disabled + fast defaults, real actions finish well under 1s, so
+    /// a few seconds is already a hang. We reply failure quickly (so the client
+    /// isn't left waiting and XCTest's own execution watchdog is less likely to
+    /// kill the test); the underlying XCUITest call — which genuinely can't be
+    /// force-cancelled — finishes on its own, and the serial queue drains it
+    /// before the next request runs.
+    private static let rpcTimeout: TimeInterval = 6
 
     /// Wire RPC dispatch + public logs onto a server instance.
     private func configureServerCallbacks(_ srv: JSONRPCServer) {
