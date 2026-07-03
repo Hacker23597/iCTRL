@@ -927,13 +927,27 @@ class ActionHandler {
         let maxElements = min(cmd.maxElements ?? 500, 2000)
         let filter = SnapshotFilter(type: cmd.filterType, label: cmd.filterLabel, text: cmd.filterText)
 
-        let snapshot: XCUIElementSnapshot
-        do {
-            snapshot = try target.snapshot()
-        } catch {
+        // Collect the snapshots to render. A single application.snapshot() can MISS
+        // floating overlay layers that live in separate windows (e.g. Taobao's
+        // fixed "加入购物车/立即购买" bottom bar). So we snapshot the application AND
+        // each of its windows, and render whichever roots we got — deduping by the
+        // window frames we've already covered.
+        var roots: [XCUIElementSnapshot] = []
+        if let appSnap = try? target.snapshot() {
+            roots.append(appSnap)
+        }
+        // Additional windows (overlays). windows.count doesn't wait for quiescence.
+        let windowCount = min(target.windows.count, 8)
+        if windowCount > 0 {
+            for i in 0..<windowCount {
+                if let ws = try? target.windows.element(boundBy: i).snapshot() {
+                    roots.append(ws)
+                }
+            }
+        }
+        guard !roots.isEmpty else {
             return (nil, .serverError(
-                "Could not snapshot the accessibility tree: \(error.localizedDescription). " +
-                "The app may still be launching — wait briefly and retry, or take a screenshot."
+                "Could not snapshot the accessibility tree. The app may still be launching — wait briefly and retry, or take a screenshot."
             ))
         }
 
@@ -941,9 +955,15 @@ class ActionHandler {
         var count = 0
         var localCount = 0
         var truncated = false
-        renderSnapshotInto(snapshot, depth: 0, maxDepth: maxDepth, maxElements: maxElements,
-                           filter: filter, lines: &lines, localCount: &localCount,
-                           globalCount: &count, truncated: &truncated)
+        // Track element frames already emitted so overlapping window/app snapshots
+        // don't duplicate the same nodes.
+        var seenFrames = Set<String>()
+        for root in roots {
+            renderSnapshotInto(root, depth: 0, maxDepth: maxDepth, maxElements: maxElements,
+                               filter: filter, lines: &lines, localCount: &localCount,
+                               globalCount: &count, truncated: &truncated, seenFrames: &seenFrames)
+            if count >= maxElements { break }
+        }
 
         let body = lines.joined(separator: "\n")
 
@@ -1018,8 +1038,17 @@ class ActionHandler {
     private func renderSnapshotInto(_ s: XCUIElementSnapshot, depth: Int, maxDepth: Int,
                                     maxElements: Int, filter: SnapshotFilter,
                                     lines: inout [String], localCount: inout Int,
-                                    globalCount: inout Int, truncated: inout Bool) -> Bool {
+                                    globalCount: inout Int, truncated: inout Bool,
+                                    seenFrames: inout Set<String>) -> Bool {
         if globalCount >= maxElements { truncated = true; return false }
+
+        // Dedup across app + per-window snapshots: skip a node we've already
+        // emitted (same type + frame). Container 'Other'/'Application' roots are
+        // allowed to repeat (their frames overlap by nature) but leaf identity is
+        // keyed on type+frame+label.
+        let f = s.frame
+        let key = "\(s.elementType.rawValue)|\(Int(f.minX)),\(Int(f.minY)),\(Int(f.width)),\(Int(f.height))|\(s.label)"
+        let isDup = seenFrames.contains(key)
 
         let selfMatches = !filter.active || filter.matches(s)
         var childLines: [String] = []
@@ -1033,18 +1062,23 @@ class ActionHandler {
                 let kept = renderSnapshotInto(child, depth: depth + 1, maxDepth: maxDepth,
                                               maxElements: maxElements, filter: filter,
                                               lines: &sub, localCount: &subCount,
-                                              globalCount: &globalCount, truncated: &truncated)
+                                              globalCount: &globalCount, truncated: &truncated,
+                                              seenFrames: &seenFrames)
                 if kept { childLines.append(contentsOf: sub); descendantMatched = true }
             }
         }
 
-        let keep = !filter.active || selfMatches || descendantMatched
+        // Skip emitting a duplicate leaf, but still surface children that are new.
+        let keep = (!filter.active || selfMatches || descendantMatched) && (!isDup || descendantMatched)
         guard keep else { return false }
 
-        let indent = String(repeating: "  ", count: depth)
-        lines.append(indent + describeSnapshot(s))
-        localCount += 1
-        globalCount += 1
+        if !isDup {
+            seenFrames.insert(key)
+            let indent = String(repeating: "  ", count: depth)
+            lines.append(indent + describeSnapshot(s))
+            localCount += 1
+            globalCount += 1
+        }
         // Append the rendered child subtree AFTER this node — without this the
         // whole descendant tree was silently dropped (only the root was emitted).
         lines.append(contentsOf: childLines)
