@@ -477,19 +477,40 @@ class ActionHandler {
         return (el, nil)
     }
 
+    /// A small random offset (±maxJitter pt, default 3) to add to an element-tap
+    /// point so successive taps don't all land on the exact same pixel — a little
+    /// more human. Clamped so the point stays comfortably inside the element frame
+    /// (never within 2pt of an edge), and skipped for tiny elements.
+    private func humanizedPoint(in frame: CGRect, maxJitter: Double = 3.0) -> (Double, Double) {
+        let cx = Double(frame.midX), cy = Double(frame.midY)
+        // Keep at least a 2pt margin from each edge; if the element is too small to
+        // jitter safely, just use the center.
+        let jx = min(maxJitter, max(0, Double(frame.width) / 2 - 2))
+        let jy = min(maxJitter, max(0, Double(frame.height) / 2 - 2))
+        func rand(_ mag: Double) -> Double {
+            guard mag > 0 else { return 0 }
+            // Uniform in [-mag, +mag], 0.1pt resolution.
+            let steps = UInt32(mag * 20) + 1              // e.g. mag=3 → 61 steps
+            let v = Double(arc4random_uniform(steps)) / 10.0
+            return v - mag
+        }
+        return (cx + rand(jx), cy + rand(jy))
+    }
+
     private func tap(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         // Prefer a stable element ref if provided (re-resolves the live element).
         if let refId = cmd.ref {
             let (el, err) = resolveRefForAction(refId)
             if let err = err { return (nil, err) }
-            // Resolve the element to its frame center and tap by SYNTHESIZED event
+            // Resolve the element to its frame and tap by SYNTHESIZED event
             // (fastTap) instead of XCUIElement.tap(). XCUIElement.tap() does its own
             // waiting and post-event settling; when the tap navigates to a new page
             // that settling ran ~4s and coincided with the test being torn down.
             // A coordinate synthesized tap is fast (<1s) and doesn't wait.
+            // Land a few pt off-center (within the element) so taps look less robotic.
             let f = el!.frame
             let label = el!.label
-            let cx = Double(f.midX), cy = Double(f.midY)
+            let (cx, cy) = humanizedPoint(in: f)
             let r = fastHandler.fastTap(x: cx, y: cy)
             if r.1 != nil {
                 // Fallback to element tap only if the synthesized tap failed.
@@ -1075,8 +1096,11 @@ class ActionHandler {
         if let appSnap = appSnap { roots.append(appSnap) }
 
         let screen = pointSize
-        let budgetDeadline = nowMonotonic + 3.0
-        let windowCount = min(target.windows.count, 8)
+        // With the 2s XCTest state-timeout cap, target.snapshot() above is bounded;
+        // keep the overlay budget tight too so total page_source stays well under
+        // the 6s RPC watchdog even on a busy/animating page.
+        let budgetDeadline = nowMonotonic + 2.0
+        let windowCount = min(target.windows.count, 6)
         for i in 0..<windowCount {
             if nowMonotonic >= budgetDeadline { break }
             let win = target.windows.element(boundBy: i)
@@ -1536,14 +1560,15 @@ class ActionHandler {
             ))
         }
 
-        // Tap by synthesized event at the element's center (fast, no post-event
-        // settling) rather than XCUIElement.tap(), which can run ~4s when the tap
-        // navigates and has coincided with the test being torn down.
+        // Tap by synthesized event a few pt off the element's center (fast, no
+        // post-event settling, slightly humanized) rather than XCUIElement.tap(),
+        // which can run ~4s when the tap navigates and has coincided with teardown.
         let f = element.frame
         let label = element.label
-        let r = fastHandler.fastTap(x: Double(f.midX), y: Double(f.midY))
+        let (tx, ty) = humanizedPoint(in: f)
+        let r = fastHandler.fastTap(x: tx, y: ty)
         if r.1 != nil { element.tap() }   // fallback only if synthesized tap failed
-        return (["message": .string("Tapped element '\(label.isEmpty ? elementId : label)' at (\(Int(f.midX)),\(Int(f.midY)))")], nil)
+        return (["message": .string("Tapped element '\(label.isEmpty ? elementId : label)' at (\(Int(tx)),\(Int(ty)))")], nil)
     }
 
     private func findElement(id: String, type: String?) -> XCUIElement {
