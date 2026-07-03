@@ -24,6 +24,7 @@ struct ActionCommand {
     var toRef: String?
     var submit: Bool?
     var country: String?
+    var url: String?
     // page_source scoping
     var maxDepth: Int?
     var maxElements: Int?
@@ -56,6 +57,7 @@ struct ActionCommand {
         self.toRef = params?["to_ref"]?.stringValue
         self.submit = params?["submit"]?.boolValue
         self.country = params?["country"]?.stringValue
+        self.url = params?["url"]?.stringValue
 
         self.maxDepth = params?["max_depth"]?.intValue
         self.maxElements = params?["max_elements"]?.intValue

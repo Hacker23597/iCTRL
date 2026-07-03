@@ -184,6 +184,14 @@ struct RPCMethodRegistry {
             returns: "{count, term, source:'built-in'|'app_store', apps:[{name, bundle_id, developer?, category?, rating?, ...}], hint}"
         ),
         RPCMethodDef(
+            name: "open_url",
+            description: "Open a URL from the device — a custom app scheme, a universal/https link, or a deep link to a specific feature. Use this to jump into an app or a particular screen (e.g. 'weixin://' opens WeChat, 'alipays://platformapi/startapp?appId=…' opens an Alipay mini-program, 'https://…' opens in the default browser/handler, 'tel:10086' dials), or to jump BACK to a caller app via its callback URL (e.g. 'minis://done?status=ok'). For simply bringing an app to the front by identity, prefer launch_app with a bundle_id. URL-encode query values as needed.",
+            params: [
+                RPCParamDef(name: "url", type: "string", required: true, description: "The URL to open (scheme://… or https://…)"),
+            ],
+            returns: "{message}"
+        ),
+        RPCMethodDef(
             name: "launch_app",
             description: "Open an app by bundle identifier (non-blocking, via LSApplicationWorkspace). If you don't know the bundle_id, use resolve_app to find it (e.g. '大麦' → cn.damai.iphone). The opened app becomes the STICKY TARGET for subsequent UI actions (see app_binding). NOTE: the app is still launching/rendering when this returns — wait 2-3s (call wait) before page_source, or you'll match splash/placeholder elements.",
             params: [

@@ -305,6 +305,8 @@ class ActionHandler {
             return listApps(cmd)
         case "resolve_app", "search_app", "search_apps":
             return resolveApp(cmd)
+        case "open_url", "open":
+            return openURL(cmd)
         case "launch_app":
             return launchApp(cmd)
         case "activate_app":
@@ -993,6 +995,33 @@ class ActionHandler {
             "source": .string("app_store"),
             "apps": .array(apps),
             "hint": .string("Resolved via the App Store (iTunes Search). Use a result's bundle_id with launch_app. Note: the bundle_id confirms App Store identity but does NOT mean the app is installed on THIS device — launch_app will tell you if it isn't."),
+        ], nil)
+    }
+
+    /// Open any URL from the runner (custom scheme or https://) to jump to an app
+    /// or a deep-linked feature — e.g. "weixin://", "alipays://platformapi/…",
+    /// "https://…", "tel:…", or a callback like "minis://done?x=1". Uses the same
+    /// XCTest-daemon path that reliably opens URLs from inside the runner.
+    private func openURL(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+        guard let raw = cmd.url ?? cmd.text, !raw.isEmpty else {
+            return (nil, JSONRPCError(code: -32602, message: "open_url requires a 'url' (e.g. 'weixin://', 'https://example.com', 'alipays://platformapi/startapp?...')", data: nil))
+        }
+        guard let url = URL(string: raw) else {
+            return (nil, JSONRPCError(code: -32602, message: "'\(raw)' is not a valid URL. URL-encode query values if needed.", data: nil))
+        }
+        let opened = ForegroundApp.open(url)
+        guard opened else {
+            return (nil, .serverError(
+                "Could not open '\(raw)'. The scheme may not be installed/registered, or the URL is malformed. " +
+                "For opening an app by identity, use launch_app with a bundle_id instead."
+            ))
+        }
+        // If the URL scheme maps to a known app coming to the foreground, the sticky
+        // target will be re-detected on the next action; we don't force-bind here
+        // because a URL can also just trigger an in-app action.
+        usleep(500_000)
+        return ([
+            "message": .string("Opened URL \(url.scheme ?? "")://… . Give it a moment, then page_source/screenshot to see where it landed."),
         ], nil)
     }
 
