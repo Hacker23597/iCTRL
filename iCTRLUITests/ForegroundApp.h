@@ -18,6 +18,20 @@ NS_ASSUME_NONNULL_BEGIN
 /// WebDriverAgent). Returns NO immediately if the app can't be opened — no hang.
 + (BOOL)openBundleID:(NSString *)bundleId;
 
+/// Opens an arbitrary URL (any scheme, with query) from inside the XCTest runner,
+/// where UIApplication.openURL is unreliable. Uses LSApplicationWorkspace's
+/// openSensitiveURL:/openURL: private APIs. Returns YES on success.
++ (BOOL)openURL:(NSURL *)url;
+
+/// Activate an app by bundle id, catching any XCTest NSException (which Swift
+/// cannot catch and which would otherwise abort the whole runner). Returns YES if
+/// activation was attempted without throwing. Must be safe to call off-main.
++ (BOOL)safeActivateBundleID:(NSString *)bundleId;
+
+/// Terminate an app by bundle id, catching any XCTest NSException. Returns YES if
+/// termination was attempted without throwing.
++ (BOOL)safeTerminateBundleID:(NSString *)bundleId;
+
 @end
 
 NS_ASSUME_NONNULL_END

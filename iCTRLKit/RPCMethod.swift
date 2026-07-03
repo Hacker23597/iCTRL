@@ -46,9 +46,10 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "screenshot",
-            description: "Capture a screenshot as base64 PNG. SECOND CHOICE after page_source — use when you need visual detail or an element is absent from the view tree. Image is in PIXELS; tap coordinates are in POINTS. Optional 'scale' controls output resolution (default 2, max 3, e.g. 1, 0.5) — the server resizes before sending to cut size/transfer time. Response includes pixel_width/pixel_height, point_width/point_height, scale, requested_scale, and a hint.",
+            description: "Capture a screenshot as base64 PNG. SECOND CHOICE after page_source — use when you need visual detail or an element is absent from the view tree. By default captures the sticky target app's window (the app you opened with launch_app/activate_app), or the whole screen if none is bound. Pass bundle_id to capture a specific app's window (works even if it isn't frontmost); the capture is scoped to that app (no status bar / other apps). Image is in PIXELS; tap coordinates are in POINTS. Optional 'scale' controls output resolution (default 2, max 3, e.g. 1, 0.5).",
             params: [
                 RPCParamDef(name: "scale", type: "number", required: false, description: "Output pixels-per-point (default 2, max 3; smaller = faster/less detail, e.g. 1 or 0.5)"),
+                RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Capture this app's window; default = sticky target app, else whole screen"),
             ],
             returns: "Object: {data: base64 PNG, pixel_width, pixel_height, point_width, point_height, scale, hint}"
         ),
@@ -120,7 +121,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "type",
-            description: "Type text via keyboard (an input field must have focus). Set submit:true to append a Return/Search keystroke that fires the field's action (search/go/send) — synthesized text alone often won't make the keyboard's Search button actionable, so submit:true is the reliable way to run a search after typing.",
+            description: "Type text into the focused input field. A text field MUST already have keyboard focus — tap a real textfield first (see 'searching_and_typing'). If no keyboard is visible, type REFUSES to run and returns an error (rather than silently dropping the text), so a failed type means 'focus a field first', not 'retry'. Set submit:true to append Return/Search so the field's action fires. See searching_and_typing guidance for the full search flow.",
             params: [
                 RPCParamDef(name: "text", type: "string", required: true, description: "Text to type"),
                 RPCParamDef(name: "submit", type: "boolean", required: false, description: "Append Return/Search to submit the field (recommended for search boxes)"),
@@ -164,18 +165,18 @@ struct RPCMethodRegistry {
             returns: "{count, apps:[{bundle_id, name}], hint}"
         ),
         RPCMethodDef(
-            name: "search_app",
-            description: "Search the App Store (iTunes Search API) by keyword to find an app's bundle_id and info — the reliable way to get a bundle_id you don't know (e.g. search '大麦' → cn.damai.iphone). Returns name, bundle_id, developer, rating, category. Then use the bundle_id with launch_app IF the app is installed on this device.",
+            name: "resolve_app",
+            description: "Resolve an app NAME/keyword to its bundle_id. PURPOSE: launch_app/activate_app need an exact bundle_id, but you usually only know the app's name — call resolve_app first to turn e.g. '大麦' into 'cn.damai.iphone', then pass that to launch_app. HOW IT WORKS: checks a built-in catalog of ~100 common apps first (instant, offline; returns source:'built-in'), and falls back to the App Store's iTunes Search API for anything else (returns full metadata). Note: resolving a bundle_id does NOT mean the app is installed on this device — launch_app will report if it isn't. (Alias: search_app.)",
             params: [
-                RPCParamDef(name: "text", type: "string", required: true, description: "App name or keyword to search"),
-                RPCParamDef(name: "country", type: "string", required: false, description: "Store country code (default: cn)"),
-                RPCParamDef(name: "distance", type: "number", required: false, description: "Max results (default: 5, max 25)"),
+                RPCParamDef(name: "text", type: "string", required: true, description: "App name or keyword to resolve (e.g. '大麦', 'WeChat')"),
+                RPCParamDef(name: "country", type: "string", required: false, description: "App Store country code for the fallback search (default: cn)"),
+                RPCParamDef(name: "distance", type: "number", required: false, description: "Max results to return (default: 5, max 25)"),
             ],
-            returns: "{count, term, apps:[{name, bundle_id, developer, category, rating, rating_count, price, version}], hint}"
+            returns: "{count, term, source:'built-in'|'app_store', apps:[{name, bundle_id, developer?, category?, rating?, ...}], hint}"
         ),
         RPCMethodDef(
             name: "launch_app",
-            description: "Open an app by bundle identifier (non-blocking, via LSApplicationWorkspace). If you don't know the bundle_id, use search_app to find it (e.g. '大麦' → cn.damai.iphone).",
+            description: "Open an app by bundle identifier (non-blocking, via LSApplicationWorkspace). If you don't know the bundle_id, use resolve_app to find it (e.g. '大麦' → cn.damai.iphone). The opened app becomes the sticky target for subsequent UI actions (see app_binding).",
             params: [
                 RPCParamDef(name: "bundle_id", type: "string", required: true, description: "App bundle identifier (from list_apps)"),
             ],
@@ -206,7 +207,7 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "element_type", type: "string", required: false, description: "button/textfield/label/image/cell/switch/icon/any"),
                 RPCParamDef(name: "bundle_id", type: "string", required: false, description: "App to search; default = detected foreground app"),
             ],
-            returns: "{exists, hittable, ref, x, y, width, height, center_x, center_y, label, value} — then act by {ref}"
+            returns: "{exists, hittable, ref, element_type, is_text_input, x, y, width, height, center_x, center_y, label, value, note?} — element_type/is_text_input tell you if you matched a real input field vs a button; note flags the 'fake search bar' case. Then act by {ref}."
         ),
         RPCMethodDef(
             name: "tap_element",
@@ -299,6 +300,24 @@ struct RPCMethodRegistry {
                     "(3) If /rpc starts failing AND /logs is also unreachable, the service died — re-wake via ictrl:// and " +
                     "poll /schema until it returns 200, then re-/auth for a fresh token. " +
                     "(4) Space out ictrl:// re-wakes by a couple seconds; rapid repeats may be throttled.",
+                "searching_and_typing": [
+                    "Searching inside an app is the #1 place automation goes wrong. Follow this sequence:",
+                    "1. After launch_app, WAIT 2-3s (call wait) then page_source — a cold-started app is still rendering; acting early matches splash/placeholder elements and element queries can take 6s+.",
+                    "2. Find the search ENTRY. On most app home screens the 'search bar' is a Button/StaticText, NOT a text field — check element_type in the find_element result (is_text_input:false means it's not a real input).",
+                    "3. Tap that entry to open the search page. WAIT ~1-2s for the page to load AND the keyboard to appear.",
+                    "4. Locate the REAL input with find_element{element_type:\"textfield\"} (or searchField). Confirm is_text_input:true.",
+                    "5. Tap that textfield's ref to focus it. Verify the keyboard is up (screenshot or page_source shows a Keyboard).",
+                    "6. Only now type{text:\"…\", submit:true}. If type returns a 'no keyboard/focus' error, go back to step 4-5 — do NOT assume the text went in.",
+                    "Key trap: type() into an unfocused field silently loses the text and submit:true then searches an empty/garbage query. type() now refuses to run when no keyboard is visible — treat that error as 'refocus the field', not 'retry blindly'.",
+                ],
+                "app_binding":
+                    "After you open an app with launch_app/activate_app, it becomes the STICKY TARGET: all " +
+                    "subsequent UI actions (tap, swipe, type, page_source, find_element, screenshot, …) operate on " +
+                    "that app, and the server re-focuses it automatically if the foreground drifted. So 'open Taobao' " +
+                    "then 'tap …' always acts on Taobao, even if another app came to the front in between. " +
+                    "To act on a DIFFERENT app for a single call, pass an explicit bundle_id on that call (it does not " +
+                    "change the sticky target). Opening another app with launch_app/activate_app moves the target; " +
+                    "terminate_app on the target clears it (actions then fall back to the live foreground app).",
                 "inspecting_ui":
                     "PREFER page_source (the accessibility/view hierarchy as text) to understand layout — " +
                     "it gives element types, labels, identifiers, and exact frames in POINTS, is far smaller " +

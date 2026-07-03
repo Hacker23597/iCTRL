@@ -93,14 +93,29 @@ class ActionHandler {
         self.fastHandler = FastActionHandler(app: app)
     }
 
-    /// Resolve the current foreground app's bundle id.
-    /// 1) private-API detection (ForegroundApp), 2) last launched/activated app.
+    /// Resolve which app subsequent actions target.
+    ///
+    /// Priority (per user design): the app we most recently OPENED via
+    /// launch_app/activate_app is the "sticky target" — element queries and taps
+    /// stay bound to it even if the user later switches to another app in the
+    /// foreground. Only when we've never opened an app do we fall back to the
+    /// live-detected foreground app. An explicit bundle_id on the call overrides
+    /// everything (handled by callers passing it through).
     private func resolveForegroundBundleId() -> String? {
+        if let bound = boundBundleId, !bound.isEmpty {
+            return bound
+        }
+        // Never opened anything explicitly — use the live foreground app.
         if let bid = ForegroundApp.currentBundleID(), !bid.isEmpty {
             return bid
         }
         return lastForegroundBundleId
     }
+
+    /// The sticky target app: the last one opened via launch_app/activate_app.
+    /// nil until the caller opens an app, after which every action binds here
+    /// unless the call passes an explicit bundle_id.
+    private var boundBundleId: String?
 
     // MARK: - Screen Geometry (for progressive disclosure)
 
@@ -157,8 +172,43 @@ class ActionHandler {
         ])
     }
 
+    /// Methods that operate on the on-screen UI. Before running any of these we
+    /// make sure the sticky target app (from launch_app/activate_app) is actually
+    /// in the foreground — so a coordinate tap / element query lands on it even if
+    /// the user drifted to another app. No-op when nothing is bound or the target
+    /// is already foreground.
+    private static let uiActionMethods: Set<String> = [
+        "tap", "double_tap", "long_press", "swipe", "scroll", "type", "drag",
+        "page_source", "view_tree", "ui_tree", "scroll_to_element", "scroll_to",
+        "find_element", "tap_element", "screenshot",
+    ]
+
+    /// Re-activate the bound app if it isn't the current foreground app. Bounded
+    /// by a short timeout so a hung activate can't stall the action.
+    private func ensureBoundAppForeground() {
+        guard let bound = boundBundleId, !bound.isEmpty else { return }
+        // An explicit-per-call bundle_id is handled by the individual method; here
+        // we only enforce the sticky default target.
+        let current = ForegroundApp.currentBundleID()
+        if current == bound { return }
+        // Use the Obj-C safe activate: XCUIApplication.activate() can throw an
+        // XCTest NSException that Swift CANNOT catch — off the main thread that
+        // exception reaches XCTest's terminate handler and aborts the whole runner
+        // (observed crash). @try/@catch in Obj-C contains it.
+        _ = runWithTimeout(seconds: 5) {
+            _ = ForegroundApp.safeActivateBundleID(bound)
+        }
+        usleep(300_000)  // let the switch settle before we act
+    }
+
     func dispatch(method: String, params: [String: JSONValue]?) -> ([String: JSONValue]?, JSONRPCError?) {
         let cmd = ActionCommand(method: method, params: params)
+
+        // Keep the sticky target app in front for UI actions — unless the caller
+        // passed an explicit bundle_id for this call (they want that app instead).
+        if Self.uiActionMethods.contains(method), cmd.bundleId == nil {
+            ensureBoundAppForeground()
+        }
 
         switch method {
         case "device_info":
@@ -187,8 +237,8 @@ class ActionHandler {
             return isLocked()
         case "list_apps", "installed_apps":
             return listApps(cmd)
-        case "search_app", "search_apps":
-            return searchApp(cmd)
+        case "resolve_app", "search_app", "search_apps":
+            return resolveApp(cmd)
         case "launch_app":
             return launchApp(cmd)
         case "activate_app":
@@ -258,8 +308,22 @@ class ActionHandler {
         let requested = cmd.scale ?? 2.0
         let targetScale = min(max(requested, 0.05), 3.0)
 
-        let shot = XCUIScreen.main.screenshot()
-        let fullImage = shot.image  // UIImage at native device scale
+        // Target selection:
+        //   - explicit bundle_id → screenshot ONLY that app's window
+        //   - else the sticky target app (bound via launch_app/activate_app)
+        //   - else the whole screen (XCUIScreen)
+        // App-scoped shots capture just that app's UI (no status bar / other apps)
+        // and work even if it isn't the frontmost app.
+        let targetBundleId = cmd.bundleId ?? boundBundleId
+        let fullImage: UIImage
+        let scopedTo: String?
+        if let bid = targetBundleId, !bid.isEmpty {
+            fullImage = XCUIApplication(bundleIdentifier: bid).screenshot().image
+            scopedTo = bid
+        } else {
+            fullImage = XCUIScreen.main.screenshot().image
+            scopedTo = nil
+        }
 
         // Resize on the server to targetScale so the client gets a smaller PNG.
         let targetPixelW = frame.width * targetScale
@@ -291,7 +355,14 @@ class ActionHandler {
                 "x = px / \(targetScale), y = py / \(targetScale). Prefer page_source to avoid this conversion."
             ),
         ]
-        return (result, nil)
+        var out = result
+        if let bid = scopedTo {
+            out["scoped_to"] = .string(bid)
+            out["scope"] = .string("app")
+        } else {
+            out["scope"] = .string("screen")
+        }
+        return (out, nil)
     }
 
     /// Render a UIImage to PNG at the requested pixel size (server-side downscale).
@@ -487,6 +558,19 @@ class ActionHandler {
 
     // MARK: - Type
 
+    /// Best-effort check that a keyboard is on screen — i.e. some text field has
+    /// focus so typed text will actually land somewhere. Without this, type()
+    /// "succeeds" at the API level but the characters go nowhere (a common trap
+    /// when the caller typed into a fake search bar that never gained focus).
+    private func hasKeyboardFocus() -> Bool {
+        let bid = resolveForegroundBundleId()
+        let target: XCUIApplication = bid.map { XCUIApplication(bundleIdentifier: $0) } ?? app
+        // keyboards.count is cheap and doesn't wait for quiescence (disabled).
+        if target.keyboards.count > 0 { return true }
+        // Fall back to the system keyboard (some apps host it out of their tree).
+        return app.keyboards.count > 0
+    }
+
     private func typeText(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let text = cmd.text else {
             return (nil, JSONRPCError(code: -32602, message: "type requires a 'text' parameter", data: nil))
@@ -500,6 +584,19 @@ class ActionHandler {
             coordinate.tap()
             usleep(500_000)
             focusedByTap = true
+        }
+
+        // Focus guard: if no keyboard is visible, nothing has input focus, so the
+        // text would be silently dropped. Fail loudly with recovery guidance
+        // instead of returning a misleading success.
+        if !hasKeyboardFocus() {
+            return (nil, JSONRPCError(
+                code: -32602,
+                message: "type aborted: no keyboard is visible, so no text field has focus and the text would be lost. " +
+                    "First tap a real text field to focus it (find_element{element_type:\"textfield\"} → tap{ref}), wait ~1s for the keyboard to appear, then type. " +
+                    "Note: a home-screen 'search bar' is often a button — tapping it opens a search page where the actual textfield lives.",
+                data: nil
+            ))
         }
 
         // submit:true appends a Return/Search keystroke so the field's action
@@ -624,17 +721,63 @@ class ActionHandler {
         ], nil)
     }
 
-    /// Search the App Store (iTunes Search API) by keyword and return app info
-    /// including bundle_id. Use this to find the bundle_id for launch_app when the
-    /// app isn't already known. Params: text (query, required), country (default cn),
-    /// limit (default 5).
-    private func searchApp(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+    /// Built-in app catalog (name → bundle_id), loaded once from AppBundles.plist
+    /// bundled into the runner. Lets resolve_app answer common apps instantly and
+    /// offline; misses fall back to the iTunes Search API.
+    private static let builtInApps: [[String: String]] = {
+        // The plist ships inside the .xctest bundle.
+        let bundle = Bundle(for: ActionHandler.self)
+        guard let url = bundle.url(forResource: "AppBundles", withExtension: "plist"),
+              let data = try? Data(contentsOf: url),
+              let obj = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              let apps = obj["apps"] as? [[String: String]] else {
+            return []
+        }
+        return apps
+    }()
+
+    /// Case-insensitive lookup in the built-in catalog by name / query / bundle_id.
+    /// Returns matches as {name, bundle_id} dicts.
+    private func lookupBuiltInApps(_ term: String) -> [[String: String]] {
+        let t = term.lowercased()
+        return Self.builtInApps.filter { app in
+            (app["name"]?.lowercased().contains(t) ?? false) ||
+            (app["query"]?.lowercased().contains(t) ?? false) ||
+            (app["bundle_id"]?.lowercased().contains(t) ?? false)
+        }
+    }
+
+    /// Resolve an app name/keyword to its bundle_id (+ basic info). Checks the
+    /// built-in catalog first (offline/instant), then the iTunes Search API.
+    /// Use this to get the bundle_id for launch_app when you only know the app's
+    /// name. Params: text (query, required), country (default cn), limit (default 5).
+    private func resolveApp(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let term = cmd.text, !term.isEmpty else {
-            return (nil, JSONRPCError(code: -32602, message: "search_app requires 'text' (the app name / keyword to search)", data: nil))
+            return (nil, JSONRPCError(code: -32602, message: "resolve_app requires 'text' (the app name / keyword to resolve to a bundle_id)", data: nil))
         }
         let country = cmd.country ?? "cn"
         let limit = min(max(Int(cmd.distance ?? 5), 1), 25)
 
+        // 1) Built-in catalog first — instant, offline, covers common apps.
+        let builtIn = lookupBuiltInApps(term)
+        if !builtIn.isEmpty {
+            let apps: [JSONValue] = builtIn.prefix(limit).map { a in
+                .object([
+                    "name": .string(a["name"] ?? ""),
+                    "bundle_id": .string(a["bundle_id"] ?? ""),
+                    "source": .string("built-in"),
+                ])
+            }
+            return ([
+                "count": .int(apps.count),
+                "term": .string(term),
+                "source": .string("built-in"),
+                "apps": .array(apps),
+                "hint": .string("Matched the built-in app catalog (instant, offline). Use a bundle_id with launch_app. For apps not in the catalog, search still falls through to the App Store."),
+            ], nil)
+        }
+
+        // 2) Fall back to the iTunes Search API.
         var comps = URLComponents(string: "https://itunes.apple.com/search")!
         comps.queryItems = [
             URLQueryItem(name: "term", value: term),
@@ -685,8 +828,9 @@ class ActionHandler {
             "count": .int(apps.count),
             "term": .string(term),
             "country": .string(country),
+            "source": .string("app_store"),
             "apps": .array(apps),
-            "hint": .string("Use a result's bundle_id with launch_app. Note: the app must already be installed on THIS device to launch — bundle_id from search only confirms the App Store identity."),
+            "hint": .string("Resolved via the App Store (iTunes Search). Use a result's bundle_id with launch_app. Note: the bundle_id confirms App Store identity but does NOT mean the app is installed on THIS device — launch_app will tell you if it isn't."),
         ], nil)
     }
 
@@ -706,8 +850,10 @@ class ActionHandler {
         }
         usleep(800_000)  // brief settle; app is coming to foreground async
         lastForegroundBundleId = bundleId
+        boundBundleId = bundleId       // sticky target for subsequent actions
         return ([
-            "message": .string("Opened \(bundleId). Give it a moment, then use page_source/screenshot to inspect."),
+            "message": .string("Opened \(bundleId). Actions now target this app until you open another. IMPORTANT: the app is still launching/rendering — wait 2-3s (call wait), THEN page_source to confirm the UI is stable before locating elements. Acting too early matches placeholder/splash elements or is very slow (cold-start element queries can take 6s+)."),
+            "advice": .string("wait 2-3s, then page_source"),
         ], nil)
     }
 
@@ -715,28 +861,36 @@ class ActionHandler {
         guard let bundleId = cmd.bundleId else {
             return (nil, JSONRPCError(code: -32602, message: "activate_app requires a 'bundle_id'", data: nil))
         }
-        let targetApp = XCUIApplication(bundleIdentifier: bundleId)
+        // Safe activate (Obj-C @try/@catch) — a raw XCUIApplication.activate() can
+        // throw an NSException that Swift can't catch and that aborts the runner.
+        var activated = false
         let ok = runWithTimeout(seconds: 5) {
-            targetApp.activate()
+            activated = ForegroundApp.safeActivateBundleID(bundleId)
         }
         guard ok else {
             return (nil, .serverError("activate_app timed out after 5s for '\(bundleId)'. Check the bundle_id."))
         }
+        guard activated else {
+            return (nil, .serverError("Could not activate '\(bundleId)' (not installed, or activation failed). Use resolve_app/list_apps to verify the bundle_id."))
+        }
         lastForegroundBundleId = bundleId
-        return (["message": .string("Activated \(bundleId)")], nil)
+        boundBundleId = bundleId       // sticky target for subsequent actions
+        return (["message": .string("Activated \(bundleId). Actions now target this app.")], nil)
     }
 
     private func terminateApp(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let bundleId = cmd.bundleId else {
             return (nil, JSONRPCError(code: -32602, message: "terminate_app requires a 'bundle_id'", data: nil))
         }
-        let targetApp = XCUIApplication(bundleIdentifier: bundleId)
         let ok = runWithTimeout(seconds: 5) {
-            targetApp.terminate()
+            _ = ForegroundApp.safeTerminateBundleID(bundleId)
         }
         guard ok else {
             return (nil, .serverError("terminate_app timed out after 5s for '\(bundleId)'."))
         }
+        // If we just killed the sticky target, unbind so actions fall back to the
+        // live foreground app instead of a dead one.
+        if boundBundleId == bundleId { boundBundleId = nil }
         return (["message": .string("Terminated \(bundleId)")], nil)
     }
 
@@ -1130,10 +1284,20 @@ class ActionHandler {
         let ref = makeRef(ElementRef(bundleId: cmd.bundleId ?? resolveForegroundBundleId(),
                                      match: match, elementType: cmd.elementType, index: index,
                                      createdAt: nowMonotonic))
-        let result: [String: JSONValue] = [
+        // Surface the actual element type so the caller can tell a real text field
+        // from a button that merely looks like a search bar. Many app home screens
+        // show a search "bar" that is actually a Button/StaticText — tapping it
+        // navigates to a search page where the REAL TextField lives.
+        let typeName = Self.elementTypeName(element.elementType)
+        let isTextInput = element.elementType == .textField
+            || element.elementType == .searchField
+            || element.elementType == .secureTextField
+        var result: [String: JSONValue] = [
             "exists": .bool(true),
             "hittable": .bool(element.isHittable),
             "ref": .string(ref),
+            "element_type": .string(typeName),
+            "is_text_input": .bool(isTextInput),
             "x": .double(frame.origin.x),
             "y": .double(frame.origin.y),
             "width": .double(frame.width),
@@ -1143,6 +1307,13 @@ class ActionHandler {
             "label": .string(element.label),
             "value": .string(element.value as? String ?? ""),
         ]
+        // Nudge the caller when they were probably looking for an input field but
+        // matched a button (the classic "fake search bar" trap).
+        if !isTextInput, (element.elementType == .button || element.elementType == .staticText || element.elementType == .other) {
+            result["note"] = .string(
+                "This is a \(typeName), NOT a text field. If you're trying to type/search: tap it to open the search page, wait ~1s for it to load and the keyboard to appear, then find_element{element_type:\"textfield\"} to locate the REAL input field before typing."
+            )
+        }
         return (result, nil)
     }
 

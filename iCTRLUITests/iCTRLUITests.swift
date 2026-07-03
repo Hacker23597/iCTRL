@@ -60,6 +60,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     }
 
     func testStartServer() throws {
+        // Prune old daily log files and note where logs are persisted.
+        Self.logBuffer.pruneOldLogFiles()
+        if let dir = Self.logBuffer.logDirectoryPath {
+            Self.logBuffer.append("🗂 Logs persist to \(dir)/ictrl-YYYY-MM-DD.log")
+        }
+
         actionHandler = ActionHandler(app: app)
 
         // Restore persisted preferences (fresh install → local only, port 8200)
@@ -117,10 +123,15 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
     // MARK: - URL Scheme Callback
 
-    /// If a pending ictrl:// URL carries a callback, open it with the server status.
+    /// Drain any pending ictrl:// URLs and, for each start URL carrying a
+    /// callback, jump back to the caller with the server status/address.
     private func handlePendingCallbackIfAny() {
-        guard let url = URLSchemeHandler.shared.takePendingURL() else { return }
+        for url in URLSchemeHandler.shared.takeAllPendingURLs() {
+            handleOneURL(url)
+        }
+    }
 
+    private func handleOneURL(_ url: URL) {
         let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let items = comps?.queryItems ?? []
 
@@ -132,14 +143,24 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
 
         guard let callbackRaw = items.first(where: { $0.name == "callback" })?.value,
-              let callbackURL = URL(string: callbackRaw) else {
+              !callbackRaw.isEmpty,
+              let callbackURL = Self.normalizeCallback(callbackRaw) else {
             Self.logBuffer.append("🔗 ictrl://start with no callback — server is running")
             return
         }
 
+        // The server starts asynchronously (and a passcode prompt may have delayed
+        // everything). Wait — briefly — for it to actually be listening before we
+        // report status, so we don't hand the caller a false "failed".
+        let deadline = Date().addingTimeInterval(8)
+        while !(server?.isRunning ?? false) && Date() < deadline {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.2))
+        }
+
+        let running = server?.isRunning ?? false
         let address = remoteAccessEnabled ? "\(getDeviceAddress()):\(server?.port ?? 8200)"
                                           : "127.0.0.1:\(server?.port ?? 8200)"
-        let status = (server?.isRunning ?? false) ? "ready" : "failed"
+        let status = running ? "ready" : "failed"
 
         // Append status + address to the callback URL.
         var cb = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)
@@ -154,9 +175,44 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
 
         Self.logBuffer.append("🔙 Callback → \(callbackURL.scheme ?? "")://…?status=\(status)")
+        openCallback(finalURL, attempt: 1)
+    }
+
+    /// Accept a callback either as a full URL ("minis://home") or as a bare scheme
+    /// ("minis" → "minis://"), so callers don't have to URL-encode a scheme.
+    static func normalizeCallback(_ raw: String) -> URL? {
+        if let u = URL(string: raw), u.scheme != nil {
+            return u
+        }
+        // No scheme separator — treat the whole thing as a scheme name.
+        let scheme = raw.hasSuffix("://") ? String(raw.dropLast(3)) : raw
+        guard !scheme.isEmpty,
+              scheme.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "+" || $0 == "." })
+        else { return nil }
+        return URL(string: "\(scheme)://")
+    }
+
+    /// Open the callback URL. From inside the XCTest runner, UIApplication.open is
+    /// unreliable (it returns false), so we open via LSApplicationWorkspace
+    /// (ForegroundApp.openURL) — the same private path that reliably launches
+    /// apps from the runner. UIApplication.open is kept as a last-resort fallback.
+    private func openCallback(_ url: URL, attempt: Int) {
+        if ForegroundApp.open(url) {
+            Self.logBuffer.append("🔙 Callback opened via XCTest daemon")
+            return
+        }
         DispatchQueue.main.async {
-            UIApplication.shared.open(finalURL, options: [:]) { ok in
-                Self.logBuffer.append(ok ? "🔙 Callback opened" : "🔙 Callback open failed")
+            UIApplication.shared.open(url, options: [:]) { ok in
+                if ok {
+                    Self.logBuffer.append("🔙 Callback opened via UIApplication (attempt \(attempt))")
+                } else if attempt < 3 {
+                    Self.logBuffer.append("🔙 Callback open failed, retrying (\(attempt))")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                        self.openCallback(url, attempt: attempt + 1)
+                    }
+                } else {
+                    Self.logBuffer.append("🔙 Callback gave up after \(attempt) attempts")
+                }
             }
         }
     }
@@ -234,7 +290,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Request permission
         let semaphore = DispatchSemaphore(value: 0)
         center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
-            print(granted ? "🔔 Notifications enabled" : "🔕 Notifications denied")
+            Self.logBuffer.append(granted ? "🔔 Notifications enabled" : "🔕 Notifications denied")
             semaphore.signal()
         }
         semaphore.wait()
@@ -254,14 +310,14 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         if actionID == Self.copyLogsActionID {
             let logs = Self.logBuffer.dump()
             UIPasteboard.general.string = logs
-            print("📋 Copied \(Self.logBuffer.count) log entries to clipboard")
+            Self.logBuffer.append("📋 Copied \(Self.logBuffer.count) log entries to clipboard")
             completionHandler()
             return
         }
 
         // Handle "Disable Remote Access"
         if actionID == Self.disableRemoteActionID {
-            print("🔒 Remote access disabled via notification")
+            Self.logBuffer.append("🔒 Remote access disabled via notification")
             disableRemoteAccess()
             completionHandler()
             return
@@ -269,7 +325,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
         // Handle "Stop Server"
         if actionID == Self.stopServerActionID {
-            print("🛑 Server stopped via notification")
+            Self.logBuffer.append("🛑 Server stopped via notification")
             server?.stop()
             completionHandler()
             return
@@ -277,7 +333,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
         // Handle "Enable Remote Access" from server-ready notification
         if actionID == Self.enableRemoteActionID {
-            print("🌐 Remote access enabled via notification")
+            Self.logBuffer.append("🌐 Remote access enabled via notification")
             enableRemoteAccess()
             completionHandler()
             return
@@ -374,14 +430,36 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
             self.rpcQueue.async {
                 let start = ProcessInfo.processInfo.systemUptime
-                let result: ([String: JSONValue]?, JSONRPCError?)
-                if method == "config" {
-                    result = self.handleConfig(params)
-                } else if let handler = self.actionHandler {
-                    result = handler.dispatch(method: method, params: params)
-                } else {
-                    result = (nil, .internalError)
+                var result: ([String: JSONValue]?, JSONRPCError?) = (nil, .internalError)
+
+                // XCUITest UI interactions (tap/swipe/type/…) MUST run on the main
+                // thread — calling them off-main throws an ObjC NSException that,
+                // uncaught on a background queue, aborts the whole runner (observed
+                // crash). So we hop to the main thread for the actual dispatch, and
+                // wrap it in an Obj-C @try/@catch so a stale/non-hittable element
+                // turns into a JSON-RPC error instead of a SIGABRT.
+                let work = {
+                    if method == "config" {
+                        result = self.handleConfig(params)
+                    } else if let handler = self.actionHandler {
+                        let reason = ObjCException.catching {
+                            result = handler.dispatch(method: method, params: params)
+                        }
+                        if let reason = reason {
+                            result = (nil, .serverError(
+                                "\(method) failed: \(reason). The element may be gone/off-screen/not hittable, or the UI changed — re-check with page_source and retry."
+                            ))
+                        }
+                    } else {
+                        result = (nil, .internalError)
+                    }
                 }
+                if Thread.isMainThread {
+                    work()
+                } else {
+                    DispatchQueue.main.sync(execute: work)
+                }
+
                 let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000
                 Self.logBuffer.recordTiming(method: method, ms: ms, ok: result.1 == nil)
                 if let err = result.1 { Self.logBuffer.append("← ERR \(method): \(err.message)") }
@@ -407,6 +485,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             let timing = Self.logBuffer.timingSummary()
             return logs + "\n\n=== Timing summary (ms) ===\n" + timing
         }
+        // Route the server's internal lifecycle messages into the persisted log.
+        srv.onLog = { Self.logBuffer.append($0) }
     }
 
     // MARK: - Config RPC

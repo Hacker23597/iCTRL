@@ -1,0 +1,236 @@
+//
+//  EarlyURLHook.m
+//  Installs the ictrl:// URL capture hooks as early as possible — at bundle
+//  load, BEFORE XCTest's setUp runs. This matters on a COLD start: iOS calls
+//  the runner's application:didFinishLaunchingWithOptions: (carrying the launch
+//  URL) before our Swift setUp executes, so a Swift-side install in setUp would
+//  miss it. Here we capture the launch URL and any early openURL into a shared
+//  store that the Swift URLSchemeHandler drains once the server is up.
+//
+
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+
+// Thread-safe stash of early-captured URLs. URLSchemeHandler (Swift) reads these
+// via +[EarlyURLHook drainURLs] and merges them into its pending queue.
+static NSMutableArray<NSURL *> *sEarlyURLs;
+static NSMutableArray<NSString *> *sEarlyLogs;   // events captured before Swift log is ready
+static NSLock *sEarlyLock;
+
+@interface EarlyURLHook : NSObject
++ (NSArray<NSURL *> *)drainURLs;
++ (NSArray<NSString *> *)drainLogs;
++ (void)hookDelegateInstance:(id<UIApplicationDelegate>)delegate;
++ (void)tryInstall;
++ (void)hookClass:(Class)cls;
+@end
+
+/// Record an event both to the console AND to a buffer the Swift LogBuffer drains
+/// into the persisted log file (these +load-era events run before Swift logging).
+static void earlyLog(NSString *msg) {
+    NSLog(@"%@", msg);
+    [sEarlyLock lock];
+    if (sEarlyLogs) { [sEarlyLogs addObject:msg]; }
+    [sEarlyLock unlock];
+}
+
+static void stashURL(NSURL *url) {
+    if (![[url.scheme lowercaseString] isEqualToString:@"ictrl"]) { return; }
+    [sEarlyLock lock];
+    [sEarlyURLs addObject:url];
+    [sEarlyLock unlock];
+    earlyLog([NSString stringWithFormat:@"🔗 early-captured URL %@://%@", url.scheme, url.host ?: @""]);
+}
+
+// Replacement for application:didFinishLaunchingWithOptions: — reads launch URL,
+// then CHAINS to the original impl (via the exchanged tmp selector) so XCTest's
+// own boot logic still runs. If there was no original (we added, not exchanged),
+// the tmp selector won't respond and we just return YES.
+static BOOL hookedDidFinishLaunching(id self, SEL _cmd, id application, NSDictionary *options) {
+    NSURL *url = options[UIApplicationLaunchOptionsURLKey];
+    earlyLog([NSString stringWithFormat:@"🔎 didFinishLaunching fired; launchURL=%@; optionKeys=%@",
+              url ? url.absoluteString : @"(none)", options.allKeys]);
+    if ([url isKindOfClass:[NSURL class]]) { stashURL(url); }
+    SEL orig = NSSelectorFromString(@"ictrlearly_application:didFinishLaunchingWithOptions:");
+    if ([self respondsToSelector:orig]) {
+        BOOL (*imp)(id, SEL, id, NSDictionary *) = (BOOL (*)(id, SEL, id, NSDictionary *))
+            [self methodForSelector:orig];
+        return imp(self, orig, application, options);
+    }
+    return YES;
+}
+
+// Replacement for application:openURL:options: — reads warm-path URLs, then
+// chains to the original if present.
+static BOOL hookedOpenURL(id self, SEL _cmd, id application, NSURL *url, NSDictionary *options) {
+    earlyLog([NSString stringWithFormat:@"🔎 openURL fired; url=%@", url ? url.absoluteString : @"(none)"]);
+    if ([url isKindOfClass:[NSURL class]]) { stashURL(url); }
+    SEL orig = NSSelectorFromString(@"ictrlearly_application:openURL:options:");
+    if ([self respondsToSelector:orig]) {
+        BOOL (*imp)(id, SEL, id, NSURL *, NSDictionary *) = (BOOL (*)(id, SEL, id, NSURL *, NSDictionary *))
+            [self methodForSelector:orig];
+        return imp(self, orig, application, url, options);
+    }
+    return YES;
+}
+
+// The runner uses a SCENE-based lifecycle: warm-path URLs arrive via
+// -scene:openURLContexts: (a Set<UIOpenURLContext>). Extract each context's URL.
+static void hookedSceneOpenURLContexts(id self, SEL _cmd, id scene, NSSet *contexts) {
+    earlyLog([NSString stringWithFormat:@"🔎 scene:openURLContexts fired; count=%lu",
+              (unsigned long)contexts.count]);
+    for (id ctx in contexts) {
+        if ([ctx respondsToSelector:@selector(URL)]) {
+            NSURL *url = [ctx performSelector:@selector(URL)];
+            if ([url isKindOfClass:[NSURL class]]) { stashURL(url); }
+        }
+    }
+    SEL orig = NSSelectorFromString(@"ictrlearly_scene:openURLContexts:");
+    if ([self respondsToSelector:orig]) {
+        void (*imp)(id, SEL, id, NSSet *) = (void (*)(id, SEL, id, NSSet *))[self methodForSelector:orig];
+        imp(self, orig, scene, contexts);
+    }
+}
+
+// COLD-path for scene lifecycle: -scene:willConnectToSession:options: carries a
+// UISceneConnectionOptions whose .URLContexts holds the launch URL(s).
+static void hookedSceneWillConnect(id self, SEL _cmd, id scene, id session, id connectionOptions) {
+    NSSet *urlContexts = nil;
+    if ([connectionOptions respondsToSelector:@selector(URLContexts)]) {
+        urlContexts = [connectionOptions performSelector:@selector(URLContexts)];
+    }
+    earlyLog([NSString stringWithFormat:@"🔎 scene:willConnect fired; urlContexts=%lu",
+              (unsigned long)urlContexts.count]);
+    for (id ctx in urlContexts) {
+        if ([ctx respondsToSelector:@selector(URL)]) {
+            NSURL *url = [ctx performSelector:@selector(URL)];
+            if ([url isKindOfClass:[NSURL class]]) { stashURL(url); }
+        }
+    }
+    SEL orig = NSSelectorFromString(@"ictrlearly_scene:willConnectToSession:options:");
+    if ([self respondsToSelector:orig]) {
+        void (*imp)(id, SEL, id, id, id) = (void (*)(id, SEL, id, id, id))[self methodForSelector:orig];
+        imp(self, orig, scene, session, connectionOptions);
+    }
+}
+
+// Swizzled -[UIApplication setDelegate:] — fires the instant the runner installs
+// its app delegate, which is GUARANTEED to be before UIApplicationMain calls
+// application:didFinishLaunchingWithOptions:. That's the only reliable window to
+// hook the delegate early enough to catch the cold-start launch URL.
+static void (*original_setDelegate)(id, SEL, id<UIApplicationDelegate>);
+static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> delegate) {
+    if (delegate) {
+        earlyLog([NSString stringWithFormat:@"🔎 UIApplication delegate set: %@",
+                  NSStringFromClass(object_getClass(delegate))]);
+        [EarlyURLHook hookDelegateInstance:delegate];
+    }
+    if (original_setDelegate) { original_setDelegate(self, _cmd, delegate); }
+}
+
+@implementation EarlyURLHook
+
++ (void)load {
+    sEarlyURLs = [NSMutableArray array];
+    sEarlyLogs = [NSMutableArray array];
+    sEarlyLock = [[NSLock alloc] init];
+
+    // Swizzle UIApplication setDelegate: so we hook the delegate the moment it's
+    // set (before didFinishLaunching). Fall back to a direct class hook too.
+    Method m = class_getInstanceMethod([UIApplication class], @selector(setDelegate:));
+    if (m) {
+        original_setDelegate = (void (*)(id, SEL, id<UIApplicationDelegate>))method_getImplementation(m);
+        method_setImplementation(m, (IMP)swizzled_setDelegate);
+    }
+
+    // Also try the class-based hook now and on the main queue, as a backstop.
+    [self tryInstall];
+    dispatch_async(dispatch_get_main_queue(), ^{ [EarlyURLHook tryInstall]; });
+}
+
+/// Hook a concrete delegate INSTANCE's class (covers cases where the runner's
+/// delegate is a subclass we didn't know the name of).
++ (void)hookDelegateInstance:(id<UIApplicationDelegate>)delegate {
+    Class cls = object_getClass(delegate);
+    if (!cls) { return; }
+    [self hookClass:cls];
+}
+
+static BOOL sInstalled = NO;
+
++ (void)tryInstall {
+    if (sInstalled) { return; }
+    Class cls = NSClassFromString(@"_XCTRunnerAppDelegate");
+    if (!cls) { return; }
+    [self hookClass:cls];
+}
+
++ (void)hookClass:(Class)cls {
+    if (sInstalled) { return; }
+    sInstalled = YES;
+
+    // application:didFinishLaunchingWithOptions:  (cold path)
+    SEL dfl = NSSelectorFromString(@"application:didFinishLaunchingWithOptions:");
+    if (!class_addMethod(cls, dfl, (IMP)hookedDidFinishLaunching, "B@:@@")) {
+        SEL tmp = NSSelectorFromString(@"ictrlearly_application:didFinishLaunchingWithOptions:");
+        if (class_addMethod(cls, tmp, (IMP)hookedDidFinishLaunching, "B@:@@")) {
+            Method a = class_getInstanceMethod(cls, dfl);
+            Method b = class_getInstanceMethod(cls, tmp);
+            if (a && b) { method_exchangeImplementations(a, b); }
+        }
+    }
+
+    // application:openURL:options:  (warm path, app-delegate lifecycle)
+    SEL ou = NSSelectorFromString(@"application:openURL:options:");
+    if (!class_addMethod(cls, ou, (IMP)hookedOpenURL, "B@:@@@")) {
+        SEL tmp = NSSelectorFromString(@"ictrlearly_application:openURL:options:");
+        if (class_addMethod(cls, tmp, (IMP)hookedOpenURL, "B@:@@@")) {
+            Method a = class_getInstanceMethod(cls, ou);
+            Method b = class_getInstanceMethod(cls, tmp);
+            if (a && b) { method_exchangeImplementations(a, b); }
+        }
+    }
+
+    // scene:openURLContexts:  (warm path, SCENE lifecycle — what the runner uses)
+    SEL sou = NSSelectorFromString(@"scene:openURLContexts:");
+    if (!class_addMethod(cls, sou, (IMP)hookedSceneOpenURLContexts, "v@:@@")) {
+        SEL tmp = NSSelectorFromString(@"ictrlearly_scene:openURLContexts:");
+        if (class_addMethod(cls, tmp, (IMP)hookedSceneOpenURLContexts, "v@:@@")) {
+            Method a = class_getInstanceMethod(cls, sou);
+            Method b = class_getInstanceMethod(cls, tmp);
+            if (a && b) { method_exchangeImplementations(a, b); }
+        }
+    }
+
+    // scene:willConnectToSession:options:  (COLD path, SCENE lifecycle)
+    SEL swc = NSSelectorFromString(@"scene:willConnectToSession:options:");
+    if (!class_addMethod(cls, swc, (IMP)hookedSceneWillConnect, "v@:@@@")) {
+        SEL tmp = NSSelectorFromString(@"ictrlearly_scene:willConnectToSession:options:");
+        if (class_addMethod(cls, tmp, (IMP)hookedSceneWillConnect, "v@:@@@")) {
+            Method a = class_getInstanceMethod(cls, swc);
+            Method b = class_getInstanceMethod(cls, tmp);
+            if (a && b) { method_exchangeImplementations(a, b); }
+        }
+    }
+
+    earlyLog(@"🔗 early URL hooks installed (app + scene lifecycle)");
+}
+
++ (NSArray<NSURL *> *)drainURLs {
+    [sEarlyLock lock];
+    NSArray *urls = [sEarlyURLs copy];
+    [sEarlyURLs removeAllObjects];
+    [sEarlyLock unlock];
+    return urls;
+}
+
++ (NSArray<NSString *> *)drainLogs {
+    [sEarlyLock lock];
+    NSArray *logs = [sEarlyLogs copy];
+    [sEarlyLogs removeAllObjects];
+    [sEarlyLock unlock];
+    return logs;
+}
+
+@end

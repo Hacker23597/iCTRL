@@ -5,67 +5,75 @@ import ObjectiveC.runtime
 ///
 /// The runner is hosted by Apple's private `_XCTRunnerAppDelegate`, so we can't
 /// implement `application(_:open:options:)` the normal way. We add that method
-/// to the delegate class at startup; it forwards the URL to this singleton.
-/// The test body polls `takePendingURL()` after the server is up.
+/// to the delegate class; it forwards the URL to this singleton. The test body
+/// drains `takeAllPendingURLs()` after the server is up.
+///
+/// Timing is the tricky part on a COLD start: iOS may deliver the launch URL
+/// (and, if the device is locked / the developer must be trusted, only AFTER the
+/// user types a passcode) before our test's setUp runs. To not lose it we:
+///   1) install the hooks from a `+load`-style path, as early as the bundle loads,
+///   2) also hook `application:didFinishLaunchingWithOptions:` to read the launch
+///      URL out of launchOptions, and
+///   3) QUEUE urls (not a single slot) so a second delivery can't overwrite a
+///      first that hasn't been drained yet.
 final class URLSchemeHandler {
     static let shared = URLSchemeHandler()
 
     static let scheme = "ictrl"
 
     private let lock = NSLock()
-    private var pendingURL: URL?
+    private var pendingURLs: [URL] = []
 
     private init() {}
 
     func record(_ url: URL) {
         guard url.scheme?.lowercased() == Self.scheme else { return }
         lock.lock()
-        pendingURL = url
+        // De-dupe identical back-to-back deliveries (iOS sometimes double-delivers).
+        if pendingURLs.last?.absoluteString != url.absoluteString {
+            pendingURLs.append(url)
+        }
         lock.unlock()
         iCTRLUITests.logBuffer.append("🔗 Received URL: \(url.scheme ?? "")://\(url.host ?? "")")
     }
 
-    /// Returns and clears any pending URL.
+    /// Returns and clears ALL pending URLs (oldest first). Also pulls in anything
+    /// the early Obj-C +load hook captured before our Swift hooks were installed
+    /// (the cold-start launch URL).
+    func takeAllPendingURLs() -> [URL] {
+        Self.drainEarlyLogs()
+        for u in EarlyURLHook.drainURLs() { record(u) }
+        lock.lock()
+        defer { lock.unlock() }
+        let urls = pendingURLs
+        pendingURLs.removeAll()
+        return urls
+    }
+
+    /// Back-compat single-URL drain (returns the oldest pending, if any).
     func takePendingURL() -> URL? {
         lock.lock()
         defer { lock.unlock() }
-        let u = pendingURL
-        pendingURL = nil
-        return u
+        return pendingURLs.isEmpty ? nil : pendingURLs.removeFirst()
     }
 
     // MARK: - Delegate hook install
 
-    /// Adds `application:openURL:options:` to the runner's app delegate class so
-    /// incoming ictrl:// URLs reach us. Called once at test startup.
+    /// The actual delegate hooks (openURL + launch options) are installed by the
+    /// Obj-C `EarlyURLHook` at bundle +load — earlier than any Swift setUp — so we
+    /// don't miss the cold-start launch URL. This drains anything it captured so
+    /// far (URLs + its early log lines) into our pending queue / the log file.
+    /// Safe to call repeatedly.
     static func installURLHandler() {
-        guard let delegateClass = NSClassFromString("_XCTRunnerAppDelegate") else {
-            iCTRLUITests.logBuffer.append("⚠️ _XCTRunnerAppDelegate not found; URL scheme disabled")
-            return
-        }
+        drainEarlyLogs()
+        for u in EarlyURLHook.drainURLs() { shared.record(u) }
+        iCTRLUITests.logBuffer.append("🔗 ictrl:// URL capture active (early hooks)")
+    }
 
-        let sel = NSSelectorFromString("application:openURL:options:")
-
-        // The IMP: block invoked as (self, _cmd, app, url, options) -> Bool.
-        let block: @convention(block) (AnyObject, UIApplication, URL, [AnyHashable: Any]) -> Bool = { _, _, url, _ in
-            URLSchemeHandler.shared.record(url)
-            return true
+    /// Flush +load-era log lines captured by EarlyURLHook into the persisted log.
+    static func drainEarlyLogs() {
+        for line in EarlyURLHook.drainLogs() {
+            iCTRLUITests.logBuffer.append(line)
         }
-        let imp = imp_implementationWithBlock(block)
-        // Type encoding: BOOL, self, _cmd, id, id, id  → "B@:@@@"
-        let types = "B@:@@@"
-
-        if class_getInstanceMethod(delegateClass, sel) != nil {
-            // Already implemented — swap ours in via a fresh method + exchange.
-            let tmpSel = NSSelectorFromString("ictrl_application:openURL:options:")
-            class_addMethod(delegateClass, tmpSel, imp, types)
-            if let m1 = class_getInstanceMethod(delegateClass, sel),
-               let m2 = class_getInstanceMethod(delegateClass, tmpSel) {
-                method_exchangeImplementations(m1, m2)
-            }
-        } else {
-            class_addMethod(delegateClass, sel, imp, types)
-        }
-        iCTRLUITests.logBuffer.append("🔗 ictrl:// URL handler installed")
     }
 }

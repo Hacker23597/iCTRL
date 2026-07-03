@@ -14,6 +14,15 @@ class JSONRPCServer {
     /// Returns redacted log text for the public (no-auth) GET /logs endpoint.
     var onLogsRequest: (() -> String)?
 
+    /// Routes internal server-lifecycle messages to the host's log sink so they
+    /// land in the persisted log file, not just the console.
+    var onLog: ((String) -> Void)?
+
+    private func log(_ message: String) {
+        onLog?(message)
+        print(message)
+    }
+
     init(port: UInt16 = 8200, localOnly: Bool = false) {
         self.port = port
         self.localOnly = localOnly
@@ -44,9 +53,9 @@ class JSONRPCServer {
             case .ready:
                 self.isRunning = true
                 self.onStateChange?(true)
-                print("🟢 iCTRL server ready on port \(self.port)")
+                self.log("🟢 iCTRL server ready on port \(self.port)")
             case .failed(let error):
-                print("🔴 Server failed: \(error)")
+                self.log("🔴 Server failed: \(error)")
                 self.isRunning = false
                 self.onStateChange?(false)
             case .cancelled:
@@ -70,7 +79,7 @@ class JSONRPCServer {
         listener?.cancel()
         listener = nil
         isRunning = false
-        print("🔴 iCTRL server stopped")
+        log("🔴 iCTRL server stopped")
     }
 
     // MARK: - Connection Handling

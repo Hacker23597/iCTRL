@@ -10,6 +10,34 @@ class LogBuffer {
         return f
     }()
 
+    // MARK: - File persistence (Library/Logs/iCTRL/ictrl-YYYY-MM-DD.log)
+
+    /// Formats the date portion of the log file name (one file per day).
+    private let fileDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    /// Directory where daily log files live: <sandbox>/Library/Logs/iCTRL.
+    /// Computed once; created lazily on first write.
+    private lazy var logsDirectory: URL? = {
+        guard let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let dir = base.appendingPathComponent("Logs/iCTRL", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    /// Cached handle for today's file; rotated when the date changes.
+    private var currentFileHandle: FileHandle?
+    private var currentFileDay: String?
+
+    /// How many days of log files to keep; older ones are pruned on startup.
+    private let retentionDays = 14
+
     // Per-method timing aggregation (durations in milliseconds).
     private struct Stat {
         var count = 0
@@ -72,7 +100,8 @@ class LogBuffer {
     }
 
     func append(_ message: String) {
-        let timestamp = dateFormatter.string(from: Date())
+        let now = Date()
+        let timestamp = dateFormatter.string(from: now)
         let entry = "[\(timestamp)] \(message)"
 
         lock.lock()
@@ -80,10 +109,58 @@ class LogBuffer {
         if entries.count > capacity {
             entries.removeFirst(entries.count - capacity)
         }
+        writeToFile(entry, date: now)   // persist under the same lock (ordered, thread-safe)
         lock.unlock()
 
         print(entry)
     }
+
+    /// Append one line to today's log file, rotating the handle at midnight.
+    /// Must be called with `lock` held. Failures are swallowed (logging must
+    /// never crash the service); a redacted copy is written to disk.
+    private func writeToFile(_ entry: String, date: Date) {
+        guard let dir = logsDirectory else { return }
+        let day = fileDateFormatter.string(from: date)
+
+        if day != currentFileDay {
+            // New day (or first write) — rotate to a fresh handle.
+            try? currentFileHandle?.close()
+            currentFileHandle = nil
+            currentFileDay = day
+
+            let fileURL = dir.appendingPathComponent("ictrl-\(day).log")
+            if !FileManager.default.fileExists(atPath: fileURL.path) {
+                FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+            }
+            currentFileHandle = try? FileHandle(forWritingTo: fileURL)
+            currentFileHandle?.seekToEndOfFile()
+        }
+
+        // Redact before persisting — files may be pulled off-device.
+        guard let data = (LogBuffer.redact(entry) + "\n").data(using: .utf8) else { return }
+        currentFileHandle?.write(data)
+    }
+
+    /// Remove log files older than `retentionDays`. Call once at startup.
+    func pruneOldLogFiles() {
+        guard let dir = logsDirectory else { return }
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
+
+        let cutoff = Calendar.current.date(byAdding: .day, value: -retentionDays, to: Date()) ?? Date()
+        for file in files where file.pathExtension == "log" {
+            let name = file.deletingPathExtension().lastPathComponent  // ictrl-YYYY-MM-DD
+            let datePart = name.replacingOccurrences(of: "ictrl-", with: "")
+            guard let fileDate = fileDateFormatter.date(from: datePart) else { continue }
+            if fileDate < cutoff {
+                try? fm.removeItem(at: file)
+                append("🧹 Pruned old log file: \(file.lastPathComponent)")
+            }
+        }
+    }
+
+    /// Absolute path of the current log directory (for surfacing in status/UI).
+    var logDirectoryPath: String? { logsDirectory?.path }
 
     /// Full, unredacted dump — used by the authenticated in-app "Copy Logs" action.
     func dump() -> String {

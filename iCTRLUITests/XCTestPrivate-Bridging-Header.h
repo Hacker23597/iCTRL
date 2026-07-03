@@ -5,6 +5,12 @@
 #import <XCTest/XCTest.h>
 #import "LockStateMonitor.h"
 #import "ForegroundApp.h"
+#import "ObjCException.h"
+
+@interface EarlyURLHook : NSObject
++ (NSArray<NSURL *> *)drainURLs;
++ (NSArray<NSString *> *)drainLogs;
+@end
 
 NS_ASSUME_NONNULL_BEGIN
 

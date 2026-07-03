@@ -18,8 +18,12 @@
 @end
 
 // Bridge from pid → bundle id via the device info service used by XCTest.
+// Also exposes openDefaultApplicationForURL:completion: — the XCTest-sanctioned
+// way to open a URL from the runner process (iOS 16.4+), which UIApplication and
+// LSApplicationWorkspace both refuse to do from inside XCTest.
 @interface XCTRunnerDaemonSession : NSObject
 + (instancetype)sharedSession;
+- (void)openDefaultApplicationForURL:(NSURL *)url completion:(void (^)(BOOL result, NSError *error))completion;
 @end
 
 // Private MobileCoreServices API listing/opening installed applications.
@@ -28,6 +32,9 @@
 - (NSArray *)allApplications;
 - (NSArray *)allInstalledApplications;
 - (BOOL)openApplicationWithBundleID:(NSString *)bundleId;  // non-blocking launch
+- (BOOL)openURL:(id)url;
+- (BOOL)openURL:(id)url withOptions:(id)options;
+- (BOOL)openSensitiveURL:(id)url withOptions:(id)options;
 @end
 
 // LSApplicationProxy exposes bundle id / display name / type.
@@ -169,6 +176,86 @@
     } @catch (__unused NSException *e) {
         return nil;
     }
+}
+
++ (BOOL)safeActivateBundleID:(NSString *)bundleId {
+    if (bundleId.length == 0) { return NO; }
+    @try {
+        Class appClass = NSClassFromString(@"XCUIApplication");
+        if (!appClass) { return NO; }
+        // -[XCUIApplication initWithBundleIdentifier:]
+        id (*initFn)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+        id app = initFn([appClass alloc], @selector(initWithBundleIdentifier:), bundleId);
+        if (!app) { return NO; }
+        // -[XCUIApplication activate] can throw an XCTest NSException (e.g. the app
+        // isn't installed / can't be brought up). Swallow it here so it never
+        // reaches the XCTest terminate handler and aborts the runner.
+        if ([app respondsToSelector:@selector(activate)]) {
+            [app performSelector:@selector(activate)];
+        }
+        return YES;
+    } @catch (NSException *e) {
+        NSLog(@"iCTRL: safeActivate caught exception for %@: %@", bundleId, e.reason);
+        return NO;
+    }
+}
+
++ (BOOL)safeTerminateBundleID:(NSString *)bundleId {
+    if (bundleId.length == 0) { return NO; }
+    @try {
+        Class appClass = NSClassFromString(@"XCUIApplication");
+        if (!appClass) { return NO; }
+        id (*initFn)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+        id app = initFn([appClass alloc], @selector(initWithBundleIdentifier:), bundleId);
+        if (!app) { return NO; }
+        if ([app respondsToSelector:@selector(terminate)]) {
+            [app performSelector:@selector(terminate)];
+        }
+        return YES;
+    } @catch (NSException *e) {
+        NSLog(@"iCTRL: safeTerminate caught exception for %@: %@", bundleId, e.reason);
+        return NO;
+    }
+}
+
++ (BOOL)openURL:(NSURL *)url {
+    // 1) XCTest daemon session — the sanctioned path from a runner (iOS 16.4+).
+    //    This is what WebDriverAgent uses; UIApplication/LSApplicationWorkspace
+    //    both refuse to open URLs from inside XCTest.
+    @try {
+        Class sessionClass = NSClassFromString(@"XCTRunnerDaemonSession");
+        if (sessionClass) {
+            id session = [sessionClass performSelector:@selector(sharedSession)];
+            SEL sel = @selector(openDefaultApplicationForURL:completion:);
+            if (session && [session respondsToSelector:sel]) {
+                __block BOOL ok = NO;
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                [session openDefaultApplicationForURL:url completion:^(BOOL result, NSError *err) {
+                    ok = result && (err == nil);
+                    dispatch_semaphore_signal(sem);
+                }];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)));
+                if (ok) { return YES; }
+            }
+        }
+    } @catch (__unused NSException *e) {}
+
+    // 2) Fallback: LSApplicationWorkspace (works on some OS versions).
+    @try {
+        Class wsClass = NSClassFromString(@"LSApplicationWorkspace");
+        if (!wsClass) { return NO; }
+        id ws = [wsClass performSelector:@selector(defaultWorkspace)];
+        if (!ws) { return NO; }
+        if ([ws respondsToSelector:@selector(openSensitiveURL:withOptions:)]) {
+            BOOL (*fn)(id, SEL, id, id) = (BOOL (*)(id, SEL, id, id))objc_msgSend;
+            if (fn(ws, @selector(openSensitiveURL:withOptions:), url, nil)) { return YES; }
+        }
+        if ([ws respondsToSelector:@selector(openURL:)]) {
+            BOOL (*fn)(id, SEL, id) = (BOOL (*)(id, SEL, id))objc_msgSend;
+            return fn(ws, @selector(openURL:), url);
+        }
+    } @catch (__unused NSException *e) {}
+    return NO;
 }
 
 + (BOOL)openBundleID:(NSString *)bundleId {
