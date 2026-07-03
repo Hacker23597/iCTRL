@@ -192,17 +192,27 @@ class ActionHandler {
         guard let bound = boundBundleId, !bound.isEmpty else { return }
         // An explicit-per-call bundle_id is handled by the individual method; here
         // we only enforce the sticky default target.
+        // Just opened/activated it — skip the (possibly slow) re-activation; the
+        // app is already coming to the front. Avoids a redundant activate right
+        // after launch_app that cost ~5s on the first post-launch action.
+        if nowMonotonic - lastBoundActivateAt < 4.0 { return }
+
         let current = ForegroundApp.currentBundleID()
         if current == bound { return }
         // Use the Obj-C safe activate: XCUIApplication.activate() can throw an
         // XCTest NSException that Swift CANNOT catch — off the main thread that
         // exception reaches XCTest's terminate handler and aborts the whole runner
         // (observed crash). @try/@catch in Obj-C contains it.
-        _ = runWithTimeout(seconds: 5) {
+        _ = runWithTimeout(seconds: 3) {
             _ = ForegroundApp.safeActivateBundleID(bound)
         }
+        lastBoundActivateAt = nowMonotonic
         usleep(300_000)  // let the switch settle before we act
     }
+
+    /// Monotonic time of the last activate of the bound app (launch/activate or a
+    /// foreground-enforcement). Used to skip redundant re-activations.
+    private var lastBoundActivateAt: TimeInterval = 0
 
     func dispatch(method: String, params: [String: JSONValue]?) -> ([String: JSONValue]?, JSONRPCError?) {
         let cmd = ActionCommand(method: method, params: params)
@@ -869,6 +879,7 @@ class ActionHandler {
         usleep(800_000)  // brief settle; app is coming to foreground async
         lastForegroundBundleId = bundleId
         boundBundleId = bundleId       // sticky target for subsequent actions
+        lastBoundActivateAt = nowMonotonic  // just brought forward — skip redundant re-activate
         return ([
             "message": .string("Opened \(bundleId). Actions now target this app until you open another. IMPORTANT: the app is still launching/rendering — wait 2-3s (call wait), THEN page_source to confirm the UI is stable before locating elements. Acting too early matches placeholder/splash elements or is very slow (cold-start element queries can take 6s+)."),
             "advice": .string("wait 2-3s, then page_source"),
@@ -893,6 +904,7 @@ class ActionHandler {
         }
         lastForegroundBundleId = bundleId
         boundBundleId = bundleId       // sticky target for subsequent actions
+        lastBoundActivateAt = nowMonotonic  // just brought forward — skip redundant re-activate
         return (["message": .string("Activated \(bundleId). Actions now target this app.")], nil)
     }
 
