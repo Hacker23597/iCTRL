@@ -1000,24 +1000,43 @@ class ActionHandler {
         let filter = SnapshotFilter(type: cmd.filterType, label: cmd.filterLabel, text: cmd.filterText)
 
         // Collect the snapshots to render. By DEFAULT we take a single
-        // application.snapshot() — fast (~0.5-1s). That can MISS floating overlay
-        // layers in separate windows (e.g. Taobao's fixed "加入购物车/立即购买" bar),
-        // so pass include_overlays:true to ALSO snapshot each window. Overlay
-        // traversal is bounded by a hard TIME BUDGET: on complex pages, snapshotting
-        // every window serially could take 15s+ and trip XCTest's own watchdog,
-        // terminating the test (observed). We stop early once the budget is spent.
+        // application.snapshot() — fast (~0.5-1s) and it already contains the app's
+        // main window hierarchy. Floating overlay layers that live in a SEPARATE
+        // window (e.g. Taobao's fixed "加入购物车/立即购买" bar) can be missed; pass
+        // include_overlays:true to also snapshot the ACTIVE/visible windows.
+        //
+        // Key lesson (observed 17s hang → XCTest killed the test): do NOT blindly
+        // snapshot every window. Most windows are zero-size / offscreen / inactive
+        // and snapshotting all of them serially is what blew the time budget. So we
+        // (a) only snapshot windows with a visible on-screen frame, (b) skip the one
+        // matching the app-snapshot root frame (already covered), and (c) enforce a
+        // hard 3s budget.
         var roots: [XCUIElementSnapshot] = []
-        if let appSnap = try? target.snapshot() {
-            roots.append(appSnap)
-        }
+        let appSnap = try? target.snapshot()
+        if let appSnap = appSnap { roots.append(appSnap) }
+
         if cmd.includeOverlays == true {
-            let budgetDeadline = nowMonotonic + 3.0   // total overlay budget
+            let screen = pointSize
+            let budgetDeadline = nowMonotonic + 3.0
             let windowCount = min(target.windows.count, 8)
             for i in 0..<windowCount {
-                if nowMonotonic >= budgetDeadline { break }   // don't risk the XCTest watchdog
-                if let ws = try? target.windows.element(boundBy: i).snapshot() {
-                    roots.append(ws)
+                if nowMonotonic >= budgetDeadline { break }
+                let win = target.windows.element(boundBy: i)
+                // Cheap frame check first — skip offscreen / zero-size / inactive
+                // windows so we only pay snapshot cost for windows the user can see.
+                let f = win.frame
+                let onScreen = f.width > 1 && f.height > 1
+                    && f.minX < screen.width && f.minY < screen.height
+                    && f.maxX > 0 && f.maxY > 0
+                guard onScreen else { continue }
+                // Skip a window that's the same size as the app root (already covered).
+                if let appSnap = appSnap,
+                   Int(f.width) == Int(appSnap.frame.width),
+                   Int(f.height) == Int(appSnap.frame.height),
+                   Int(f.minY) == Int(appSnap.frame.minY) {
+                    continue
                 }
+                if let ws = try? win.snapshot() { roots.append(ws) }
             }
         }
         guard !roots.isEmpty else {
