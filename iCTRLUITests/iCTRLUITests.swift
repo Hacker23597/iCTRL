@@ -393,6 +393,28 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// Compact one-line summary of the most useful params for the request log.
+    /// Keeps element_id/x/y/bundle_id/direction/text-length so a crash post-mortem
+    /// shows what an action targeted, without dumping the whole payload.
+    private static func summarizeParams(_ params: [String: JSONValue]?) -> String {
+        guard let params = params, !params.isEmpty else { return "" }
+        let keys = ["element_id", "ref", "bundle_id", "x", "y", "direction", "match", "element_type", "submit"]
+        var parts: [String] = []
+        for k in keys {
+            if let v = params[k] {
+                switch v {
+                case .string(let s): parts.append("\(k)='\(s)'")
+                case .int(let i): parts.append("\(k)=\(i)")
+                case .double(let d): parts.append("\(k)=\(Int(d))")
+                case .bool(let b): parts.append("\(k)=\(b)")
+                default: break
+                }
+            }
+        }
+        if let t = params["text"]?.stringValue { parts.append("text.len=\(t.count)") }
+        return parts.joined(separator: " ")
+    }
+
     /// Serial queue for RPC execution — OFF the main thread so a slow/blocking
     /// XCUITest call can't freeze the network listener (which would drop the whole
     /// service). Serial so actions still run one-at-a-time in order.
@@ -433,6 +455,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             self.rpcQueue.async {
                 let start = ProcessInfo.processInfo.systemUptime
                 var result: ([String: JSONValue]?, JSONRPCError?) = (nil, .internalError)
+
+                // Log the request WITH key params BEFORE running it, so if this
+                // call crashes/hangs the persisted log shows exactly what was
+                // invoked (e.g. which element tap_element targeted). Redaction in
+                // the log layer masks sensitive values.
+                Self.logBuffer.append("→ \(method) \(Self.summarizeParams(params))")
 
                 // XCUITest UI interactions (tap/swipe/type/…) MUST run on the main
                 // thread — calling them off-main throws an ObjC NSException that,
