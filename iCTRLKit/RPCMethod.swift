@@ -41,9 +41,8 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "filter", type: "object", required: false, description: "Return only matching nodes + their ancestors. {label:'待收货'} (label/value substring, case-insensitive), {type:'button'} (element type), or {text:'…'} (label+value+id substring). e.g. filter:{label:\"待收货\"}"),
                 RPCParamDef(name: "max_depth", type: "number", required: false, description: "Max tree depth to traverse (e.g. 3-4 for top-level structure only)"),
                 RPCParamDef(name: "max_elements", type: "number", required: false, description: "Max nodes to return (default 500, hard cap 2000). If hit, response is truncated:true"),
-                RPCParamDef(name: "include_overlays", type: "boolean", required: false, description: "Also snapshot overlay windows to catch FIXED bottom/floating bars (buy/submit buttons) that the main tree omits. Off by default (a single snapshot is fast); on complex pages this is slower but time-bounded."),
             ],
-            returns: "{source: text tree, truncated, total_returned, filtered?, coordinate_space:'points', hint}"
+            returns: "{source: text tree, truncated, total_returned, filtered?, coordinate_space:'points', hint}. Includes visible overlay windows (fixed bottom/floating bars) automatically."
         ),
         RPCMethodDef(
             name: "screenshot",
