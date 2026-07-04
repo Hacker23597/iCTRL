@@ -539,7 +539,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private static let mainThreadMethods: Set<String> = [
         "tap", "double_tap", "long_press", "swipe", "scroll", "drag",
         "page", "page_down", "page_up",
-        "type", "screenshot", "page_source", "view_tree", "ui_tree",
+        "type", "clear_text", "screenshot", "page_source", "view_tree", "ui_tree",
         "scroll_to_element", "scroll_to", "find_element", "tap_element",
         "launch_app", "activate_app", "terminate_app",
         "home", "lock", "unlock",

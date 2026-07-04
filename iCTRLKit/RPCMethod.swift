@@ -131,14 +131,21 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "type",
-            description: "Type text into the focused input field. A text field must already have keyboard focus — tap a real textfield first (see 'searching_and_typing'). Type always runs, but if no keyboard could be confirmed the response includes a 'warning' (keyboard detection can't see all third-party keyboards, so this is advisory, not a failure) — if the text didn't land, re-focus the field and type again. Set submit:true to append Return/Search so the field's action (search/go/send) fires. See searching_and_typing guidance for the full search flow.",
+            description: "Type text into the focused input field. A text field must already have keyboard focus — tap a real textfield first (see 'searching_and_typing'). Type always runs, but if no keyboard could be confirmed the response includes a 'warning' (keyboard detection can't see all third-party keyboards, so this is advisory, not a failure) — if the text didn't land, re-focus the field and type again. Set clear:true to EMPTY the field before typing (replace its contents); set submit:true to append Return/Search so the field's action (search/go/send) fires. See searching_and_typing guidance for the full search flow.",
             params: [
-                RPCParamDef(name: "text", type: "string", required: true, description: "Text to type"),
+                RPCParamDef(name: "text", type: "string", required: true, description: "Text to type (optional if clear:true — then it just empties the field)"),
+                RPCParamDef(name: "clear", type: "boolean", required: false, description: "Empty the field (delete existing text) before typing. Use to REPLACE contents. The field must be focused first."),
                 RPCParamDef(name: "submit", type: "boolean", required: false, description: "Append Return/Search to submit the field (recommended for search boxes)"),
                 RPCParamDef(name: "x", type: "number", required: false, description: "Tap X to focus before typing"),
                 RPCParamDef(name: "y", type: "number", required: false, description: "Tap Y to focus before typing"),
                 RPCParamDef(name: "fast", type: "boolean", required: false, description: "Use fast mode"),
             ],
+            returns: "{message, warning?} — warning present when a focused keyboard couldn't be confirmed"
+        ),
+        RPCMethodDef(
+            name: "clear_text",
+            description: "Empty the currently-focused text field (delete its existing contents) without typing anything new. The field must already have keyboard focus — tap a real textfield first. Equivalent to type{clear:true} with no text. Sends backspaces sized to the field's value (falls back to a generous default when the length can't be read). If no focused keyboard could be confirmed the response includes an advisory 'warning'.",
+            params: [],
             returns: "{message, warning?} — warning present when a focused keyboard couldn't be confirmed"
         ),
         RPCMethodDef(
@@ -329,6 +336,7 @@ struct RPCMethodRegistry {
                     "5. Tap that textfield's ref to focus it. Verify the keyboard is up (screenshot or page_source shows a Keyboard).",
                     "6. Only now type{text:\"…\", submit:true}. If type returns a 'no keyboard/focus' error, go back to step 4-5 — do NOT assume the text went in.",
                     "Key trap: type() into an unfocused field silently loses the text and submit:true then searches an empty/garbage query. type() returns a 'warning' when it can't confirm a focused keyboard — heed it: verify the text landed (screenshot/page_source) and, if not, re-focus a real textfield before typing again.",
+                    "To REPLACE the contents of a field that already has text, don't type on top of it — use type{clear:true, text:\"…\"} (empties it first), or clear_text to just empty it. Tap the field to focus it before clearing.",
                 ],
                 "app_binding":
                     "After you open an app with launch_app/activate_app it becomes the STICKY TARGET (see 'bound_app' " +

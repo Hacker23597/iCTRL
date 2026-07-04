@@ -293,6 +293,8 @@ class ActionHandler {
             return scroll(cmd)
         case "type":
             return typeText(cmd)
+        case "clear_text":
+            return clearText(cmd)
         case "home":
             return pressHome()
         case "lock":
@@ -736,8 +738,10 @@ class ActionHandler {
     }
 
     private func typeText(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
-        guard let text = cmd.text else {
-            return (nil, JSONRPCError(code: -32602, message: "type requires a 'text' parameter", data: nil))
+        let clearFirst = cmd.clear == true
+        // text is optional when clear:true (type{clear:true} just empties the field).
+        guard let text = cmd.text ?? (clearFirst ? "" : nil) else {
+            return (nil, JSONRPCError(code: -32602, message: "type requires a 'text' parameter (or clear:true to just empty the field)", data: nil))
         }
 
         var focusedByTap = false
@@ -749,6 +753,9 @@ class ActionHandler {
             usleep(500_000)
             focusedByTap = true
         }
+
+        // clear:true empties the field before typing (tap to focus first, above).
+        if clearFirst { clearFocusedField() }
 
         // Focus check is a SOFT signal only — keyboard detection can't see
         // third-party keyboards, so we must NOT block typing on it (that produced
@@ -768,7 +775,8 @@ class ActionHandler {
             let r = fastHandler.fastTypeText(text)
             if submit, r.1 == nil { sendReturnKey() }
             if var data = r.0 {
-                data["message"] = .string("Typed: \(text)" + (submit ? " + Return" : ""))
+                let prefix = clearFirst ? "Cleared then typed: " : "Typed: "
+                data["message"] = .string(text.isEmpty && clearFirst ? "Cleared focused field" : (prefix + text + (submit ? " + Return" : "")))
                 if let w = focusWarning { data["warning"] = .string(w) }
                 return (data, r.1)
             }
@@ -783,7 +791,9 @@ class ActionHandler {
         do {
             try eventRecord.synthesize()
             if submit { sendReturnKey() }
-            var out: [String: JSONValue] = ["message": .string("Typed: \(text)" + (submit ? " + Return" : ""))]
+            let prefix = clearFirst ? "Cleared then typed: " : "Typed: "
+            let msg = text.isEmpty && clearFirst ? "Cleared focused field" : (prefix + text + (submit ? " + Return" : ""))
+            var out: [String: JSONValue] = ["message": .string(msg)]
             if let w = focusWarning { out["warning"] = .string(w) }
             return (out, nil)
         } catch {
@@ -801,6 +811,57 @@ class ActionHandler {
         path.typeText("\n", atOffset: 0.0, typingSpeed: 60, shouldRedact: false)
         record.add(path)
         try? record.synthesize()
+    }
+
+    /// Clear the currently-focused text field. Requires the field to already have
+    /// keyboard focus (tap it first). Strategy: move the caret to the end, then
+    /// send a run of backspaces. We size the run from the focused element's value
+    /// length when we can read it, and otherwise fall back to a generous default
+    /// (extra backspaces past an empty field are harmless no-ops).
+    /// Returns the number of delete keystrokes sent.
+    @discardableResult
+    private func clearFocusedField() -> Int {
+        // Best-effort read of the focused element's current text length.
+        var count = 0
+        if let bid = resolveForegroundBundleId() {
+            let target = XCUIApplication(bundleIdentifier: bid)
+            // The focused field usually surfaces as the element with keyboardFocus.
+            let focused = target.textFields.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
+            if focused.exists, let v = focused.value as? String { count = v.count }
+            if count == 0 {
+                let sv = target.secureTextFields.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
+                if sv.exists, let v = sv.value as? String { count = v.count }
+            }
+        }
+        // Fall back to a generous fixed count if we couldn't measure it. Cap the
+        // measured count too, so a pathological value can't send thousands of keys.
+        let deletes = min(max(count, count == 0 ? 60 : count), 200)
+
+        // Move caret to end first (End of text), then delete backwards. \u{8} is
+        // backspace; some fields also honor forward-delete, but backspace after
+        // caret-to-end covers the common case.
+        let record = XCSynthesizedEventRecord(name: "ClearText")
+        let path = XCPointerEventPath(forTextInput: ())
+        let backspaces = String(repeating: "\u{8}", count: deletes)
+        path.typeText(backspaces, atOffset: 0.0, typingSpeed: 90, shouldRedact: false)
+        record.add(path)
+        try? record.synthesize()
+        return deletes
+    }
+
+    /// clear_text method: clear the focused field without typing anything new.
+    private func clearText(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+        let keyboardConfirmed = hasKeyboardFocus()
+        let sent = clearFocusedField()
+        var out: [String: JSONValue] = [
+            "message": .string("Cleared focused field (\(sent) deletes sent)"),
+        ]
+        if !keyboardConfirmed {
+            out["warning"] = .string(
+                "Could not confirm a focused text field / visible keyboard. If the field wasn't cleared, " +
+                "tap a real textfield first (find_element{element_type:\"textfield\"} → tap{ref}), then clear_text again.")
+        }
+        return (out, nil)
     }
 
     // MARK: - Device Buttons

@@ -23,6 +23,7 @@ struct ActionCommand {
     var fromRef: String?
     var toRef: String?
     var submit: Bool?
+    var clear: Bool?
     var country: String?
     var url: String?
     // page_source scoping
@@ -56,6 +57,7 @@ struct ActionCommand {
         self.fromRef = params?["from_ref"]?.stringValue
         self.toRef = params?["to_ref"]?.stringValue
         self.submit = params?["submit"]?.boolValue
+        self.clear = params?["clear"]?.boolValue
         self.country = params?["country"]?.stringValue
         self.url = params?["url"]?.stringValue
 
