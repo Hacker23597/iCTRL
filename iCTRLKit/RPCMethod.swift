@@ -332,16 +332,39 @@ struct RPCMethodRegistry {
                 ],
                 "app_binding":
                     "After you open an app with launch_app/activate_app it becomes the STICKY TARGET (see 'bound_app' " +
-                    "in the launch_app response): all subsequent UI actions (tap, swipe, type, page_source, " +
-                    "find_element, screenshot, …) operate on that app, and the server re-focuses it automatically if " +
-                    "the foreground drifted (the response then carries an 'app_note' saying it was re-focused). So " +
+                    "in the launch_app response). INTERACTION methods (tap, double_tap, long_press, tap_element, " +
+                    "swipe, scroll, scroll_to_element, drag, page) re-focus the bound app automatically if the " +
+                    "foreground drifted — the response then carries an 'app_note' saying it was re-focused — so " +
                     "'open Taobao' then 'tap …' always acts on Taobao even if another app came to the front. " +
-                    "Two situations abort the action with a clear error instead of doing the wrong thing: " +
+                    "READ-ONLY methods (page_source, screenshot, find_element) do NOT re-activate the bound app: " +
+                    "they read whatever is CURRENTLY in the foreground, because force-activating just to read can " +
+                    "stall on launch/transition animations. If the bound app was pushed to the background and you " +
+                    "want to read IT specifically, either run one interaction first (which re-focuses it) or pass an " +
+                    "explicit bundle_id to the read call (e.g. page_source{bundle_id:'com.taobao.taobao4iphone'}). " +
+                    "For interaction methods, two situations abort with a clear error instead of doing the wrong thing: " +
                     "(1) the bound app has CRASHED/EXITED (state notRunning) → error tells you to launch_app again; " +
                     "(2) a SYSTEM ALERT/permission dialog is covering the app → error tells you to read it via " +
                     "page_source{bundle_id:'com.apple.springboard'} and tap its button first. " +
                     "To act on a DIFFERENT app for one call, pass an explicit bundle_id (does not change the sticky " +
                     "target). Opening another app moves the target; terminate_app on the target clears it.",
+                "opening_apps_and_urls": [
+                    "Don't guess bundle IDs. To open an app by name:",
+                    "1. resolve_app{text:'携程'} → resolves a name/keyword to a bundle_id via a built-in catalog, " +
+                    "falling back to the iTunes Search API (source field says which). Returns candidates with bundle_id + name.",
+                    "2. launch_app{bundle_id:<resolved>} → opens it and binds it as the sticky target.",
+                    "list_apps returns the bundle IDs actually INSTALLED on this device — use it to confirm an app is present.",
+                    "open_url{url:'taobao://…'} opens a deep link / app URL scheme (often faster than launch_app and can jump " +
+                    "straight to a feature). Use it when you know the scheme; use launch_app when you just want the app's home.",
+                ],
+                "scrolling_and_paging":
+                    "Two ways to move a scroll view: swipe/scroll (a gesture — fast, has momentum, can overshoot) and " +
+                    "page (a precise one-screen step, ~85% of the screen, NO momentum — best for reading long content " +
+                    "predictably). page{direction:'down', pages:N} advances N screens. Prefer page when reading a feed/" +
+                    "detail page screen-by-screen; use scroll_to_element when you're hunting a specific labeled element.",
+                "stopping_the_service":
+                    "config{stop_server:true} shuts the service down (it replies first, then stops listening ~1s later). " +
+                    "Tokens persist, so after the runner is relaunched you can reconnect WITHOUT re-authorizing. Only do " +
+                    "this when you intend to end automation — there is no remote start, the runner must be relaunched on-device.",
                 "inspecting_ui":
                     "PREFER page_source (the accessibility/view hierarchy as text) to understand layout — " +
                     "it gives element types, labels, identifiers, and exact frames in POINTS, is far smaller " +
@@ -364,11 +387,12 @@ struct RPCMethodRegistry {
                     "Get scale and the valid point range from device_info (point_width/point_height).",
                 "recommended_flow":
                     "1) call device_info once to learn point_width/point_height/scale. " +
-                    "2) call page_source to read the current layout (types, labels, ids, frames in points). " +
-                    "3) locate the target: find_element (on screen) or scroll_to_element (needs scrolling) → get a ref. " +
-                    "4) act by ref: tap/double_tap/long_press{ref}, or drag{from_ref,to_ref}. " +
-                    "5) only fall back to screenshot + coordinate tap when the element has no usable label. " +
-                    "6) re-check with page_source (or screenshot) to verify the result.",
+                    "2) open the app you need: resolve_app{text:<name>} → launch_app{bundle_id} (or open_url for a deep link). " +
+                    "3) call page_source to read the current layout (types, labels, ids, frames in points). " +
+                    "4) locate the target: find_element (on screen) or scroll_to_element (needs scrolling) → get a ref. " +
+                    "5) act by ref: tap/double_tap/long_press{ref}, or drag{from_ref,to_ref}; page{direction} to read long content. " +
+                    "6) only fall back to screenshot + coordinate tap when the element has no usable label. " +
+                    "7) re-check with page_source (or screenshot) to verify the result.",
                 "common_pitfalls": [
                     "Reaching for screenshot first when page_source + find_element would locate the element more precisely and cheaply.",
                     "Using a coordinate when a ref is available — the coordinate breaks after any scroll/animation; a ref re-resolves the live element.",
@@ -462,12 +486,23 @@ struct RPCMethodRegistry {
         (<code>point_width</code> × <code>point_height</code>) from <code>device_info</code>.
         </p>
         <p style="margin-top:6px;color:#6e6e73;font-size:14px">
-        Recommended flow: <code>device_info</code> → <code>page_source</code> → tap frame center → verify.
-        Fetch <code>GET /schema</code> for machine-readable guidance.
+        Recommended flow: <code>device_info</code> → <code>resolve_app</code>/<code>launch_app</code> → <code>page_source</code> → tap frame center → verify.
+        Fetch <code>GET /schema</code> for full machine-readable guidance (app binding, searching/typing, reliability…).
         </p>
         </div>
 
-        <p class="section">Methods</p>
+        <div class="info">
+        <p><strong>Diagnostics &amp; logs (no auth, redacted):</strong></p>
+        <ul style="margin:6px 0 0 18px;color:#6e6e73;font-size:14px;line-height:1.6">
+        <li><code>GET /logs</code> — recent in-memory logs for the current process (includes <code>⏱ ✓ &lt;method&gt; &lt;ms&gt;</code> timings).</li>
+        <li><code>GET /logs/files</code> — list persisted daily log files (survive crashes/restarts).</li>
+        <li><code>GET /logs/history?date=YYYY-MM-DD</code> — read a persisted day's log. Use this to recover logs from BEFORE a crash.</li>
+        <li><code>GET /schema</code> — this document, as JSON.</li>
+        </ul>
+        <p style="margin-top:8px;color:#6e6e73;font-size:14px">Stop the service remotely with <code>config {"stop_server": true}</code> — tokens persist, so relaunching the runner needs no re-auth.</p>
+        </div>
+
+        <p class="section">Methods (\(methods.count))</p>
         """
 
         for m in methods {
