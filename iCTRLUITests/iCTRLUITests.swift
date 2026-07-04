@@ -828,17 +828,58 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// while the app is foreground).
     private static let selfWakeURL = URL(string: "ictrl://start")!
 
+    /// Holds the multicast connection alive briefly while it triggers the prompt.
+    private var lnTriggerConnection: NWConnection?
+
     /// Bring the runner to the foreground via its own ictrl:// scheme so iOS can
     /// present the Local Network permission prompt (it only appears while the app
-    /// is foreground). No-op-ish if already foreground; runs at most once per
-    /// outage so we don't repeatedly re-open the app. Does NOT post a
-    /// notification — the single failure notice is owned by verifyRemote…().
+    /// is foreground), THEN actually touch the LAN so the OS raises the prompt.
+    /// Declaring NSLocalNetworkUsageDescription is not enough — iOS only prompts
+    /// on a real local-network access, and a TCP connect to our OWN device IP can
+    /// route internally without counting. Sending to the mDNS multicast group is
+    /// unambiguous LAN activity, so that's what triggers the dialog. Runs at most
+    /// once per outage; posts no notification (the failure notice is owned by
+    /// verifyRemote…()).
     private func selfWakeForLocalNetworkPrompt() {
         guard !selfWokeForCurrentOutage else { return }
         selfWokeForCurrentOutage = true
+
         let woke = ForegroundApp.open(Self.selfWakeURL)
         Self.logBuffer.append(woke ? "🔼 self-wake via ictrl:// requested (foreground for LN prompt)"
                                    : "⚠️ self-wake via ictrl:// failed")
+
+        // Give the app ~1s to reach the foreground, then touch the LAN to raise
+        // the permission prompt.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.triggerLocalNetworkPrompt()
+        }
+    }
+
+    /// Send a datagram to the mDNS multicast group (224.0.0.251:5353) — real
+    /// local-network activity that makes iOS present the Local Network permission
+    /// prompt while the app is foreground. Held briefly, then torn down.
+    private func triggerLocalNetworkPrompt() {
+        let host = NWEndpoint.Host("224.0.0.251")
+        guard let port = NWEndpoint.Port(rawValue: 5353) else { return }
+        let conn = NWConnection(host: host, port: port, using: .udp)
+        lnTriggerConnection = conn
+        conn.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                conn.send(content: Data([0]), completion: .contentProcessed { _ in })
+                Self.logBuffer.append("🌐 LAN prompt trigger sent (mDNS multicast) — grant Local Network if asked")
+            case .failed, .cancelled:
+                self?.lnTriggerConnection = nil
+            default:
+                break
+            }
+        }
+        conn.start(queue: DispatchQueue(label: "com.openminis.ictrl.ln-trigger"))
+        // Tear down after a few seconds — its only job is to raise the dialog.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.lnTriggerConnection?.cancel()
+            self?.lnTriggerConnection = nil
+        }
     }
 
     /// Fixed identifier for the "Remote Access Failed" notification so it can be
