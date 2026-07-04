@@ -5,7 +5,6 @@ import Network
 
 final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private var server: JSONRPCServer?
-    private let lanPrimer = LocalNetworkPrimer()
     private var app: XCUIApplication!
     private var actionHandler: ActionHandler?
     private var pendingAuthCompletions: [String: (Bool) -> Void] = [:]
@@ -178,20 +177,6 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         let lockedAtStart = LockStateMonitor.shared().isLocked
         Self.logBuffer.append("🔐 startup lock state: \(lockedAtStart ? "LOCKED" : "unlocked")")
 
-        // Proactively raise the iOS "Local Network" permission prompt now. Without
-        // this the prompt only appears when a LAN client first connects — and until
-        // it's granted the server looks dead from the LAN even though it's bound
-        // (loopback still works, so it looks like "remote access on but only
-        // localhost reachable"). Doing it here means the user grants it at startup.
-        // If the probe shows the permission is NOT granted, post a notification so
-        // the user knows to enable it — otherwise the failure is silent/mysterious.
-        lanPrimer.prime(log: { Self.logBuffer.append($0) }, onLikelyDenied: { [weak self] in
-            guard let self = self else { return }
-            // Only nag when remote access is expected; local-only doesn't need LAN.
-            guard self.remoteAccessEnabled else { return }
-            self.handleLocalNetworkBlocked()
-        })
-
         // Prune old daily log files and note where logs are persisted.
         Self.logBuffer.pruneOldLogFiles()
         if let dir = Self.logBuffer.logDirectoryPath {
@@ -244,11 +229,13 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil
         ) { [weak self] _ in
+            // Only react when we're recovering from a reported failure (the user
+            // likely just went to grant the permission). verify() reads the
+            // reportedRemoteFailure flag to decide whether to announce success and
+            // whether to re-post the failure, so we DON'T clear it here.
             guard let self = self, self.remoteAccessEnabled, self.reportedRemoteFailure else { return }
             Self.logBuffer.append("🔄 app active after remote failure — re-verifying reachability")
-            self.reportedRemoteFailure = false
-            self.handledLocalNetworkBlocked = false  // allow recovery to run again if still broken
-            self.verifyRemoteReachableThenNotify(address: self.getDeviceAddress())
+            self.verifyRemoteReachableThenNotify(address: self.getDeviceAddress(), announceSuccess: false)
         }
 
         // If launched via ictrl://start?callback=..., jump back to the caller now.
@@ -823,48 +810,35 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         wireServerStateChange()
     }
 
-    /// Guard so we only run the blocked-permission recovery once per launch.
-    private var handledLocalNetworkBlocked = false
-
     /// True once a "Remote Access Failed" notification has been posted, so the
-    /// didBecomeActive observer knows to re-verify when the user returns.
+    /// didBecomeActive observer knows to re-verify when the user returns. Also
+    /// guards against posting the failure notice twice for the same outage.
     private var reportedRemoteFailure = false
+
+    /// Serializes reachability verification so overlapping triggers (startup,
+    /// enable-remote, didBecomeActive) can't run concurrent checks / stack notes.
+    private var verifyInFlight = false
+
+    /// Whether we've already self-woken to the foreground for the current outage,
+    /// so we don't repeatedly re-open the app.
+    private var selfWokeForCurrentOutage = false
 
     /// The runner's own URL scheme, used to bring it back to the foreground so
     /// iOS can present the Local Network permission prompt (which only appears
     /// while the app is foreground).
     private static let selfWakeURL = URL(string: "ictrl://start")!
 
-    /// Called when the LAN probe suggests Local Network access is blocked. iOS
-    /// only shows that permission prompt while the app is in the FOREGROUND — if
-    /// the runner was woken headlessly and is in the background, the prompt can't
-    /// appear and the service stays LAN-unreachable silently. So we: (1) try to
-    /// self-wake to the foreground via our own URL scheme (harmless if already
-    /// foreground), which lets the OS present the prompt; (2) re-probe so the
-    /// prompt actually fires; (3) post a notification telling the user to enable
-    /// the permission if it still doesn't take.
-    private func handleLocalNetworkBlocked() {
-        guard !handledLocalNetworkBlocked else { return }
-        handledLocalNetworkBlocked = true
-
-        Self.logBuffer.append("🔔 Local Network appears blocked — attempting self-wake + notifying user")
-
-        // (1) Bring the runner to the foreground via ictrl:// so the OS can show
-        //     the permission dialog. openURL uses the XCTest-sanctioned path.
+    /// Bring the runner to the foreground via its own ictrl:// scheme so iOS can
+    /// present the Local Network permission prompt (it only appears while the app
+    /// is foreground). No-op-ish if already foreground; runs at most once per
+    /// outage so we don't repeatedly re-open the app. Does NOT post a
+    /// notification — the single failure notice is owned by verifyRemote…().
+    private func selfWakeForLocalNetworkPrompt() {
+        guard !selfWokeForCurrentOutage else { return }
+        selfWokeForCurrentOutage = true
         let woke = ForegroundApp.open(Self.selfWakeURL)
-        Self.logBuffer.append(woke ? "🔼 self-wake via ictrl:// requested" : "⚠️ self-wake via ictrl:// failed")
-
-        // (2) Re-probe shortly after (now hopefully foreground) so the prompt fires.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.lanPrimer.prime(log: { Self.logBuffer.append($0) })
-        }
-
-        // (3) Notify regardless, so the user has a clear action even if the prompt
-        //     was dismissed or doesn't appear.
-        sendNotification(
-            title: "⚠️ Enable Local Network for iCTRL",
-            body: "iCTRL is running but your LAN can't reach it. Open Settings › iCTRL › Local Network and turn it ON, then reconnect. (localhost still works.)"
-        )
+        Self.logBuffer.append(woke ? "🔼 self-wake via ictrl:// requested (foreground for LN prompt)"
+                                   : "⚠️ self-wake via ictrl:// failed")
     }
 
     /// Fixed identifier for the "Remote Access Failed" notification so it can be
@@ -994,31 +968,59 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// this self-check with a 1s timeout and post the appropriate notification:
     /// success → "Server Ready"; failure → "Remote Access Failed" (likely the
     /// Local Network permission — the user must open the app to grant it).
-    private func verifyRemoteReachableThenNotify(address: String) {
+    /// `announceSuccess` controls whether a reachable result posts a "Server
+    /// Ready" notification. First check after enabling remote access: yes. The
+    /// re-check on didBecomeActive only announces if it's RECOVERING from a prior
+    /// failure (so we don't ping "Ready" every time the app is foregrounded).
+    private func verifyRemoteReachableThenNotify(address: String, announceSuccess: Bool = true) {
+        // Serialize: overlapping triggers must not run concurrent checks.
+        guard !verifyInFlight else {
+            Self.logBuffer.append("🌐 reachability check already in flight — skipping duplicate")
+            return
+        }
+        // No usable LAN address (e.g. Wi-Fi down) — can't verify or reach remotely.
+        guard address != "127.0.0.1", !address.isEmpty else {
+            Self.logBuffer.append("🌐 no LAN address available — skipping remote reachability check")
+            return
+        }
+        verifyInFlight = true
         let portNum = UInt16(server?.port ?? 8200)
+        let wasFailed = reportedRemoteFailure
         selfConnectCheck(host: address, port: portNum, timeout: 1.0) { [weak self] ok in
             guard let self = self else { return }
+            self.verifyInFlight = false
+
             if ok {
                 Self.logBuffer.append("🌐 Remote reachability OK on \(address):\(portNum)")
-                // Access works now — clear any earlier failure notification and
-                // announce success (this covers the "user just granted the
-                // permission and came back" case).
+                // Recovered (or first success): clear any failure notice, reset
+                // outage state. Announce success on the first check, or when we're
+                // recovering from a previously-reported failure.
+                let recovering = self.reportedRemoteFailure
+                self.reportedRemoteFailure = false
+                self.selfWokeForCurrentOutage = false
                 self.clearRemoteFailedNotification()
-                self.sendNotification(
-                    title: "🟢 iCTRL Server Ready",
-                    body: "Running on \(address):\(portNum) (remote access)\nLong press to Disable Remote or Stop Server",
-                    category: Self.serverRemoteCategoryID
-                )
+                if announceSuccess || recovering {
+                    self.sendNotification(
+                        title: "🟢 iCTRL Server Ready",
+                        body: "Running on \(address):\(portNum) (remote access)\nLong press to Disable Remote or Stop Server",
+                        category: Self.serverRemoteCategoryID
+                    )
+                }
             } else {
                 Self.logBuffer.append("🔴 Remote reachability FAILED on \(address):\(portNum) — likely Local Network permission")
-                self.reportedRemoteFailure = true
-                self.sendNotification(
-                    title: "🔴 Remote Access Failed",
-                    body: "iCTRL is listening but \(address):\(portNum) can't be reached — likely the Local Network permission. Open the iCTRL app once and allow Local Network, then reconnect. (localhost still works.)",
-                    identifier: Self.remoteFailedNotifID
-                )
-                // Also run the self-wake / permission-prompt recovery.
-                self.handleLocalNetworkBlocked()
+                // Post the failure notice only once per outage (fixed id means a
+                // repeat would just replace it, but skipping avoids re-alerting).
+                if !wasFailed {
+                    self.reportedRemoteFailure = true
+                    self.sendNotification(
+                        title: "🔴 Remote Access Failed",
+                        body: "iCTRL is listening but \(address):\(portNum) can't be reached — likely the Local Network permission. Open the iCTRL app once and allow Local Network, then reconnect. (localhost still works.)",
+                        identifier: Self.remoteFailedNotifID
+                    )
+                }
+                // Bring the app forward so iOS can present the permission prompt
+                // (once per outage). No extra notification here.
+                self.selfWakeForLocalNetworkPrompt()
             }
         }
     }
