@@ -238,6 +238,19 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         keepRunning = true
         wireServerStateChange()
 
+        // When the app comes back to the foreground (e.g. the user opened it to
+        // grant the Local Network permission), re-verify remote reachability — if
+        // it now works we clear the failure notification and post a fresh success.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self = self, self.remoteAccessEnabled, self.reportedRemoteFailure else { return }
+            Self.logBuffer.append("🔄 app active after remote failure — re-verifying reachability")
+            self.reportedRemoteFailure = false
+            self.handledLocalNetworkBlocked = false  // allow recovery to run again if still broken
+            self.verifyRemoteReachableThenNotify(address: self.getDeviceAddress())
+        }
+
         // If launched via ictrl://start?callback=..., jump back to the caller now.
         handlePendingCallbackIfAny()
 
@@ -813,6 +826,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// Guard so we only run the blocked-permission recovery once per launch.
     private var handledLocalNetworkBlocked = false
 
+    /// True once a "Remote Access Failed" notification has been posted, so the
+    /// didBecomeActive observer knows to re-verify when the user returns.
+    private var reportedRemoteFailure = false
+
     /// The runner's own URL scheme, used to bring it back to the foreground so
     /// iOS can present the Local Network permission prompt (which only appears
     /// while the app is foreground).
@@ -850,7 +867,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         )
     }
 
-    private func sendNotification(title: String, body: String, category: String? = nil) {
+    /// Fixed identifier for the "Remote Access Failed" notification so it can be
+    /// removed once access starts working.
+    private static let remoteFailedNotifID = "ictrl.remote.failed"
+
+    private func sendNotification(title: String, body: String, category: String? = nil,
+                                  identifier: String? = nil) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -860,11 +882,18 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
 
         let request = UNNotificationRequest(
-            identifier: UUID().uuidString,
+            identifier: identifier ?? UUID().uuidString,
             content: content,
             trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false)
         )
         UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Remove the "Remote Access Failed" notification (pending + already-delivered).
+    private func clearRemoteFailedNotification() {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [Self.remoteFailedNotifID])
+        center.removeDeliveredNotifications(withIdentifiers: [Self.remoteFailedNotifID])
     }
 
     private func enableRemoteAccess() {
@@ -971,6 +1000,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             guard let self = self else { return }
             if ok {
                 Self.logBuffer.append("🌐 Remote reachability OK on \(address):\(portNum)")
+                // Access works now — clear any earlier failure notification and
+                // announce success (this covers the "user just granted the
+                // permission and came back" case).
+                self.clearRemoteFailedNotification()
                 self.sendNotification(
                     title: "🟢 iCTRL Server Ready",
                     body: "Running on \(address):\(portNum) (remote access)\nLong press to Disable Remote or Stop Server",
@@ -978,9 +1011,11 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 )
             } else {
                 Self.logBuffer.append("🔴 Remote reachability FAILED on \(address):\(portNum) — likely Local Network permission")
+                self.reportedRemoteFailure = true
                 self.sendNotification(
                     title: "🔴 Remote Access Failed",
-                    body: "iCTRL is listening but \(address):\(portNum) can't be reached — likely the Local Network permission. Open the iCTRL app once and allow Local Network, then reconnect. (localhost still works.)"
+                    body: "iCTRL is listening but \(address):\(portNum) can't be reached — likely the Local Network permission. Open the iCTRL app once and allow Local Network, then reconnect. (localhost still works.)",
+                    identifier: Self.remoteFailedNotifID
                 )
                 // Also run the self-wake / permission-prompt recovery.
                 self.handleLocalNetworkBlocked()
