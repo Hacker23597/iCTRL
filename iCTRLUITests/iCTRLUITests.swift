@@ -61,12 +61,18 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             setValue(false, forKey: "shouldHaltWhenReceivesControl")
         }
 
+        // Construct the app reference but DO NOT activate() here. WebDriverAgent's
+        // setUp never touches XCUIApplication. If the device is on the lock/passcode
+        // screen (first launch after a URL wake), activate() blocks waiting for
+        // SpringBoard to reach a foreground/quiescent state it can't reach behind
+        // the passcode UI — which stalls setUp and the runner exits silently. We
+        // only hold the reference; the first real action reads app.frame lazily
+        // (well after unlock).
         app = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        app.activate()
 
         URLSchemeHandler.installURLHandler()
         setupNotifications()
-        Self.logBuffer.append("🧩 setUpWithError done")
+        Self.logBuffer.append("🧩 setUpWithError done (no app.activate)")
     }
 
     private static var lifecycleObserved = false
@@ -162,6 +168,14 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // silent teardown / kill leaves a trace in the persisted log.
         Self.installExitHandlers()
 
+        // Note the lock state at startup (diagnostics). We DON'T block on it: with
+        // app.activate() removed from setUp, starting the server no longer needs the
+        // device unlocked — the NWListener + device-address lookup work while locked,
+        // and UI actions read app.frame lazily (only once a client calls one, which
+        // is after unlock in practice).
+        let lockedAtStart = LockStateMonitor.shared().isLocked
+        Self.logBuffer.append("🔐 startup lock state: \(lockedAtStart ? "LOCKED" : "unlocked")")
+
         // Prune old daily log files and note where logs are persisted.
         Self.logBuffer.pruneOldLogFiles()
         if let dir = Self.logBuffer.logDirectoryPath {
@@ -214,17 +228,25 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         handlePendingCallbackIfAny()
 
         Self.logBuffer.append("🔁 entering run loop (keepRunning=\(keepRunning))")
+        // WDA-style run loop: block on distantFuture instead of a 0.2s poll. The
+        // run loop wakes on any input source — the RPC queue's main.sync, server
+        // callbacks, notification actions — so we don't need to busy-poll. This
+        // keeps CPU near zero when idle (matching FBWebServer.startServing) and
+        // removes the 0.2s wakeup churn. A low-frequency safety timer still drains
+        // any ictrl:// callback that somehow didn't wake us.
         let runLoop = RunLoop.current
+        let safetyTimer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.handlePendingCallbackIfAny()
+        }
+        runLoop.add(safetyTimer, forMode: .default)
+
         while keepRunning {
             autoreleasepool {
-                // Short slice so main-queue work (the main.sync from the RPC queue)
-                // and pending ictrl:// callbacks are serviced promptly. The runloop
-                // also wakes early on dispatch, so this mainly bounds callback polling.
-                runLoop.run(until: Date(timeIntervalSinceNow: 0.2))
-                // A URL may also arrive after startup (app already running).
-                handlePendingCallbackIfAny()
+                // Blocks until an input source fires (or distantFuture, i.e. never).
+                runLoop.run(mode: .default, before: Date.distantFuture)
             }
         }
+        safetyTimer.invalidate()
         // Only reached when keepRunning was set false (stop_server / notification /
         // config restart). If we ever get here unexpectedly, the log shows it.
         Self.logBuffer.append("🔁 run loop exited (keepRunning=false)")
