@@ -1,6 +1,7 @@
 import XCTest
 import UserNotifications
 import UIKit
+import Network
 
 final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private var server: JSONRPCServer?
@@ -214,12 +215,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             try server?.start()
             if remoteAccessEnabled {
                 let address = getDeviceAddress()
-                Self.logBuffer.append("🌐 Server started on \(address):8200 (remote access)")
-                sendNotification(
-                    title: "🟢 iCTRL Server Ready",
-                    body: "Running on \(address):8200 (remote access)\nLong press to Disable Remote or Stop Server",
-                    category: Self.serverRemoteCategoryID
-                )
+                Self.logBuffer.append("🌐 Server started on \(address):8200 (remote access) — verifying reachability")
+                // Confirm the LAN address is actually reachable (1s) before saying
+                // "ready"; if it isn't (Local Network permission), notify failure.
+                verifyRemoteReachableThenNotify(address: address)
             } else {
                 Self.logBuffer.append("🔒 Server started on 127.0.0.1:8200 (local only)")
                 sendNotification(
@@ -881,12 +880,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         do {
             try newServer.start()
             let address = getDeviceAddress()
-            Self.logBuffer.append("🌐 Remote access enabled on \(address):8200")
-            sendNotification(
-                title: "🌐 Remote Access Enabled",
-                body: "Now accessible at \(address):8200\nLong press to Disable or Stop Server",
-                category: Self.serverRemoteCategoryID
-            )
+            Self.logBuffer.append("🌐 Remote access enabled on \(address):8200 — verifying reachability")
+            // Verify the LAN address is reachable (1s) before confirming; on
+            // failure the user gets "Remote Access Failed" + recovery.
+            verifyRemoteReachableThenNotify(address: address)
         } catch {
             Self.logBuffer.append("🔴 Failed to enable remote access: \(error)")
         }
@@ -959,6 +956,63 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
 
         return wifiAddr ?? fallbackAddr ?? "127.0.0.1"
+    }
+
+    /// After enabling remote access, confirm the LAN address is actually reachable
+    /// before telling the user it's ready. If Local Network permission is denied,
+    /// iOS binds the listener but silently blocks LAN connections — so a TCP
+    /// connect to our own LAN address FAILS even though the server is "up". We do
+    /// this self-check with a 1s timeout and post the appropriate notification:
+    /// success → "Server Ready"; failure → "Remote Access Failed" (likely the
+    /// Local Network permission — the user must open the app to grant it).
+    private func verifyRemoteReachableThenNotify(address: String) {
+        let portNum = UInt16(server?.port ?? 8200)
+        selfConnectCheck(host: address, port: portNum, timeout: 1.0) { [weak self] ok in
+            guard let self = self else { return }
+            if ok {
+                Self.logBuffer.append("🌐 Remote reachability OK on \(address):\(portNum)")
+                self.sendNotification(
+                    title: "🟢 iCTRL Server Ready",
+                    body: "Running on \(address):\(portNum) (remote access)\nLong press to Disable Remote or Stop Server",
+                    category: Self.serverRemoteCategoryID
+                )
+            } else {
+                Self.logBuffer.append("🔴 Remote reachability FAILED on \(address):\(portNum) — likely Local Network permission")
+                self.sendNotification(
+                    title: "🔴 Remote Access Failed",
+                    body: "iCTRL is listening but \(address):\(portNum) can't be reached — likely the Local Network permission. Open the iCTRL app once and allow Local Network, then reconnect. (localhost still works.)"
+                )
+                // Also run the self-wake / permission-prompt recovery.
+                self.handleLocalNetworkBlocked()
+            }
+        }
+    }
+
+    /// TCP-connect to host:port with a timeout, calling `completion(reachable)`
+    /// on the main queue exactly once. Used to self-test LAN reachability.
+    private func selfConnectCheck(host: String, port: UInt16, timeout: TimeInterval,
+                                  completion: @escaping (Bool) -> Void) {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { completion(false); return }
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        var finished = false
+        let finish: (Bool) -> Void = { ok in
+            if finished { return }
+            finished = true
+            conn.cancel()
+            DispatchQueue.main.async { completion(ok) }
+        }
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready: finish(true)
+            case .failed, .cancelled: finish(false)
+            // Don't fail immediately on .waiting: a healthy listener that's still
+            // coming up briefly waits then goes ready, whereas a permission-blocked
+            // connect stays waiting — so let the timeout be the arbiter for waiting.
+            default: break
+            }
+        }
+        conn.start(queue: DispatchQueue(label: "com.openminis.ictrl.reachcheck"))
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(false) }
     }
 }
 
