@@ -18,12 +18,13 @@ struct RPCMethodRegistry {
     static let methods: [RPCMethodDef] = [
         RPCMethodDef(
             name: "config",
-            description: "Read or update server settings and manage authorized sessions. With no params: returns current config plus the list of authorized sessions (client name, masked token prefix, granted/expiry times). Pass allow_remote_access and/or listen_port to change settings (persisted; server restarts, dropping the connection — reconnect at the returned address). Pass revoke_session_id to remove one session, or clear_sessions=true to revoke ALL tokens (including your own).",
+            description: "Read or update server settings and manage authorized sessions. With no params: returns current config plus the list of authorized sessions (client name, masked token prefix, granted/expiry times). Pass allow_remote_access and/or listen_port to change settings (persisted; server restarts, dropping the connection — reconnect at the returned address). Pass revoke_session_id to remove one session, or clear_sessions=true to revoke ALL tokens (including your own). Pass stop_server=true to SHUT DOWN the service (stops listening after replying; re-launch the runner to restart — tokens are preserved so no re-auth is needed).",
             params: [
                 RPCParamDef(name: "allow_remote_access", type: "boolean", required: false, description: "true = listen on all interfaces (LAN reachable); false = 127.0.0.1 only"),
                 RPCParamDef(name: "listen_port", type: "number", required: false, description: "TCP port to listen on (1..65535, default 8200)"),
                 RPCParamDef(name: "revoke_session_id", type: "string", required: false, description: "session_id of a single authorization to revoke"),
                 RPCParamDef(name: "clear_sessions", type: "boolean", required: false, description: "true = revoke all authorized tokens immediately"),
+                RPCParamDef(name: "stop_server", type: "boolean", required: false, description: "true = stop the service (stops listening ~1s after replying). Re-launch the runner to restart; tokens persist."),
             ],
             returns: "{allow_remote_access, listen_port, address, restarted, device_name, active_sessions, sessions:[{session_id, client_name, token_prefix, granted_at, last_active_at, expires_at}], cleared_sessions}"
         ),

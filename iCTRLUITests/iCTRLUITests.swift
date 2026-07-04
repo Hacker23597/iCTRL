@@ -590,6 +590,24 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             Self.logBuffer.append("🧹 Cleared all authorized sessions (\(clearedSessions))")
         }
 
+        // Stop the whole service (ends the test / stops listening). Scheduled AFTER
+        // this response is sent so the client still gets an acknowledgement. Tokens
+        // persist, so a later relaunch doesn't require re-authorization.
+        if params?["stop_server"]?.boolValue == true {
+            Self.logBuffer.append("🛑 Stop requested via config — shutting down after reply")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self = self else { return }
+                Self.logBuffer.append("🛑 Stopping server and ending test (config stop_server)")
+                self.server?.onStateChange = nil
+                self.server?.stop()
+                self.keepRunning = false   // break the run loop → test ends cleanly
+            }
+            return ([
+                "message": .string("Server is shutting down. It will stop listening in ~1s. Re-launch the iCTRL runner to start it again (your token is preserved — no re-auth needed)."),
+                "stopping": .bool(true),
+            ], nil)
+        }
+
         if let remote = params?["allow_remote_access"]?.boolValue {
             if remote != remoteAccessEnabled {
                 remoteAccessEnabled = remote
