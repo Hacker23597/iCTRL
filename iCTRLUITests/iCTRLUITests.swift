@@ -80,6 +80,11 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     }
 
     func testStartServer() throws {
+        // Tell the bootstrap watchdog the test actually began, so it won't re-kick
+        // runTestsInBackground: (the watchdog covers the case where the first-launch
+        // passcode prompt interrupted the XCTest bootstrap).
+        EarlyURLHook.markTestStarted()
+
         // Prune old daily log files and note where logs are persisted.
         Self.logBuffer.pruneOldLogFiles()
         if let dir = Self.logBuffer.logDirectoryPath {

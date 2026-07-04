@@ -10,6 +10,7 @@
 @interface EarlyURLHook : NSObject
 + (NSArray<NSURL *> *)drainURLs;
 + (NSArray<NSString *> *)drainLogs;
++ (void)markTestStarted;
 @end
 
 NS_ASSUME_NONNULL_BEGIN

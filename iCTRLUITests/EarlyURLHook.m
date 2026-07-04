@@ -11,6 +11,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 // Thread-safe stash of early-captured URLs. URLSchemeHandler (Swift) reads these
 // via +[EarlyURLHook drainURLs] and merges them into its pending queue.
@@ -18,12 +19,20 @@ static NSMutableArray<NSURL *> *sEarlyURLs;
 static NSMutableArray<NSString *> *sEarlyLogs;   // events captured before Swift log is ready
 static NSLock *sEarlyLock;
 
+// Set to YES by Swift (via +[EarlyURLHook markTestStarted]) once testStartServer
+// actually begins. The bootstrap watchdog uses this to decide whether to re-kick
+// runTestsInBackground: — the passcode prompt on first launch can interrupt the
+// XCTest bootstrap so the test method never runs and the server never comes up.
+static BOOL sTestStarted = NO;
+
 @interface EarlyURLHook : NSObject
 + (NSArray<NSURL *> *)drainURLs;
 + (NSArray<NSString *> *)drainLogs;
 + (void)hookDelegateInstance:(id<UIApplicationDelegate>)delegate;
 + (void)tryInstall;
 + (void)hookClass:(Class)cls;
++ (void)markTestStarted;
++ (void)scheduleBootstrapWatchdogForDelegate:(id)delegate;
 @end
 
 /// Record an event both to the console AND to a buffer the Swift LogBuffer drains
@@ -52,6 +61,9 @@ static BOOL hookedDidFinishLaunching(id self, SEL _cmd, id application, NSDictio
     earlyLog([NSString stringWithFormat:@"🔎 didFinishLaunching fired; launchURL=%@; optionKeys=%@",
               url ? url.absoluteString : @"(none)", options.allKeys]);
     if ([url isKindOfClass:[NSURL class]]) { stashURL(url); }
+    // Arm the bootstrap watchdog in case the passcode prompt interrupts the test
+    // kickoff (self is the _XCTRunnerAppDelegate).
+    [EarlyURLHook scheduleBootstrapWatchdogForDelegate:self];
     SEL orig = NSSelectorFromString(@"ictrlearly_application:didFinishLaunchingWithOptions:");
     if ([self respondsToSelector:orig]) {
         BOOL (*imp)(id, SEL, id, NSDictionary *) = (BOOL (*)(id, SEL, id, NSDictionary *))
@@ -108,6 +120,9 @@ static void hookedSceneWillConnect(id self, SEL _cmd, id scene, id session, id c
             if ([url isKindOfClass:[NSURL class]]) { stashURL(url); }
         }
     }
+    // Arm the bootstrap watchdog on the actual app delegate (which owns
+    // runTestsInBackground:), in case the passcode prompt interrupted kickoff.
+    [EarlyURLHook scheduleBootstrapWatchdogForDelegate:[UIApplication sharedApplication].delegate];
     SEL orig = NSSelectorFromString(@"ictrlearly_scene:willConnectToSession:options:");
     if ([self respondsToSelector:orig]) {
         void (*imp)(id, SEL, id, id, id) = (void (*)(id, SEL, id, id, id))[self methodForSelector:orig];
@@ -215,6 +230,35 @@ static BOOL sInstalled = NO;
     }
 
     earlyLog(@"🔗 early URL hooks installed (app + scene lifecycle)");
+}
+
++ (void)markTestStarted {
+    sTestStarted = YES;
+    earlyLog(@"✅ testStartServer began — bootstrap OK");
+}
+
+// Bootstrap watchdog: if the XCTest test method hasn't begun a few seconds after
+// launch (e.g. the first-launch passcode prompt interrupted the bootstrap so
+// runTestsInBackground: never ran), re-invoke it on the delegate to kick the
+// test off. No-op once the test has started.
++ (void)scheduleBootstrapWatchdogForDelegate:(id)delegate {
+    if (!delegate) { return; }
+    SEL kick = NSSelectorFromString(@"runTestsInBackground:");
+    if (![delegate respondsToSelector:kick]) { return; }
+    // Retry a few times with backoff — the passcode dialog can take a while.
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(attempt * 4.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (sTestStarted) { return; }
+            earlyLog([NSString stringWithFormat:@"🔁 bootstrap watchdog: test not started, re-kicking runTestsInBackground: (attempt %d)", attempt]);
+            @try {
+                void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
+                imp(delegate, kick, nil);
+            } @catch (NSException *e) {
+                earlyLog([NSString stringWithFormat:@"🔁 watchdog re-kick threw: %@", e.reason]);
+            }
+        });
+    }
 }
 
 + (NSArray<NSURL *> *)drainURLs {
