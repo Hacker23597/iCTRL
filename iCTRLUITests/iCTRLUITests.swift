@@ -4,6 +4,7 @@ import UIKit
 
 final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private var server: JSONRPCServer?
+    private let lanPrimer = LocalNetworkPrimer()
     private var app: XCUIApplication!
     private var actionHandler: ActionHandler?
     private var pendingAuthCompletions: [String: (Bool) -> Void] = [:]
@@ -175,6 +176,13 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // is after unlock in practice).
         let lockedAtStart = LockStateMonitor.shared().isLocked
         Self.logBuffer.append("🔐 startup lock state: \(lockedAtStart ? "LOCKED" : "unlocked")")
+
+        // Proactively raise the iOS "Local Network" permission prompt now. Without
+        // this the prompt only appears when a LAN client first connects — and until
+        // it's granted the server looks dead from the LAN even though it's bound.
+        // Doing it here means the user grants it at startup, not as a mysterious
+        // later connection failure. (Only prompts once; a no-op if already granted.)
+        lanPrimer.prime { Self.logBuffer.append($0) }
 
         // Prune old daily log files and note where logs are persisted.
         Self.logBuffer.pruneOldLogFiles()

@@ -45,6 +45,10 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         CODE_SIGN_STYLE: Automatic
         SWIFT_OBJC_BRIDGING_HEADER: iCTRLUITests/XCTestPrivate-Bridging-Header.h
+        # The server runs in THIS (runner) process, so the runner is the app that
+        # needs Local Network access. Declared here so the permission prompt has a
+        # rationale and the LocalNetworkPrimer can raise it at startup.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "iCTRL needs local network access to serve the automation API on your LAN."
         TEST_HOST: ""
     postBuildScripts:
       - name: "Strip unnecessary XCTest frameworks"
