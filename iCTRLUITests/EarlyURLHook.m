@@ -237,28 +237,33 @@ static BOOL sInstalled = NO;
     earlyLog(@"✅ testStartServer began — bootstrap OK");
 }
 
-// Bootstrap watchdog: if the XCTest test method hasn't begun a few seconds after
-// launch (e.g. the first-launch passcode prompt interrupted the bootstrap so
-// runTestsInBackground: never ran), re-invoke it on the delegate to kick the
-// test off. No-op once the test has started.
+// Bootstrap watchdog — DIAGNOSTIC ONLY. It does NOT re-invoke
+// runTestsInBackground: anymore.
+//
+// History: this used to re-kick runTestsInBackground: if the test hadn't begun a
+// few seconds after launch, to recover from the first-launch passcode prompt
+// interrupting the bootstrap. But re-invoking runTestsInBackground: RE-ENTERS
+// XCTest in the same process, which crashes with
+//   "Attempted to register a shared symbolication service instance when one was
+//    already set" (NSInternalInconsistencyException)
+// — observed on a fresh install: the re-kick fought a bootstrap that was already
+// underway (slowed only by first-launch notification/network permission prompts),
+// so the app crash-looped several times before one launch happened to win the
+// race. The real cause of the original "server ready then dies" was setUp calling
+// app.activate() behind the lock screen, which is now removed. So the re-kick is
+// no longer needed and was doing net harm.
+//
+// We keep the watchdog purely to LOG if the test is slow to start, so a genuine
+// bootstrap stall is still visible without risking the re-entrancy crash.
 + (void)scheduleBootstrapWatchdogForDelegate:(id)delegate {
     if (!delegate) { return; }
-    SEL kick = NSSelectorFromString(@"runTestsInBackground:");
-    if (![delegate respondsToSelector:kick]) { return; }
-    // Retry a few times with backoff — the passcode dialog can take a while.
-    for (int attempt = 1; attempt <= 3; attempt++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(attempt * 4.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (sTestStarted) { return; }
-            earlyLog([NSString stringWithFormat:@"🔁 bootstrap watchdog: test not started, re-kicking runTestsInBackground: (attempt %d)", attempt]);
-            @try {
-                void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
-                imp(delegate, kick, nil);
-            } @catch (NSException *e) {
-                earlyLog([NSString stringWithFormat:@"🔁 watchdog re-kick threw: %@", e.reason]);
-            }
-        });
-    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (sTestStarted) { return; }
+        earlyLog(@"⚠️ bootstrap watchdog: test still not started 10s after launch "
+                 @"(NOT re-kicking — re-entering XCTest crashes). If the server never "
+                 @"comes up, relaunch the runner.");
+    });
 }
 
 + (NSArray<NSURL *> *)drainURLs {
