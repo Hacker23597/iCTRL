@@ -179,10 +179,17 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
         // Proactively raise the iOS "Local Network" permission prompt now. Without
         // this the prompt only appears when a LAN client first connects — and until
-        // it's granted the server looks dead from the LAN even though it's bound.
-        // Doing it here means the user grants it at startup, not as a mysterious
-        // later connection failure. (Only prompts once; a no-op if already granted.)
-        lanPrimer.prime { Self.logBuffer.append($0) }
+        // it's granted the server looks dead from the LAN even though it's bound
+        // (loopback still works, so it looks like "remote access on but only
+        // localhost reachable"). Doing it here means the user grants it at startup.
+        // If the probe shows the permission is NOT granted, post a notification so
+        // the user knows to enable it — otherwise the failure is silent/mysterious.
+        lanPrimer.prime(log: { Self.logBuffer.append($0) }, onLikelyDenied: { [weak self] in
+            guard let self = self else { return }
+            // Only nag when remote access is expected; local-only doesn't need LAN.
+            guard self.remoteAccessEnabled else { return }
+            self.handleLocalNetworkBlocked()
+        })
 
         // Prune old daily log files and note where logs are persisted.
         Self.logBuffer.pruneOldLogFiles()
@@ -802,6 +809,46 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         configureServerCallbacks(newServer)
         self.server = newServer
         wireServerStateChange()
+    }
+
+    /// Guard so we only run the blocked-permission recovery once per launch.
+    private var handledLocalNetworkBlocked = false
+
+    /// The runner's own URL scheme, used to bring it back to the foreground so
+    /// iOS can present the Local Network permission prompt (which only appears
+    /// while the app is foreground).
+    private static let selfWakeURL = URL(string: "ictrl://start")!
+
+    /// Called when the LAN probe suggests Local Network access is blocked. iOS
+    /// only shows that permission prompt while the app is in the FOREGROUND — if
+    /// the runner was woken headlessly and is in the background, the prompt can't
+    /// appear and the service stays LAN-unreachable silently. So we: (1) try to
+    /// self-wake to the foreground via our own URL scheme (harmless if already
+    /// foreground), which lets the OS present the prompt; (2) re-probe so the
+    /// prompt actually fires; (3) post a notification telling the user to enable
+    /// the permission if it still doesn't take.
+    private func handleLocalNetworkBlocked() {
+        guard !handledLocalNetworkBlocked else { return }
+        handledLocalNetworkBlocked = true
+
+        Self.logBuffer.append("🔔 Local Network appears blocked — attempting self-wake + notifying user")
+
+        // (1) Bring the runner to the foreground via ictrl:// so the OS can show
+        //     the permission dialog. openURL uses the XCTest-sanctioned path.
+        let woke = ForegroundApp.open(Self.selfWakeURL)
+        Self.logBuffer.append(woke ? "🔼 self-wake via ictrl:// requested" : "⚠️ self-wake via ictrl:// failed")
+
+        // (2) Re-probe shortly after (now hopefully foreground) so the prompt fires.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.lanPrimer.prime(log: { Self.logBuffer.append($0) })
+        }
+
+        // (3) Notify regardless, so the user has a clear action even if the prompt
+        //     was dismissed or doesn't appear.
+        sendNotification(
+            title: "⚠️ Enable Local Network for iCTRL",
+            body: "iCTRL is running but your LAN can't reach it. Open Settings › iCTRL › Local Network and turn it ON, then reconnect. (localhost still works.)"
+        )
     }
 
     private func sendNotification(title: String, body: String, category: String? = nil) {

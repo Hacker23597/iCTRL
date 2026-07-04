@@ -20,11 +20,17 @@ final class LocalNetworkPrimer {
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "com.openminis.ictrl.lan-primer")
     private var onEvent: ((String) -> Void)?
+    private var onDenied: (() -> Void)?
+    private var deniedReported = false
 
     /// Kick off a one-shot local-network probe. `log` receives short status
     /// lines for the persisted log so the permission state stays observable.
-    func prime(log: @escaping (String) -> Void) {
+    /// `onLikelyDenied` fires (once) when the probe can't reach the LAN, which
+    /// most often means Local Network permission is denied/undecided — the caller
+    /// can surface a notification telling the user to enable it in Settings.
+    func prime(log: @escaping (String) -> Void, onLikelyDenied: (() -> Void)? = nil) {
         onEvent = log
+        onDenied = onLikelyDenied
 
         // mDNS multicast group — a well-known link-local address. Sending here
         // counts as local-network access and raises the permission dialog.
@@ -41,11 +47,14 @@ final class LocalNetworkPrimer {
                 self?.onEvent?("🌐 LAN permission probe sent — grant 'Local Network' if prompted")
                 self?.stopSoon()
             case .waiting(let err):
-                // .waiting on a permission error means access is denied/undecided.
-                self?.onEvent?("🌐 LAN probe waiting: \(err) — if unreachable later, enable Settings › iCTRL › Local Network")
+                // .waiting (e.g. "Network is down", POSIX 50) means the probe
+                // can't send to the LAN — Local Network access is denied/undecided.
+                self?.onEvent?("🌐 LAN probe waiting: \(err) — Local Network likely not granted")
+                self?.reportDenied()
                 self?.stopSoon()
             case .failed(let err):
                 self?.onEvent?("🌐 LAN probe failed: \(err)")
+                self?.reportDenied()
                 self?.stop()
             default:
                 break
@@ -53,6 +62,21 @@ final class LocalNetworkPrimer {
         }
         conn.start(queue: queue)
         log("🌐 Priming Local Network permission…")
+
+        // Safety net: if the probe never reaches .ready within a few seconds
+        // (some denials leave it stuck in .preparing), treat that as likely denied.
+        queue.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self = self, self.connection != nil, !self.deniedReported else { return }
+            self.onEvent?("🌐 LAN probe never became ready — Local Network likely not granted")
+            self.reportDenied()
+        }
+    }
+
+    /// Fire the denied callback at most once.
+    private func reportDenied() {
+        guard !deniedReported else { return }
+        deniedReported = true
+        onDenied?()
     }
 
     private func stopSoon() {
