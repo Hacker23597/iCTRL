@@ -162,6 +162,33 @@ class LogBuffer {
     /// Absolute path of the current log directory (for surfacing in status/UI).
     var logDirectoryPath: String? { logsDirectory?.path }
 
+    // MARK: - Signal-safe direct file append (for atexit / signal handlers)
+
+    static var signalName: String?
+    static func nameForSignal(_ s: Int32) -> String {
+        switch s {
+        case SIGTERM: return "SIGTERM"; case SIGINT: return "SIGINT"
+        case SIGABRT: return "SIGABRT"; case SIGSEGV: return "SIGSEGV"
+        case SIGILL: return "SIGILL"; case SIGBUS: return "SIGBUS"
+        case SIGKILL: return "SIGKILL"; default: return "SIG\(s)"
+        }
+    }
+
+    /// Append a line straight to today's log file with a low-level POSIX write —
+    /// safe to call from atexit / signal handlers where the normal (locking,
+    /// ObjC) path isn't. Best-effort; ignores errors.
+    func appendDirectToFile(_ message: String) {
+        guard let dir = logsDirectory else { return }
+        let day = fileDateFormatter.string(from: Date())
+        let path = dir.appendingPathComponent("ictrl-\(day).log").path
+        let line = "[exit] \(message)\n"
+        let fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        if fd >= 0 {
+            _ = line.withCString { cstr in write(fd, cstr, strlen(cstr)) }
+            close(fd)
+        }
+    }
+
     /// Full, unredacted dump — used by the authenticated in-app "Copy Logs" action.
     func dump() -> String {
         lock.lock()

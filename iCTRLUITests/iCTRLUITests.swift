@@ -45,6 +45,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     }
 
     override func setUpWithError() throws {
+        Self.logBuffer.append("🧩 setUpWithError begin")
+        Self.observeAppLifecycle()
         // Make the test "failure-proof" — like WebDriverAgent's FBFailureProofTestCase.
         // A hung/slow XCUITest call (tap/snapshot on an animating page) makes XCTest
         // record a failure and tear the test down, which kills the server. We keep
@@ -64,6 +66,44 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
         URLSchemeHandler.installURLHandler()
         setupNotifications()
+        Self.logBuffer.append("🧩 setUpWithError done")
+    }
+
+    private static var lifecycleObserved = false
+
+    /// Log foreground/background transitions — a silent exit often correlates with
+    /// the runner being backgrounded/resigned right before it's reclaimed.
+    private static func observeAppLifecycle() {
+        guard !lifecycleObserved else { return }
+        lifecycleObserved = true
+        let nc = NotificationCenter.default
+        let events: [(Notification.Name, String)] = [
+            (UIApplication.didFinishLaunchingNotification, "app didFinishLaunching"),
+            (UIApplication.didBecomeActiveNotification, "app didBecomeActive"),
+            (UIApplication.willResignActiveNotification, "app willResignActive"),
+            (UIApplication.didEnterBackgroundNotification, "app didEnterBackground"),
+            (UIApplication.willEnterForegroundNotification, "app willEnterForeground"),
+            (UIApplication.willTerminateNotification, "app willTerminate"),
+        ]
+        for (name, label) in events {
+            nc.addObserver(forName: name, object: nil, queue: nil) { _ in
+                logBuffer.append("🔄 \(label)")
+            }
+        }
+        // Scene lifecycle (the runner uses scenes).
+        let sceneEvents: [(Notification.Name, String)] = [
+            (UIScene.willConnectNotification, "scene willConnect"),
+            (UIScene.didActivateNotification, "scene didActivate"),
+            (UIScene.willDeactivateNotification, "scene willDeactivate"),
+            (UIScene.didEnterBackgroundNotification, "scene didEnterBackground"),
+            (UIScene.willEnterForegroundNotification, "scene willEnterForeground"),
+            (UIScene.didDisconnectNotification, "scene didDisconnect"),
+        ]
+        for (name, label) in sceneEvents {
+            nc.addObserver(forName: name, object: nil, queue: nil) { _ in
+                logBuffer.append("🔄 \(label)")
+            }
+        }
     }
 
     /// Swallow XCTest failure reports so a slow/hung interaction can't tear the
@@ -73,7 +113,39 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Intentionally NOT calling super — do not propagate the failure.
     }
 
+    private static var exitHandlersInstalled = false
+
+    /// Register atexit + fatal-signal handlers that append to the persisted log
+    /// file, so a silent process exit/kill is still recorded. Signal handlers must
+    /// be async-signal-safe, so they write straight to the log file (no ObjC).
+    private static func installExitHandlers() {
+        guard !exitHandlersInstalled else { return }
+        exitHandlersInstalled = true
+
+        atexit {
+            iCTRLUITests.logBuffer.appendDirectToFile("🚪 atexit — process exiting normally")
+        }
+        // Fatal signals — write a minimal marker, then re-raise the default handler.
+        let signals: [(Int32, String)] = [
+            (SIGTERM, "SIGTERM"), (SIGINT, "SIGINT"), (SIGABRT, "SIGABRT"),
+            (SIGSEGV, "SIGSEGV"), (SIGILL, "SIGILL"), (SIGBUS, "SIGBUS"),
+            (SIGKILL, "SIGKILL"),  // can't actually be caught, but harmless to try
+        ]
+        for (sig, name) in signals {
+            signal(sig) { received in
+                LogBuffer.signalName = LogBuffer.nameForSignal(received)
+                iCTRLUITests.logBuffer.appendDirectToFile("💥 received signal \(LogBuffer.signalName ?? "\(received)")")
+                signal(received, SIG_DFL)
+                raise(received)
+            }
+        }
+        Self.logBuffer.append("🪝 exit/signal handlers installed")
+    }
+
     override func tearDownWithError() throws {
+        // Record WHY the test is ending — this is the main place a silent exit
+        // shows up (XCTest tears the test down → server stops).
+        Self.logBuffer.append("🚪 tearDownWithError — test ending, stopping server. keepRunning=\(keepRunning)")
         server?.stop()
         server = nil
         actionHandler = nil
@@ -82,8 +154,13 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     func testStartServer() throws {
         // Tell the bootstrap watchdog the test actually began, so it won't re-kick
         // runTestsInBackground: (the watchdog covers the case where the first-launch
-        // passcode prompt interrupted the XCTest bootstrap).
+        // passcode prompt interrupted the XCTest bootstrap). Do this FIRST so a
+        // watchdog timer that's about to fire sees the flag and stays a no-op.
         EarlyURLHook.markTestStarted()
+
+        // Last-resort exit visibility: register atexit + signal handlers so a
+        // silent teardown / kill leaves a trace in the persisted log.
+        Self.installExitHandlers()
 
         // Prune old daily log files and note where logs are persisted.
         Self.logBuffer.pruneOldLogFiles()
@@ -136,6 +213,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // If launched via ictrl://start?callback=..., jump back to the caller now.
         handlePendingCallbackIfAny()
 
+        Self.logBuffer.append("🔁 entering run loop (keepRunning=\(keepRunning))")
         let runLoop = RunLoop.current
         while keepRunning {
             autoreleasepool {
@@ -147,6 +225,9 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 handlePendingCallbackIfAny()
             }
         }
+        // Only reached when keepRunning was set false (stop_server / notification /
+        // config restart). If we ever get here unexpectedly, the log shows it.
+        Self.logBuffer.append("🔁 run loop exited (keepRunning=false)")
     }
 
     // MARK: - URL Scheme Callback

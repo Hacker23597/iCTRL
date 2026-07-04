@@ -68,8 +68,13 @@ class JSONRPCServer {
             case .cancelled:
                 self.isRunning = false
                 self.onStateChange?(false)
-            default:
-                break
+                self.log("⚪️ NWListener cancelled")
+            case .waiting(let error):
+                self.log("🟡 NWListener waiting: \(error)")
+            case .setup:
+                self.log("🔧 NWListener setup")
+            @unknown default:
+                self.log("❔ NWListener state: \(state)")
             }
         }
 
@@ -78,9 +83,11 @@ class JSONRPCServer {
         }
 
         listener.start(queue: queue)
+        log("🔊 NWListener.start called (port \(port), localOnly=\(localOnly))")
     }
 
     func stop() {
+        log("🔻 JSONRPCServer.stop called")
         connections.forEach { $0.cancel() }
         connections.removeAll()
         listener?.cancel()
