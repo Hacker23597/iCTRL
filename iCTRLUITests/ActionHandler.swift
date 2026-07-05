@@ -1169,6 +1169,30 @@ class ActionHandler {
             target = app
         }
 
+        // Pre-check the target's state before snapshotting. snapshot() on an app
+        // that isn't frontmost has no main window to read, so the accessibility
+        // server returns kAXErrorServerNotFound — but only after XCTest's internal
+        // ~16s timeout, blocking the whole call (the RPC 6s watchdog can't cancel
+        // the in-flight XCUITest call). A backgrounded bound app is the common
+        // cause (e.g. a tap sent the app to the background). Fail fast with a clear
+        // recoverable error instead. SpringBoard is always readable, so skip it.
+        if let bid = inspectedBundleId, bid != "com.apple.springboard" {
+            let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bid)) ?? .unknown
+            switch state {
+            case .notRunning:
+                return (nil, JSONRPCError(code: -32004, message:
+                    "Can't read the view tree: app '\(bid)' is not running (it may have crashed or been closed). " +
+                    "Call launch_app to (re)open it, then retry.", data: nil))
+            case .background, .backgroundSuspended:
+                return (nil, JSONRPCError(code: -32004, message:
+                    "Can't read the view tree: app '\(bid)' is in the background, so it has no snapshottable window. " +
+                    "Bring it to the front first — run one interaction (tap/swipe re-focuses the bound app) or call " +
+                    "launch_app/activate_app, then retry page_source.", data: nil))
+            default:
+                break  // foreground or unknown → proceed (unknown may still work)
+            }
+        }
+
         // Custom snapshot traversal so we can bound depth / count and filter —
         // debugDescription enumerates & serializes the WHOLE tree (68KB+ on rich
         // pages), which is what makes the first call block for tens of seconds.
