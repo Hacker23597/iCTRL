@@ -46,6 +46,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     }
 
     override func setUpWithError() throws {
+        // Signal the bootstrap watchdog that XCTest actually reached the test —
+        // so it never re-kicks runTestsInBackground: (which would re-enter XCTest
+        // and crash). Only a bootstrap that never reaches setUp gets recovered.
+        EarlyURLHook.markSetUpEntered()
         Self.logBuffer.append("🧩 setUpWithError begin")
         Self.observeAppLifecycle()
         _ = NetworkTypeMonitor.shared  // start network-type monitoring early

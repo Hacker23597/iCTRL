@@ -25,6 +25,18 @@ static NSLock *sEarlyLock;
 // XCTest bootstrap so the test method never runs and the server never comes up.
 static BOOL sTestStarted = NO;
 
+// Set to YES by Swift (via +[EarlyURLHook markSetUpEntered]) the moment
+// setUpWithError runs. This distinguishes the two failure modes:
+//   - setUp NEVER entered  → XCTest bootstrap never ran (passcode interrupted
+//     runTestsInBackground:). Safe to re-kick — nothing is running to re-enter.
+//   - setUp entered but test not "started" → the test IS running, just slow to
+//     mark itself. Re-kicking here re-enters XCTest → the symbolication abort
+//     crash. So we must NOT re-kick in this case.
+static BOOL sSetUpEntered = NO;
+
+// Ensures the watchdog re-kicks at most once, ever.
+static BOOL sReKicked = NO;
+
 @interface EarlyURLHook : NSObject
 + (NSArray<NSURL *> *)drainURLs;
 + (NSArray<NSString *> *)drainLogs;
@@ -32,6 +44,7 @@ static BOOL sTestStarted = NO;
 + (void)tryInstall;
 + (void)hookClass:(Class)cls;
 + (void)markTestStarted;
++ (void)markSetUpEntered;
 + (void)scheduleBootstrapWatchdogForDelegate:(id)delegate;
 @end
 
@@ -237,32 +250,43 @@ static BOOL sInstalled = NO;
     earlyLog(@"✅ testStartServer began — bootstrap OK");
 }
 
-// Bootstrap watchdog — DIAGNOSTIC ONLY. It does NOT re-invoke
-// runTestsInBackground: anymore.
++ (void)markSetUpEntered {
+    sSetUpEntered = YES;
+}
+
+// Bootstrap watchdog — recovers from the first-launch passcode prompt
+// interrupting XCTest bootstrap (so runTestsInBackground: never ran and the test
+// method never executes → silent, no setUp, no crash), WITHOUT reintroducing the
+// symbolication re-entrancy crash.
 //
-// History: this used to re-kick runTestsInBackground: if the test hadn't begun a
-// few seconds after launch, to recover from the first-launch passcode prompt
-// interrupting the bootstrap. But re-invoking runTestsInBackground: RE-ENTERS
-// XCTest in the same process, which crashes with
-//   "Attempted to register a shared symbolication service instance when one was
-//    already set" (NSInternalInconsistencyException)
-// — observed on a fresh install: the re-kick fought a bootstrap that was already
-// underway (slowed only by first-launch notification/network permission prompts),
-// so the app crash-looped several times before one launch happened to win the
-// race. The real cause of the original "server ready then dies" was setUp calling
-// app.activate() behind the lock screen, which is now removed. So the re-kick is
-// no longer needed and was doing net harm.
-//
-// We keep the watchdog purely to LOG if the test is slow to start, so a genuine
-// bootstrap stall is still visible without risking the re-entrancy crash.
+// The crash happened when we re-kicked while the test was ALREADY running (just
+// slow to mark itself started) — re-entering XCTest aborts with "shared
+// symbolication service ... already set". The fix is to only re-kick when the
+// test truly never began: setUp has NOT entered AND the test has NOT started. In
+// the passcode-interrupted case neither ever fires (bootstrap never reached the
+// test), so a single re-kick is safe; in the "running but slow" case sSetUpEntered
+// is YES, so we DON'T re-kick and can't crash. Re-kick at most once, after a long
+// delay (well past a normal cold start), guarded by @try.
 + (void)scheduleBootstrapWatchdogForDelegate:(id)delegate {
     if (!delegate) { return; }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+    SEL kick = NSSelectorFromString(@"runTestsInBackground:");
+    if (![delegate respondsToSelector:kick]) { return; }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (sTestStarted) { return; }
-        earlyLog(@"⚠️ bootstrap watchdog: test still not started 10s after launch "
-                 @"(NOT re-kicking — re-entering XCTest crashes). If the server never "
-                 @"comes up, relaunch the runner.");
+        // Already made progress → nothing to recover, never re-kick.
+        if (sTestStarted || sSetUpEntered) { return; }
+        // Only re-kick once, ever.
+        if (sReKicked) { return; }
+        sReKicked = YES;
+        earlyLog(@"🔁 bootstrap watchdog: no setUp/test 8s after launch — passcode "
+                 @"likely interrupted bootstrap; re-kicking runTestsInBackground: once");
+        @try {
+            void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
+            imp(delegate, kick, nil);
+        } @catch (NSException *e) {
+            earlyLog([NSString stringWithFormat:@"🔁 watchdog re-kick threw: %@", e.reason]);
+        }
     });
 }
 

@@ -11,6 +11,7 @@
 + (NSArray<NSURL *> *)drainURLs;
 + (NSArray<NSString *> *)drainLogs;
 + (void)markTestStarted;
++ (void)markSetUpEntered;
 @end
 
 NS_ASSUME_NONNULL_BEGIN
