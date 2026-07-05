@@ -48,6 +48,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     override func setUpWithError() throws {
         Self.logBuffer.append("🧩 setUpWithError begin")
         Self.observeAppLifecycle()
+        _ = NetworkTypeMonitor.shared  // start network-type monitoring early
         // Make the test "failure-proof" — like WebDriverAgent's FBFailureProofTestCase.
         // A hung/slow XCUITest call (tap/snapshot on an animating page) makes XCTest
         // record a failure and tear the test down, which kills the server. We keep
@@ -200,10 +201,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             try server?.start()
             if remoteAccessEnabled {
                 let address = getDeviceAddress()
-                Self.logBuffer.append("🌐 Server started on \(address):8200 (remote access) — verifying reachability")
-                // Confirm the LAN address is actually reachable (1s) before saying
-                // "ready"; if it isn't (Local Network permission), notify failure.
-                verifyRemoteReachableThenNotify(address: address)
+                announceRemoteReady(address: address)
             } else {
                 Self.logBuffer.append("🔒 Server started on 127.0.0.1:8200 (local only)")
                 sendNotification(
@@ -923,13 +921,36 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
         do {
             try newServer.start()
-            let address = getDeviceAddress()
-            Self.logBuffer.append("🌐 Remote access enabled on \(address):8200 — verifying reachability")
-            // Verify the LAN address is reachable (1s) before confirming; on
-            // failure the user gets "Remote Access Failed" + recovery.
-            verifyRemoteReachableThenNotify(address: address)
+            announceRemoteReady(address: getDeviceAddress())
         } catch {
             Self.logBuffer.append("🔴 Failed to enable remote access: \(error)")
+        }
+    }
+
+    /// Decide how to announce remote access based on the network type:
+    /// - Wi-Fi / wired → the address is LAN-reachable, so self-check it (which also
+    ///   raises the Local Network permission prompt if needed) and post
+    ///   success/failure accordingly.
+    /// - Cellular → the address is a public/CGNAT one that ISN'T reachable from
+    ///   outside and has no Local Network concept; a self-check would always
+    ///   "fail". So skip the check entirely, don't touch the LAN / trigger any
+    ///   permission, and just tell the user it's on-device only. No error.
+    private func announceRemoteReady(address: String) {
+        let net = NetworkTypeMonitor.shared.current
+        if NetworkTypeMonitor.shared.isLANReachable {
+            Self.logBuffer.append("🌐 Server started on \(address):8200 (remote, \(net.rawValue)) — verifying reachability")
+            verifyRemoteReachableThenNotify(address: address)
+        } else {
+            // Cellular / undetermined: no LAN, so no self-check and no failure.
+            Self.logBuffer.append("📶 Server started on \(address):8200 (\(net.rawValue) — on-device only, skipping remote self-check)")
+            // Clear any stale failure notice from a previous Wi-Fi session.
+            reportedRemoteFailure = false
+            clearRemoteFailedNotification()
+            sendNotification(
+                title: "🟢 iCTRL Server Ready",
+                body: "Listening on \(address):8200 (\(net == .cellular ? "mobile data" : "no Wi-Fi") — reachable on-device only; connect over Wi-Fi for LAN access).\nLong press to Disable Remote or Stop Server",
+                category: Self.serverRemoteCategoryID
+            )
         }
     }
 
@@ -1022,6 +1043,13 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // No usable LAN address (e.g. Wi-Fi down) — can't verify or reach remotely.
         guard address != "127.0.0.1", !address.isEmpty else {
             Self.logBuffer.append("🌐 no LAN address available — skipping remote reachability check")
+            return
+        }
+        // Authoritative gate: only self-check on a LAN (Wi-Fi/wired). On cellular
+        // the address is public/CGNAT and unreachable from outside — a check would
+        // always "fail", so skip it and never post a failure there.
+        guard NetworkTypeMonitor.shared.isLANReachable else {
+            Self.logBuffer.append("📶 not on LAN (\(NetworkTypeMonitor.shared.current.rawValue)) — skipping remote reachability check")
             return
         }
         verifyInFlight = true
