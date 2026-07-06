@@ -73,19 +73,19 @@ When a call returns success, it worked. Don't repeat it "to be safe."
 ## Searching & typing (the #1 place automation breaks)
 
 1. `launch_app`, wait 2–3s once (cold render).
-2. Find the search ENTRY. On most home screens the "search bar" is a **Button/StaticText that opens a search page**, not the input itself (`is_text_input:false`). `find_element{element_id:"搜索"}` → `tap{ref}` — no wait after.
+2. Find the search ENTRY (by its visible label, whatever the app's language). It is often a **Button/StaticText that opens a separate search page** rather than a real input — check `is_text_input`: false means it's an entry, not the field itself. `find_element{element_id:"<label>"}` → `tap{ref}` — no wait after.
 3. Locate the REAL input: `find_element{element_type:"textfield"}`, confirm `is_text_input:true`, `tap{ref}` to focus (keyboard comes up with the tap).
 4. `type{text:"…", submit:true}` — `submit` appends Return/Search so the field's action fires.
 5. Read results with `page_source` directly.
 - **TRUST the result — do NOT re-type the same text.** If `type` returns success (no error/warning), the text WENT IN. Only re-type when `type` itself returns a "no keyboard/focus" **warning**. A common false-failure trap: after `type{submit}` you read `page_source` and see the OLD content (the search page/results haven't updated yet, or you read a stale home-screen search bar) — that is NOT proof the type failed. Wait ~1s and re-read, or check the results, before ever re-typing. Re-typing the same query is almost always wrong and just doubles the work.
 - Replace existing text: `type{clear:true, text:"…"}` (empties first) or `clear_text`; tap to focus before clearing.
-- If after `type{submit:true}` the search didn't run, the field may need its explicit **Search button** tapped instead — `find_element` the "搜索"/Search button and `tap{ref}` it, rather than re-typing.
+- If after `type{submit:true}` the action didn't fire, the field may need its explicit submit/search control tapped instead — `find_element` that control (by its visible label) and `tap{ref}` it, rather than re-typing.
 
 ## Reading long content
 
 - **`page{direction:"down", pages:N}`** — precise one-screen steps, no momentum. This is how you read a feed/detail page predictably.
 - **Do NOT use `swipe` to read feeds** — its default ~100pt travel barely moves the page; you'll under-scroll. Reserve `swipe` for carousels / partial drags / pull-to-refresh.
-- **Harvest repeated data cheaply**: `page_source{filter:{text:"¥"}}` returns only the price-bearing nodes + ancestors — far easier than parsing the whole tree.
+- **Harvest repeated data cheaply**: when you want many similar values off a page, `page_source{filter:{text:"<substring common to them>"}}` returns only the matching nodes + ancestors — far smaller and easier to parse than the whole tree.
 
 ## App binding (sticky target)
 

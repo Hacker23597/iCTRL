@@ -36,10 +36,10 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "page_source",
-            description: "Inspect the current UI: returns the accessibility/view hierarchy as text (element types, labels, identifiers, frames in POINTS). Use it to UNDERSTAND layout — NOT as your locate-and-tap loop. To act on a control you already know by label, do NOT read its frame and tap x,y; call find_element{element_id:<label>} → tap{ref} (a ref survives scroll/animation, needs no coordinate math, and no re-read to re-derive coords). Reserve coordinate taps for elements with no usable label. On rich pages the full tree is large and the first call after a launch can be slow while the UI settles — scope it: filter returns only matching nodes+ancestors (also great for HARVESTING repeated data, e.g. filter:{text:'¥'} for all prices), max_elements caps the count. 500-node hard cap by default (truncated:true when hit). Use screenshot only when an element is missing here or you need visual detail.",
+            description: "Inspect the current UI: returns the accessibility/view hierarchy as text (element types, labels, identifiers, frames in POINTS). Use it to UNDERSTAND layout — NOT as your locate-and-tap loop. To act on a control you already know by label, do NOT read its frame and tap x,y; call find_element{element_id:<label>} → tap{ref} (a ref survives scroll/animation, needs no coordinate math, and no re-read to re-derive coords). Reserve coordinate taps for elements with no usable label. On rich pages the full tree is large and the first call after a launch can be slow while the UI settles — scope it: filter returns only matching nodes+ancestors (also great for HARVESTING repeated data — filter by a substring common to the values you want), max_elements caps the count. 500-node hard cap by default (truncated:true when hit). Use screenshot only when an element is missing here or you need visual detail.",
             params: [
                 RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Inspect this app's tree; omit for the detected foreground app"),
-                RPCParamDef(name: "filter", type: "object", required: false, description: "Return only matching nodes + their ancestors. {label:'待收货'} (label/value substring, case-insensitive), {type:'button'} (element type), or {text:'…'} (label+value+id substring). Also the cheapest way to HARVEST repeated data — filter:{text:'¥'} returns just the price nodes, far easier than parsing the whole tree."),
+                RPCParamDef(name: "filter", type: "object", required: false, description: "Return only matching nodes + their ancestors. {label:'<substring>'} (label/value substring, case-insensitive), {type:'button'} (element type), or {text:'<substring>'} (label+value+id substring). Also the cheapest way to HARVEST repeated data — filter by a substring common to the values you want, far easier than parsing the whole tree."),
                 RPCParamDef(name: "max_depth", type: "number", required: false, description: "Max tree depth. WARNING: labels/tappable controls live near the LEAVES, so a shallow depth (3-4) returns structure with NO useful labels and you'll have to re-fetch — a wasted call. Use max_depth ONLY to preview overall layout; to FIND an element use filter or find_element instead."),
                 RPCParamDef(name: "max_elements", type: "number", required: false, description: "Max nodes to return (default 500, hard cap 2000). If hit, response is truncated:true"),
             ],
@@ -333,7 +333,7 @@ struct RPCMethodRegistry {
                     "Searching inside an app is the #1 place automation goes wrong. Follow this sequence:",
                     "DON'T BLIND-WAIT between steps. tap/type/swipe/page already block on UI quiescence before returning, so after them you can page_source/find_element DIRECTLY — no wait call. The ONLY routine wait is after a COLD launch_app (2-3s, the app is still rendering). If a read comes back mid-transition (splash/placeholder/empty), THEN wait ~1s and re-read — reactively, not by default. Blind 2-3s sleeps after every tap just add latency.",
                     "1. launch_app, then wait 2-3s ONCE (cold render). If you opened via open_url to a specific screen, often no wait is needed.",
-                    "2. Find the search ENTRY. On most home screens the 'search bar' is a Button/StaticText, NOT a text field — find_element{element_id:'搜索'} (or the visible label). is_text_input:false means it opens a search PAGE, it's not the input itself.",
+                    "2. Find the search ENTRY by its visible label (whatever the app's language). It's often a Button/StaticText that opens a search PAGE, not a real input — is_text_input:false confirms it's an entry, not the field. find_element{element_id:'<label>'} → tap{ref}.",
                     "3. tap{ref} that entry (use the ref from step 2, not coordinates). No wait — tap already settled; go straight to step 4.",
                     "4. Locate the REAL input: find_element{element_type:\"textfield\"} (or searchField), confirm is_text_input:true, then tap{ref} to focus. (The keyboard comes up as part of that tap.)",
                     "5. type{text:\"…\", submit:true}. If type returns a 'no keyboard/focus' warning, re-focus the textfield (step 4) and retry — don't assume it went in.",
@@ -346,12 +346,12 @@ struct RPCMethodRegistry {
                     "in the launch_app response). INTERACTION methods (tap, double_tap, long_press, tap_element, " +
                     "swipe, scroll, scroll_to_element, drag, page) re-focus the bound app automatically if the " +
                     "foreground drifted — the response then carries an 'app_note' saying it was re-focused — so " +
-                    "'open Taobao' then 'tap …' always acts on Taobao even if another app came to the front. " +
+                    "launch an app then 'tap …' always acts on THAT app even if another app came to the front. " +
                     "READ-ONLY methods (page_source, screenshot, find_element) do NOT re-activate the bound app: " +
                     "they read whatever is CURRENTLY in the foreground, because force-activating just to read can " +
                     "stall on launch/transition animations. If the bound app was pushed to the background and you " +
-                    "want to read IT specifically, either run one interaction first (which re-focuses it) or pass an " +
-                    "explicit bundle_id to the read call (e.g. page_source{bundle_id:'com.taobao.taobao4iphone'}). " +
+                    "want to read IT specifically, either run one interaction first (which re-focuses it) or pass the " +
+                    "app's explicit bundle_id to the read call (e.g. page_source{bundle_id:'<the bound app>'}). " +
                     "For interaction methods, two situations abort with a clear error instead of doing the wrong thing: " +
                     "(1) the bound app has CRASHED/EXITED (state notRunning) → error tells you to launch_app again; " +
                     "(2) a SYSTEM ALERT/permission dialog is covering the app → error tells you to read it via " +
@@ -484,7 +484,7 @@ struct RPCMethodRegistry {
         </p>
         <p style="margin-top:8px;color:#6e6e73;font-size:14px">
         Rich pages can be big and the first call after a launch can be slow. <strong>Scope it:</strong>
-        <code>page_source({"filter":{"label":"待收货"}})</code> returns only matching nodes + ancestors;
+        <code>page_source({"filter":{"label":"&lt;substring&gt;"}})</code> returns only matching nodes + ancestors;
         <code>{"max_depth":3}</code> gives just the top structure; <code>{"max_elements":200}</code> caps the count.
         A 500-node hard cap applies by default (<code>truncated:true</code> when hit).
         </p>
