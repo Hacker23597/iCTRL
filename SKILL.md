@@ -23,7 +23,7 @@ Full machine-readable method list + parameters + guidance: **`GET /schema`** (JS
 
 ## The golden rules (this is where speed comes from)
 
-Most automation is slow because of two anti-patterns. Avoid them:
+Most automation is slow because of three anti-patterns. Avoid them:
 
 ### 1. Don't blind-wait
 `tap`, `type`, `swipe`, `page`, `scroll` **already block on UI quiescence before they return**. After an interaction you can read/act **immediately** — no `wait` call. `page_source` reads whatever is currently settled.
@@ -37,6 +37,12 @@ Don't read `page_source`, find an element's frame, and tap its center. Instead:
 - A `ref` re-resolves the live element: it survives scroll/animation, needs no coordinate math, and no re-read to re-derive coordinates.
 - Reserve raw coordinate taps for elements with **no usable label** (icons, canvas, games).
 - `page_source` is for **understanding layout**, not for your locate-and-tap loop.
+
+### 3. Trust the result — don't re-do an action that already succeeded
+When a call returns success, it worked. Don't repeat it "to be safe."
+- After `type{submit}`, if it returned no error/warning, the text is in — do NOT re-type the same query. Reading `page_source` and seeing OLD content usually means the page hasn't updated yet (wait ~1s, re-read), NOT that the action failed.
+- Before retrying anything after a client timeout, check `/logs` for `⏱ ✓ <method>` — if it's there, it already ran; retrying doubles it (a tap fires twice, a query searches twice).
+- The cost of a needless retry is high: a wasted type (~2s) plus the taps and reads around it.
 
 ## Core workflow
 
@@ -69,9 +75,11 @@ Don't read `page_source`, find an element's frame, and tap its center. Instead:
 1. `launch_app`, wait 2–3s once (cold render).
 2. Find the search ENTRY. On most home screens the "search bar" is a **Button/StaticText that opens a search page**, not the input itself (`is_text_input:false`). `find_element{element_id:"搜索"}` → `tap{ref}` — no wait after.
 3. Locate the REAL input: `find_element{element_type:"textfield"}`, confirm `is_text_input:true`, `tap{ref}` to focus (keyboard comes up with the tap).
-4. `type{text:"…", submit:true}` — `submit` appends Return/Search so the field's action fires. If `type` returns a "no keyboard/focus" **warning**, re-focus the field and retry — don't assume it landed.
+4. `type{text:"…", submit:true}` — `submit` appends Return/Search so the field's action fires.
 5. Read results with `page_source` directly.
+- **TRUST the result — do NOT re-type the same text.** If `type` returns success (no error/warning), the text WENT IN. Only re-type when `type` itself returns a "no keyboard/focus" **warning**. A common false-failure trap: after `type{submit}` you read `page_source` and see the OLD content (the search page/results haven't updated yet, or you read a stale home-screen search bar) — that is NOT proof the type failed. Wait ~1s and re-read, or check the results, before ever re-typing. Re-typing the same query is almost always wrong and just doubles the work.
 - Replace existing text: `type{clear:true, text:"…"}` (empties first) or `clear_text`; tap to focus before clearing.
+- If after `type{submit:true}` the search didn't run, the field may need its explicit **Search button** tapped instead — `find_element` the "搜索"/Search button and `tap{ref}` it, rather than re-typing.
 
 ## Reading long content
 
