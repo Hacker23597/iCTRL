@@ -13,6 +13,12 @@ iCTRL runs on an iPhone and exposes iOS UI automation as a **JSON-RPC 2.0 API ov
 2. **Get a token**: `POST /auth` with `{"client_name":"<you>"}`. **This BLOCKS until the device user taps Allow on-screen** — use a client timeout ≥ 60s and do NOT retry early (each retry pops another prompt). On approval you get a token (valid 30 days, survives restarts); denial returns HTTP 403.
 3. **Call methods**: `POST /rpc` with `{"jsonrpc":"2.0","method":"…","params":{…},"id":1}` and header `Authorization: Bearer <token>`.
 
+**Cache the token so you don't re-prompt the user every run.** On first successful `/auth`, persist it to **`~/.ictrl/token.json`** as:
+```json
+{"host": "<host>:8200", "token": "<token>", "granted_at": "<ISO8601>", "client_name": "<you>"}
+```
+On subsequent runs, **before calling `/auth`**: read `~/.ictrl/token.json`, and if it exists for this host, try it directly (any authenticated call, e.g. `device_info`). Only fall back to `/auth` if that call returns **401** (token expired/revoked) — tokens last 30 days and survive app restarts, so re-auth is rarely needed. This avoids the on-screen Allow prompt on every run. If you cache the resolved `bundle_id`s too (e.g. `~/.ictrl/apps.json`), you can also skip `resolve_app` on repeat tasks.
+
 Full machine-readable method list + parameters + guidance: **`GET /schema`** (JSON). This SKILL is the how; `/schema` is the exact what (method names, params, return shapes). Method set can change — trust `/schema` for the current list.
 
 ## The golden rules (this is where speed comes from)
@@ -83,7 +89,7 @@ After `launch_app`/`activate_app`, that app is the **sticky target**.
 
 - Use generous `/rpc` client timeouts (≥ 30s, ideally 60–120s): `/rpc` drives a real device; a cold launch or heavy page takes seconds.
 - **A client timeout ≠ failure.** The device keeps executing. Before retrying, `GET /logs` and look for `⏱ ✓ <method>` — if present, it already succeeded and retrying would DOUBLE the action (e.g. a tap fires twice).
-- **Cheap recovery** if the service drops: reuse the cached `bundle_id` (don't `resolve_app` again); the token lasts 30 days, so re-`/auth` only if a call actually returns 401; if you know a deep link back (`open_url`), use it instead of re-navigating from the app's home screen.
+- **Cheap recovery** if the service drops: reuse the cached token (`~/.ictrl/token.json`) and `bundle_id` (don't `resolve_app` again); re-`/auth` only if a call actually returns 401; if you know a deep link back (`open_url`), use it instead of re-navigating from the app's home screen.
 
 ## Safety
 
