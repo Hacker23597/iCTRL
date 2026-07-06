@@ -12,8 +12,9 @@ RUNNER_APP    = iCTRLUITests-Runner.app
 XCTEST_BUNDLE = iCTRLUITests.xctest
 RUNNER_IPA    = iCTRLUITests-Runner.ipa
 
-# Auto-detect signing identity
-SIGN_IDENTITY := $(shell security find-identity -v -p codesigning 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
+# Signing identity is read from the freshly-built app (below, in `ipa`) so the
+# re-sign uses EXACTLY what xcodebuild chose from the Xcode project's automatic
+# signing — never a guessed keychain identity. Do NOT hardcode it here.
 
 # ──────────────────────────────────────────────
 # Build both targets with Xcode signing
@@ -78,11 +79,20 @@ ipa: build
 	/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLName string com.openminis.ictrl" "$$PLIST"; \
 	/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "$$PLIST"; \
 	/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string ictrl" "$$PLIST"
-	@echo "🔏 Re-signing Runner..."
-	codesign --force --sign "$(SIGN_IDENTITY)" \
-		"$(BUILD_DIR)/$(RUNNER_APP)/PlugIns/$(XCTEST_BUNDLE)"
-	codesign --force --sign "$(SIGN_IDENTITY)" --preserve-metadata=entitlements \
-		"$(BUILD_DIR)/$(RUNNER_APP)"
+	@echo "🔏 Re-signing Runner (identity read back from what xcodebuild signed)..."
+	@# Read the signing identity xcodebuild actually used, straight off the built
+	@# app — this reflects the Xcode project's automatic signing (team + cert),
+	@# so the re-sign can never drift from the build. Match by the cert's SHA-1 in
+	@# the keychain to pin the exact identity.
+	@set -e; \
+	APP="$(BUILD_DIR)/$(RUNNER_APP)"; \
+	AUTH="$$(codesign -dvv "$$APP" 2>&1 | sed -n 's/^Authority=//p' | head -1)"; \
+	if [ -z "$$AUTH" ]; then echo "🔴 could not read signing identity from $$APP"; exit 1; fi; \
+	SHA="$$(security find-identity -v -p codesigning 2>/dev/null | grep -F "$$AUTH" | head -1 | awk '{print $$2}')"; \
+	IDENT="$${SHA:-$$AUTH}"; \
+	echo "   using: $$AUTH ($$IDENT)"; \
+	codesign --force --sign "$$IDENT" "$$APP/PlugIns/$(XCTEST_BUNDLE)"; \
+	codesign --force --sign "$$IDENT" --preserve-metadata=entitlements "$$APP"
 	@echo "📦 Packaging $(RUNNER_IPA)..."
 	rm -rf "$(BUILD_DIR)/Payload"
 	mkdir -p "$(BUILD_DIR)/Payload"
