@@ -193,6 +193,9 @@ class JSONRPCServer {
         case ("GET", "/skill"), ("GET", "/skill.md"), ("GET", "/SKILL.md"):
             handleSkill(connection: connection)
 
+        case ("GET", "/docs"):
+            handleDocsPage(connection: connection)
+
         case ("GET", "/logs/files"):
             handleLogFiles(connection: connection)
 
@@ -218,6 +221,11 @@ class JSONRPCServer {
 
     // MARK: - Handlers
 
+    /// GET / — content-negotiated:
+    ///   Accept: application/json  → the JSON schema (machine-readable methods)
+    ///   Accept: text/html         → the visual HTML docs page (for browsers)
+    ///   default (agents/curl)     → the SKILL.md operating manual (Markdown)
+    /// The HTML page is also always at /docs.
     private func handleDocPage(connection: NWConnection, headers: [String: String]) {
         let accept = headers["accept"] ?? ""
         if accept.contains("application/json") {
@@ -228,10 +236,18 @@ class JSONRPCServer {
             } else {
                 sendHTTPResponse(connection: connection, status: 500, body: "Failed to generate schema")
             }
+        } else if accept.contains("text/html") {
+            // A real browser asked — give it the visual page.
+            handleDocsPage(connection: connection)
         } else {
-            let html = RPCMethodRegistry.generateHTMLDoc()
-            sendHTTPResponse(connection: connection, status: 200, contentType: "text/html; charset=utf-8", body: html)
+            // Default (agents, curl): the Skill manual — read once, drive the phone.
+            handleSkill(connection: connection)
         }
+    }
+
+    private func handleDocsPage(connection: NWConnection) {
+        let html = RPCMethodRegistry.generateHTMLDoc()
+        sendHTTPResponse(connection: connection, status: 200, contentType: "text/html; charset=utf-8", body: html)
     }
 
     private func handleSchema(connection: NWConnection) {
