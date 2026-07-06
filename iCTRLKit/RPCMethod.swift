@@ -36,11 +36,11 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "page_source",
-            description: "PREFERRED way to inspect the current UI: returns the accessibility/view hierarchy as text (element types, labels, identifiers, and frames in POINTS). Parse this to locate elements and tap their frame center. On rich pages the full tree can be large and the FIRST call (right after an app launches) can be slow while the UI settles — scope it: pass filter to return only matching nodes (plus their ancestors), max_depth for just the top structure, or max_elements to cap the count. A hard cap of 500 nodes applies by default; if truncated, narrow with filter/max_depth. Use screenshot only when an element is missing here or you need visual detail.",
+            description: "Inspect the current UI: returns the accessibility/view hierarchy as text (element types, labels, identifiers, frames in POINTS). Use it to UNDERSTAND layout — NOT as your locate-and-tap loop. To act on a control you already know by label, do NOT read its frame and tap x,y; call find_element{element_id:<label>} → tap{ref} (a ref survives scroll/animation, needs no coordinate math, and no re-read to re-derive coords). Reserve coordinate taps for elements with no usable label. On rich pages the full tree is large and the first call after a launch can be slow while the UI settles — scope it: filter returns only matching nodes+ancestors (also great for HARVESTING repeated data, e.g. filter:{text:'¥'} for all prices), max_elements caps the count. 500-node hard cap by default (truncated:true when hit). Use screenshot only when an element is missing here or you need visual detail.",
             params: [
                 RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Inspect this app's tree; omit for the detected foreground app"),
-                RPCParamDef(name: "filter", type: "object", required: false, description: "Return only matching nodes + their ancestors. {label:'待收货'} (label/value substring, case-insensitive), {type:'button'} (element type), or {text:'…'} (label+value+id substring). e.g. filter:{label:\"待收货\"}"),
-                RPCParamDef(name: "max_depth", type: "number", required: false, description: "Max tree depth to traverse (e.g. 3-4 for top-level structure only)"),
+                RPCParamDef(name: "filter", type: "object", required: false, description: "Return only matching nodes + their ancestors. {label:'待收货'} (label/value substring, case-insensitive), {type:'button'} (element type), or {text:'…'} (label+value+id substring). Also the cheapest way to HARVEST repeated data — filter:{text:'¥'} returns just the price nodes, far easier than parsing the whole tree."),
+                RPCParamDef(name: "max_depth", type: "number", required: false, description: "Max tree depth. WARNING: labels/tappable controls live near the LEAVES, so a shallow depth (3-4) returns structure with NO useful labels and you'll have to re-fetch — a wasted call. Use max_depth ONLY to preview overall layout; to FIND an element use filter or find_element instead."),
                 RPCParamDef(name: "max_elements", type: "number", required: false, description: "Max nodes to return (default 500, hard cap 2000). If hit, response is truncated:true"),
             ],
             returns: "{source: text tree, truncated, total_returned, filtered?, coordinate_space:'points', hint}. Includes visible overlay windows (fixed bottom/floating bars) automatically."
@@ -88,7 +88,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "swipe",
-            description: "Low-level swipe/scroll gesture. x,y are OPTIONAL — default start is the screen center. 'distance' is finger travel in points (default 100). 'velocity': 'fast'/'flick' adds iOS momentum (scrolls FAR beyond finger travel — easy to overshoot/skip content), 'normal' (default), 'slow'/'precise' = exact drag, no momentum. NOTE: to READ through a long page use 'page' (precise Page Down/Up, won't overshoot); to reach a known element use 'scroll_to_element'. Reserve swipe for custom gestures (partial drags, horizontal carousels, etc.).",
+            description: "Low-level swipe gesture. Do NOT use swipe to read through results/feeds — its default 100pt travel barely moves the page so you under-scroll and waste calls; use 'page' (one full screen, precise Page Down/Up, no overshoot) for reading, and 'scroll_to_element' to reach a known element. Reserve swipe for custom gestures (partial drags, horizontal carousels, pull-to-refresh). x,y OPTIONAL (default screen center). 'distance' = finger travel in points (default 100). 'velocity': 'fast'/'flick' adds iOS momentum (scrolls far, easy to overshoot), 'normal' (default), 'slow'/'precise' = exact drag.",
             params: [
                 RPCParamDef(name: "x", type: "number", required: false, description: "Start X (default: screen center)"),
                 RPCParamDef(name: "y", type: "number", required: false, description: "Start Y (default: screen center)"),
@@ -260,7 +260,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "wait",
-            description: "Wait for a specified duration",
+            description: "Pause for a fixed duration. Use SPARINGLY — most waits are wasted latency. tap/type/swipe/page/scroll already block on UI quiescence before they return, and page_source reads whatever is currently settled, so after an interaction you can read/act DIRECTLY without waiting. Legit uses: (a) 2-3s once after a COLD launch_app while the app renders; (b) a known async delay (search results loading over the network, a video). If a page_source comes back mid-transition (splash/placeholder/empty), wait ~1s and re-read REACTIVELY — don't pre-emptively sleep after every step.",
             params: [
                 RPCParamDef(name: "duration", type: "number", required: false, description: "Duration in seconds (default: 1.0)"),
             ],
@@ -326,17 +326,20 @@ struct RPCMethodRegistry {
                     "GET /schema for a few seconds. " +
                     "(3) If /rpc starts failing AND /logs is also unreachable, the service died — re-wake via ictrl:// and " +
                     "poll /schema until it returns 200, then re-/auth for a fresh token. " +
-                    "(4) Space out ictrl:// re-wakes by a couple seconds; rapid repeats may be throttled.",
+                    "(4) Space out ictrl:// re-wakes by a couple seconds; rapid repeats may be throttled. " +
+                    "(5) CHEAP RECOVERY: don't restart the task from scratch. The resolved bundle_id is stable — REUSE it, do NOT call resolve_app again. The token lasts 30 days and persists across restarts, so re-/auth only if a call actually returns 401. After recovering, jump back with open_url{app deep link} (e.g. straight to the search page) instead of launch_app→wait→tap-search→type from the home screen.",
                 "searching_and_typing": [
                     "Searching inside an app is the #1 place automation goes wrong. Follow this sequence:",
-                    "1. After launch_app, WAIT 2-3s (call wait) then page_source — a cold-started app is still rendering; acting early matches splash/placeholder elements and element queries can take 6s+.",
-                    "2. Find the search ENTRY. On most app home screens the 'search bar' is a Button/StaticText, NOT a text field — check element_type in the find_element result (is_text_input:false means it's not a real input).",
-                    "3. Tap that entry to open the search page. WAIT ~1-2s for the page to load AND the keyboard to appear.",
-                    "4. Locate the REAL input with find_element{element_type:\"textfield\"} (or searchField). Confirm is_text_input:true.",
-                    "5. Tap that textfield's ref to focus it. Verify the keyboard is up (screenshot or page_source shows a Keyboard).",
-                    "6. Only now type{text:\"…\", submit:true}. If type returns a 'no keyboard/focus' error, go back to step 4-5 — do NOT assume the text went in.",
-                    "Key trap: type() into an unfocused field silently loses the text and submit:true then searches an empty/garbage query. type() returns a 'warning' when it can't confirm a focused keyboard — heed it: verify the text landed (screenshot/page_source) and, if not, re-focus a real textfield before typing again.",
-                    "To REPLACE the contents of a field that already has text, don't type on top of it — use type{clear:true, text:\"…\"} (empties it first), or clear_text to just empty it. Tap the field to focus it before clearing.",
+                    "DON'T BLIND-WAIT between steps. tap/type/swipe/page already block on UI quiescence before returning, so after them you can page_source/find_element DIRECTLY — no wait call. The ONLY routine wait is after a COLD launch_app (2-3s, the app is still rendering). If a read comes back mid-transition (splash/placeholder/empty), THEN wait ~1s and re-read — reactively, not by default. Blind 2-3s sleeps after every tap just add latency.",
+                    "1. launch_app, then wait 2-3s ONCE (cold render). If you opened via open_url to a specific screen, often no wait is needed.",
+                    "2. Find the search ENTRY. On most home screens the 'search bar' is a Button/StaticText, NOT a text field — find_element{element_id:'搜索'} (or the visible label). is_text_input:false means it opens a search PAGE, it's not the input itself.",
+                    "3. tap{ref} that entry (use the ref from step 2, not coordinates). No wait — tap already settled; go straight to step 4.",
+                    "4. Locate the REAL input: find_element{element_type:\"textfield\"} (or searchField), confirm is_text_input:true, then tap{ref} to focus. (The keyboard comes up as part of that tap.)",
+                    "5. type{text:\"…\", submit:true}. If type returns a 'no keyboard/focus' warning, re-focus the textfield (step 4) and retry — don't assume it went in.",
+                    "6. Read results with page_source directly (no wait) — only if it's still loading do you wait ~1s and re-read.",
+                    "Key trap: type() into an unfocused field silently loses the text and submit:true then searches an empty/garbage query. type() returns a 'warning' when it can't confirm a focused keyboard — heed it and re-focus if needed.",
+                    "To REPLACE existing text, use type{clear:true, text:\"…\"} (empties first) or clear_text; tap the field to focus before clearing.",
+                    "FASTEST PATH: if the app has a search URL scheme (see open_url), open_url{that} replaces steps 2-5 entirely — one call instead of tap-search + focus + type.",
                 ],
                 "app_binding":
                     "After you open an app with launch_app/activate_app it becomes the STICKY TARGET (see 'bound_app' " +
@@ -363,6 +366,9 @@ struct RPCMethodRegistry {
                     "list_apps returns the bundle IDs actually INSTALLED on this device — use it to confirm an app is present.",
                     "open_url{url:'taobao://…'} opens a deep link / app URL scheme (often faster than launch_app and can jump " +
                     "straight to a feature). Use it when you know the scheme; use launch_app when you just want the app's home.",
+                    "SEARCH DEEP LINK (big speedup): many apps expose a search scheme that lands directly on results, " +
+                    "skipping home→tap-search-bar→focus→type. E.g. Taobao: open_url{url:'taobao://s.taobao.com/search?q=<url-encoded>'}. " +
+                    "One open_url replaces ~4 calls (tap + wait + focus + type). Prefer this whenever the app supports it.",
                 ],
                 "scrolling_and_paging":
                     "Two ways to move a scroll view: swipe/scroll (a gesture — fast, has momentum, can overshoot) and " +
@@ -381,6 +387,7 @@ struct RPCMethodRegistry {
                     "request a smaller screenshot with scale (e.g. 1 or 0.5).",
                 "locating_elements_decision_tree": [
                     "Pick the locate method by situation — each returns a stable 'ref' you then act on:",
+                    "0. You already know the label of an on-screen control (search bar, a named button) → skip page_source, go STRAIGHT to find_element{element_id:<label>} → tap{ref}. Don't read the tree just to compute coordinates.",
                     "1. Element has a clear text/label AND is on screen → find_element{element_id:<label>} → tap{ref}. Fastest, precise.",
                     "2. Element is off-screen (need to scroll to it) → scroll_to_element{element_id:<label>} — it scrolls then returns the ref in one call. Don't hand-roll swipe loops.",
                     "3. App exposes accessibility identifiers (look for 'identifier:' in page_source, e.g. big apps use them for their own UI tests) → use that id as element_id — the most stable key.",
