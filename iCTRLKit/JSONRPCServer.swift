@@ -190,6 +190,9 @@ class JSONRPCServer {
         case ("GET", "/schema"):
             handleSchema(connection: connection)
 
+        case ("GET", "/skill"), ("GET", "/skill.md"), ("GET", "/SKILL.md"):
+            handleSkill(connection: connection)
+
         case ("GET", "/logs/files"):
             handleLogFiles(connection: connection)
 
@@ -239,6 +242,29 @@ class JSONRPCServer {
         } else {
             sendHTTPResponse(connection: connection, status: 500, body: "Failed to generate schema")
         }
+    }
+
+    /// GET /skill — the operating manual in Skill (Markdown + frontmatter) format,
+    /// so an agent can read it once and treat iCTRL as a Skill. Served from the
+    /// bundled SKILL.md resource; falls back to a pointer if the resource is
+    /// missing. The dynamic method list stays at /schema.
+    private func handleSkill(connection: NWConnection) {
+        let md = Self.bundledSkillMarkdown()
+            ?? "# iCTRL\n\nOperating manual resource missing. Fetch GET /schema for the machine-readable method list and guidance.\n"
+        sendHTTPResponse(connection: connection, status: 200,
+                         contentType: "text/markdown; charset=utf-8", body: md)
+    }
+
+    /// Load SKILL.md from whichever bundle carries it (the runner or the kit).
+    static func bundledSkillMarkdown() -> String? {
+        let candidates = [Bundle.main] + Bundle.allBundles
+        for b in candidates {
+            if let url = b.url(forResource: "SKILL", withExtension: "md"),
+               let s = try? String(contentsOf: url, encoding: .utf8) {
+                return s
+            }
+        }
+        return nil
     }
 
     private func handleLogs(connection: NWConnection) {

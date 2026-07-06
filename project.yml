@@ -37,6 +37,9 @@ targets:
     sources:
       - path: iCTRLUITests
       - path: iCTRLKit
+      # The operating manual, bundled so GET /skill can serve it at runtime.
+      - path: SKILL.md
+        buildPhase: resources
     dependencies:
       - target: iCTRL
     settings:

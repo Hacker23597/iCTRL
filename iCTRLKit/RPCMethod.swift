@@ -293,6 +293,7 @@ struct RPCMethodRegistry {
         [
             "protocol": "JSON-RPC 2.0",
             "endpoints": [
+                "skill": "GET /skill — START HERE. The operating manual in Skill (Markdown) format; read it ONCE to learn the fast-path workflow and best practices, then treat iCTRL as a Skill.",
                 "auth": "POST /auth  {client_name} → {token}. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. Returns 403 if denied.",
                 "rpc": "POST /rpc   {jsonrpc, method, params, id}  (Authorization: Bearer <token>)",
                 "logs": "GET /logs   plain-text recent logs (current process, in-memory), no auth, sensitive values redacted",
