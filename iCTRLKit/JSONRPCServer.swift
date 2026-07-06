@@ -255,9 +255,11 @@ class JSONRPCServer {
                          contentType: "text/markdown; charset=utf-8", body: md)
     }
 
-    /// Load SKILL.md from whichever bundle carries it (the runner or the kit).
+    /// Load SKILL.md from whichever bundle carries it. The resource ships inside
+    /// the UITests .xctest bundle (this class's bundle), not runner.app's root, so
+    /// try Bundle(for:) first, then main + all loaded bundles as a fallback.
     static func bundledSkillMarkdown() -> String? {
-        let candidates = [Bundle.main] + Bundle.allBundles
+        let candidates = [Bundle(for: JSONRPCServer.self), Bundle.main] + Bundle.allBundles
         for b in candidates {
             if let url = b.url(forResource: "SKILL", withExtension: "md"),
                let s = try? String(contentsOf: url, encoding: .utf8) {
