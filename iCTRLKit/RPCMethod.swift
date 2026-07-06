@@ -327,7 +327,7 @@ struct RPCMethodRegistry {
                     "(3) If /rpc starts failing AND /logs is also unreachable, the service died — re-wake via ictrl:// and " +
                     "poll /schema until it returns 200, then re-/auth for a fresh token. " +
                     "(4) Space out ictrl:// re-wakes by a couple seconds; rapid repeats may be throttled. " +
-                    "(5) CHEAP RECOVERY: don't restart the task from scratch. The resolved bundle_id is stable — REUSE it, do NOT call resolve_app again. The token lasts 30 days and persists across restarts, so re-/auth only if a call actually returns 401. After recovering, jump back with open_url{app deep link} (e.g. straight to the search page) instead of launch_app→wait→tap-search→type from the home screen.",
+                    "(5) CHEAP RECOVERY: don't restart the task from scratch. The resolved bundle_id is stable — REUSE it, do NOT call resolve_app again. The token lasts 30 days and persists across restarts, so re-/auth only if a call actually returns 401. If you know a deep link back to where you were (open_url), use it instead of re-navigating from the app's home screen.",
                 "searching_and_typing": [
                     "Searching inside an app is the #1 place automation goes wrong. Follow this sequence:",
                     "DON'T BLIND-WAIT between steps. tap/type/swipe/page already block on UI quiescence before returning, so after them you can page_source/find_element DIRECTLY — no wait call. The ONLY routine wait is after a COLD launch_app (2-3s, the app is still rendering). If a read comes back mid-transition (splash/placeholder/empty), THEN wait ~1s and re-read — reactively, not by default. Blind 2-3s sleeps after every tap just add latency.",
@@ -339,7 +339,6 @@ struct RPCMethodRegistry {
                     "6. Read results with page_source directly (no wait) — only if it's still loading do you wait ~1s and re-read.",
                     "Key trap: type() into an unfocused field silently loses the text and submit:true then searches an empty/garbage query. type() returns a 'warning' when it can't confirm a focused keyboard — heed it and re-focus if needed.",
                     "To REPLACE existing text, use type{clear:true, text:\"…\"} (empties first) or clear_text; tap the field to focus before clearing.",
-                    "FASTEST PATH: if the app has a search URL scheme (see open_url), open_url{that} replaces steps 2-5 entirely — one call instead of tap-search + focus + type.",
                 ],
                 "app_binding":
                     "After you open an app with launch_app/activate_app it becomes the STICKY TARGET (see 'bound_app' " +
@@ -364,11 +363,8 @@ struct RPCMethodRegistry {
                     "falling back to the iTunes Search API (source field says which). Returns candidates with bundle_id + name.",
                     "2. launch_app{bundle_id:<resolved>} → opens it and binds it as the sticky target.",
                     "list_apps returns the bundle IDs actually INSTALLED on this device — use it to confirm an app is present.",
-                    "open_url{url:'taobao://…'} opens a deep link / app URL scheme (often faster than launch_app and can jump " +
-                    "straight to a feature). Use it when you know the scheme; use launch_app when you just want the app's home.",
-                    "SEARCH DEEP LINK (big speedup): many apps expose a search scheme that lands directly on results, " +
-                    "skipping home→tap-search-bar→focus→type. E.g. Taobao: open_url{url:'taobao://s.taobao.com/search?q=<url-encoded>'}. " +
-                    "One open_url replaces ~4 calls (tap + wait + focus + type). Prefer this whenever the app supports it.",
+                    "open_url{url:'scheme://…'} opens an app URL scheme / deep link (often faster than launch_app and can jump " +
+                    "straight to a feature). Use it when you already know the app's scheme; use launch_app when you just want the app's home.",
                 ],
                 "scrolling_and_paging":
                     "Two ways to move a scroll view: swipe/scroll (a gesture — fast, has momentum, can overshoot) and " +
