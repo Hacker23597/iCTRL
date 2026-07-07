@@ -140,11 +140,13 @@ unsigned:
 	unzip -qq "$(RUNNER_IPA)" -d "$$TMP"; \
 	APP="$$TMP/Payload/$(RUNNER_APP)"; \
 	[ -d "$$APP" ] || { echo "🔴 $(RUNNER_APP) not found inside IPA"; exit 1; }; \
-	echo "   removing signatures..."; \
-	find "$$APP" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true; \
+	echo "   removing signatures (app + plugin + any nested bundle)..."; \
 	codesign --remove-signature "$$APP/PlugIns/$(XCTEST_BUNDLE)" 2>/dev/null || true; \
 	codesign --remove-signature "$$APP" 2>/dev/null || true; \
-	rm -f "$$APP/embedded.mobileprovision"; \
+	find "$$APP" \( -name "*.appex" -o -name "*.framework" -o -name "*.dylib" -o -name "*.xctest" \) \
+		-exec codesign --remove-signature {} + 2>/dev/null || true; \
+	find "$$APP" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true; \
+	find "$$APP" -name "*.mobileprovision" -exec rm -f {} + 2>/dev/null || true; \
 	rm -f "$(UNSIGNED_IPA)"; \
 	( cd "$$TMP" && zip -qr "$$OLDPWD/$(UNSIGNED_IPA)" Payload/ ); \
 	echo "✅ $(UNSIGNED_IPA)"
