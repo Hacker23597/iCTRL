@@ -71,6 +71,10 @@ ipa: build
 	rm -rf "$(BUILD_DIR)/$(RUNNER_APP)/Frameworks/Testing.framework"
 	rm -f  "$(BUILD_DIR)/$(RUNNER_APP)/Frameworks/libXCTestSwiftSupport.dylib"
 	@rmdir "$(BUILD_DIR)/$(RUNNER_APP)/Frameworks" 2>/dev/null || true
+	@echo "🧹 Removing dSYM debug symbols from the app..."
+	@# build-for-testing embeds a .dSYM inside the app; it is debug-symbol data,
+	@# not needed at runtime, and bloats the IPA (~3MB). Strip it before packaging.
+	@find "$(BUILD_DIR)/$(RUNNER_APP)" -name "*.dSYM" -exec rm -rf {} + 2>/dev/null || true
 	@echo "🔗 Registering ictrl:// URL scheme..."
 	@PLIST="$(BUILD_DIR)/$(RUNNER_APP)/Info.plist"; \
 	/usr/libexec/PlistBuddy -c "Delete :CFBundleURLTypes" "$$PLIST" 2>/dev/null || true; \
