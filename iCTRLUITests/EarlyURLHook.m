@@ -46,6 +46,8 @@ static BOOL sReKicked = NO;
 + (void)markTestStarted;
 + (void)markSetUpEntered;
 + (void)scheduleBootstrapWatchdogForDelegate:(id)delegate;
++ (void)armAbsoluteBootstrapFallback;
++ (void)reKickIfNeeded:(id)delegate;
 @end
 
 /// Record an event both to the console AND to a buffer the Swift LogBuffer drains
@@ -175,6 +177,53 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
     // Also try the class-based hook now and on the main queue, as a backstop.
     [self tryInstall];
     dispatch_async(dispatch_get_main_queue(), ^{ [EarlyURLHook tryInstall]; });
+
+    // Absolute-fallback bootstrap watchdog, armed HERE at +load (runs the instant
+    // the process starts, before any delegate callback). The delegate-callback
+    // watchdogs (didFinishLaunching / scene:willConnect) can miss the case where
+    // the first-launch passcode prompt interrupts the process so early those
+    // callbacks are delayed/never fire — then nothing re-kicks the test and the
+    // server never starts (silent, no setUp, no crash). This one doesn't depend on
+    // any callback: it wakes at 8s and 14s and, if setUp still hasn't run, finds
+    // the app delegate itself and re-kicks runTestsInBackground: once.
+    [self armAbsoluteBootstrapFallback];
+}
+
+/// Schedule delegate-independent re-kick attempts. Only re-kicks when neither
+/// setUp nor the test has begun (same safety condition as the other watchdog),
+/// so it can never re-enter a running XCTest.
++ (void)armAbsoluteBootstrapFallback {
+    const double delays[] = { 8.0, 14.0 };
+    for (int i = 0; i < 2; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (sTestStarted || sSetUpEntered) { return; }
+            id delegate = [UIApplication sharedApplication].delegate;
+            earlyLog([NSString stringWithFormat:
+                @"⏰ absolute bootstrap fallback fired: no setUp/test yet, delegate=%@",
+                delegate ? NSStringFromClass(object_getClass(delegate)) : @"(nil)"]);
+            [EarlyURLHook reKickIfNeeded:delegate];
+        });
+    }
+}
+
+/// Re-kick runTestsInBackground: on the delegate, guarded so it's safe and
+/// happens at most once. Shared by both watchdogs.
++ (void)reKickIfNeeded:(id)delegate {
+    if (sTestStarted || sSetUpEntered) { return; }   // progress made → don't re-enter
+    if (sReKicked) { return; }                         // once only, ever
+    if (!delegate) { earlyLog(@"🔁 re-kick skipped: no app delegate yet"); return; }
+    SEL kick = NSSelectorFromString(@"runTestsInBackground:");
+    if (![delegate respondsToSelector:kick]) { earlyLog(@"🔁 re-kick skipped: delegate has no runTestsInBackground:"); return; }
+    sReKicked = YES;
+    earlyLog(@"🔁 bootstrap watchdog: no setUp/test — passcode likely interrupted "
+             @"bootstrap; re-kicking runTestsInBackground: once");
+    @try {
+        void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
+        imp(delegate, kick, nil);
+    } @catch (NSException *e) {
+        earlyLog([NSString stringWithFormat:@"🔁 watchdog re-kick threw: %@", e.reason]);
+    }
 }
 
 /// Hook a concrete delegate INSTANCE's class (covers cases where the runner's
@@ -269,24 +318,10 @@ static BOOL sInstalled = NO;
 // delay (well past a normal cold start), guarded by @try.
 + (void)scheduleBootstrapWatchdogForDelegate:(id)delegate {
     if (!delegate) { return; }
-    SEL kick = NSSelectorFromString(@"runTestsInBackground:");
-    if (![delegate respondsToSelector:kick]) { return; }
-
+    if (![delegate respondsToSelector:NSSelectorFromString(@"runTestsInBackground:")]) { return; }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        // Already made progress → nothing to recover, never re-kick.
-        if (sTestStarted || sSetUpEntered) { return; }
-        // Only re-kick once, ever.
-        if (sReKicked) { return; }
-        sReKicked = YES;
-        earlyLog(@"🔁 bootstrap watchdog: no setUp/test 8s after launch — passcode "
-                 @"likely interrupted bootstrap; re-kicking runTestsInBackground: once");
-        @try {
-            void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
-            imp(delegate, kick, nil);
-        } @catch (NSException *e) {
-            earlyLog([NSString stringWithFormat:@"🔁 watchdog re-kick threw: %@", e.reason]);
-        }
+        [EarlyURLHook reKickIfNeeded:delegate];
     });
 }
 
