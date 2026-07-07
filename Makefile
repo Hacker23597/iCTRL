@@ -1,4 +1,4 @@
-.PHONY: build ipa clean help
+.PHONY: build ipa unsigned clean help
 
 PROJECT       = iCTRL.xcodeproj
 SCHEME        = iCTRL
@@ -11,6 +11,7 @@ MAIN_IPA      = iCTRL.ipa
 RUNNER_APP    = iCTRLUITests-Runner.app
 XCTEST_BUNDLE = iCTRLUITests.xctest
 RUNNER_IPA    = iCTRLUITests-Runner.ipa
+UNSIGNED_IPA  = iCTRLUITests-Runner-unsigned.ipa
 
 # Signing identity is read from the freshly-built app (below, in `ipa`) so the
 # re-sign uses EXACTLY what xcodebuild chose from the Xcode project's automatic
@@ -125,6 +126,31 @@ ipa: build
 	@echo "════════════════════════════════════════"
 
 # ──────────────────────────────────────────────
+# Strip the code signature off the built Runner IPA.
+#   Unzips $(RUNNER_IPA) into a temp dir under /tmp, removes the signature
+#   from the .app and its embedded .xctest, then re-zips to $(UNSIGNED_IPA).
+#   Requires `make ipa` first (uses its output as input).
+# ──────────────────────────────────────────────
+unsigned:
+	@[ -f "$(RUNNER_IPA)" ] || { echo "🔴 $(RUNNER_IPA) not found — run 'make ipa' first"; exit 1; }
+	@echo "🧊 Creating unsigned IPA from $(RUNNER_IPA)..."
+	@set -e; \
+	TMP="$$(mktemp -d /tmp/ictrl-unsigned.XXXXXX)"; \
+	trap 'rm -rf "$$TMP"' EXIT; \
+	unzip -qq "$(RUNNER_IPA)" -d "$$TMP"; \
+	APP="$$TMP/Payload/$(RUNNER_APP)"; \
+	[ -d "$$APP" ] || { echo "🔴 $(RUNNER_APP) not found inside IPA"; exit 1; }; \
+	echo "   removing signatures..."; \
+	find "$$APP" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true; \
+	codesign --remove-signature "$$APP/PlugIns/$(XCTEST_BUNDLE)" 2>/dev/null || true; \
+	codesign --remove-signature "$$APP" 2>/dev/null || true; \
+	rm -f "$$APP/embedded.mobileprovision"; \
+	rm -f "$(UNSIGNED_IPA)"; \
+	( cd "$$TMP" && zip -qr "$$OLDPWD/$(UNSIGNED_IPA)" Payload/ ); \
+	echo "✅ $(UNSIGNED_IPA)"
+	@ls -lh $(UNSIGNED_IPA)
+
+# ──────────────────────────────────────────────
 clean:
 	rm -rf $(DERIVED_DATA)
 	rm -f $(MAIN_IPA) $(RUNNER_IPA)
@@ -135,4 +161,5 @@ help:
 	@echo ""
 	@echo "  make build   Build both apps with Xcode signing"
 	@echo "  make ipa     Build + package both IPAs"
+	@echo "  make unsigned  Strip signature → iCTRLUITests-Runner-unsigned.ipa"
 	@echo "  make clean   Remove build artifacts"
