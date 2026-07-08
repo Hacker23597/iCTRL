@@ -1,7 +1,15 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
 """
 iCTRL GUI — a minimal live viewer + input passthrough for the iCTRL phone
 automation service.
+
+Run with uv (gives a modern Python with Tk 8.6 — needed for base64-PNG decode):
+    uv run tools/ictrl_gui.py --host 10.1.1.43:8200 --token <token>
+(uv reads the inline PEP 723 header above; no venv/deps setup needed.)
 
 - Connect to an iCTRL host (host:port). The auth TOKEN is provided by the caller
   (a --token CLI arg or the token field in the UI) — this tool does NOT read the
@@ -22,18 +30,32 @@ automation service.
   image's pixel size and the point-space to tap in (x = px / scale).
 
 Zero third-party deps: uses only the Python standard library (tkinter + urllib).
-Tkinter's PhotoImage decodes PNG natively (Tk 8.6+), so no Pillow needed.
-
-Run with a Python that has tkinter, e.g. the macOS system Python:
-    /usr/bin/python3 tools/ictrl_gui.py --host <host:port> --token <token>
+Tkinter's PhotoImage decodes PNG natively on Tk 8.6+, so no Pillow is needed —
+which is why we run under uv (its Python ships Tk 8.6); the macOS system Python
+is Tk 8.5 and can't decode a base64 PNG.
 """
 
 import argparse
 import json
+import os
+import sys
 import threading
 import time
+
+# uv's standalone Python ships Tcl/Tk under sys.base_prefix/lib but doesn't set
+# TCL_LIBRARY/TK_LIBRARY in `uv run script` mode, so `import tkinter` fails with
+# "Can't find a usable init.tcl". Point them at the bundled libs before import.
+def _fix_tcl_tk_paths():
+    lib = os.path.join(sys.base_prefix, "lib")
+    for var, sub in (("TCL_LIBRARY", "tcl8.6"), ("TK_LIBRARY", "tk8.6")):
+        if not os.environ.get(var):
+            cand = os.path.join(lib, sub)
+            if os.path.isdir(cand):
+                os.environ[var] = cand
+_fix_tcl_tk_paths()
+
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import urllib.request
 import urllib.error
 
@@ -148,57 +170,99 @@ class App:
 
     # ---- UI construction ----
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=6)
-        top.pack(fill="x")
+        # Two-column layout: left = live screen, right = control panel.
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
 
-        ttk.Label(top, text="Host:").pack(side="left")
-        self.host_var = tk.StringVar(value=self.init_host)
-        ttk.Entry(top, textvariable=self.host_var, width=18).pack(side="left", padx=(2, 8))
+        left = ttk.Frame(outer)
+        left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(outer, padding=8, width=220)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
 
-        ttk.Label(top, text="FPS:").pack(side="left")
-        self.fps_var = tk.StringVar(value="1")
-        ttk.Combobox(top, textvariable=self.fps_var, width=4,
-                     values=["0.5", "1", "2", "3", "5"]).pack(side="left", padx=(2, 8))
-
-        ttk.Label(top, text="Quality:").pack(side="left")
-        self.scale_var = tk.StringVar(value="1")
-        ttk.Combobox(top, textvariable=self.scale_var, width=4,
-                     values=["0.5", "1", "2"]).pack(side="left", padx=(2, 8))
-
-        self.connect_btn = ttk.Button(top, text="Connect", command=self.on_connect)
-        self.connect_btn.pack(side="left", padx=4)
-        self.stop_btn = ttk.Button(top, text="Stop", command=self.stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=4)
-
-        self.status = tk.StringVar(value="Idle")
-        ttk.Label(top, textvariable=self.status, foreground="#0a7").pack(side="left", padx=10)
-
-        # token row — the caller supplies the token (CLI/UI); we don't read the
-        # cache file. Leave blank + press Authorize to grant one on the device.
-        row2 = ttk.Frame(self.root, padding=(6, 0, 6, 6))
-        row2.pack(fill="x")
-        ttk.Label(row2, text="Token:").pack(side="left")
-        self.token_var = tk.StringVar(value=self.init_token)
-        ttk.Entry(row2, textvariable=self.token_var, width=42, show="•").pack(side="left", padx=(2, 8))
-        ttk.Button(row2, text="Authorize", command=self.on_authorize).pack(side="left", padx=4)
-
-        # canvas for the live screen
-        self.canvas = tk.Canvas(self.root, bg="#111", width=320, height=640,
-                                highlightthickness=0)
+        # ── LEFT: live screen ──
+        self.canvas = tk.Canvas(left, bg="#111", width=320, height=640, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_motion)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Double-Button-1>", self.on_double)
         self.canvas.bind("<ButtonPress-3>", self.on_right)  # right = long press
+        self.root.bind("<Key>", self.on_key)  # typing → device focused field
 
-        # keyboard: send typed characters to the device's focused field
-        self.root.bind("<Key>", self.on_key)
+        # ── RIGHT: control panel ──
+        # Connection
+        conn = ttk.LabelFrame(right, text="Connection", padding=6)
+        conn.pack(fill="x")
+        ttk.Label(conn, text="Host").grid(row=0, column=0, sticky="w")
+        self.host_var = tk.StringVar(value=self.init_host)
+        ttk.Entry(conn, textvariable=self.host_var, width=18).grid(row=0, column=1, columnspan=2, sticky="we", pady=2)
+        ttk.Label(conn, text="Token").grid(row=1, column=0, sticky="w")
+        self.token_var = tk.StringVar(value=self.init_token)
+        ttk.Entry(conn, textvariable=self.token_var, width=18, show="•").grid(row=1, column=1, columnspan=2, sticky="we", pady=2)
+        self.connect_btn = ttk.Button(conn, text="Connect", command=self.on_connect)
+        self.connect_btn.grid(row=2, column=0, columnspan=2, sticky="we", pady=(4, 0))
+        self.stop_btn = ttk.Button(conn, text="Stop", command=self.stop, state="disabled")
+        self.stop_btn.grid(row=2, column=2, sticky="we", pady=(4, 0))
+        ttk.Button(conn, text="Authorize on device", command=self.on_authorize).grid(
+            row=3, column=0, columnspan=3, sticky="we", pady=(2, 0))
+        conn.columnconfigure(1, weight=1)
 
-        # footer hint
-        hint = ("Left-click = tap · drag = swipe · double-click = double_tap · "
-                "right-click = long_press · type = send to focused field · Enter = submit")
-        ttk.Label(self.root, text=hint, padding=4, foreground="#888").pack(fill="x")
+        # Stream settings
+        strm = ttk.LabelFrame(right, text="Stream", padding=6)
+        strm.pack(fill="x", pady=(8, 0))
+        ttk.Label(strm, text="FPS").grid(row=0, column=0, sticky="w")
+        self.fps_var = tk.StringVar(value="1")
+        ttk.Combobox(strm, textvariable=self.fps_var, width=5,
+                     values=["0.5", "1", "2", "3", "5"]).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(strm, text="Quality").grid(row=0, column=2, sticky="w")
+        self.scale_var = tk.StringVar(value="1")
+        ttk.Combobox(strm, textvariable=self.scale_var, width=4,
+                     values=["0.5", "1", "2"]).grid(row=0, column=3, sticky="w", padx=4)
+
+        # Device buttons
+        dev = ttk.LabelFrame(right, text="Device", padding=6)
+        dev.pack(fill="x", pady=(8, 0))
+        buttons = [
+            ("🏠 Home", lambda: self._send(lambda: self.client.rpc("home"), "home")),
+            ("🔒 Lock", self._lock_confirm),  # needs confirmation
+            ("🔓 Unlock", lambda: self._send(lambda: self.client.rpc("unlock"), "unlock")),
+            ("📷 Shot", lambda: self._send(self._save_shot, "screenshot saved")),
+        ]
+        for i, (label, cmd) in enumerate(buttons):
+            ttk.Button(dev, text=label, width=9, command=cmd).grid(
+                row=i // 2, column=i % 2, sticky="we", padx=2, pady=2)
+        dev.columnconfigure(0, weight=1); dev.columnconfigure(1, weight=1)
+
+        # Direction pad (swipe-based) + paging
+        nav = ttk.LabelFrame(right, text="Navigate (swipe)", padding=6)
+        nav.pack(fill="x", pady=(8, 0))
+        ttk.Button(nav, text="↑", width=4, command=lambda: self._swipe_dir("up")).grid(row=0, column=1, pady=1)
+        ttk.Button(nav, text="←", width=4, command=lambda: self._swipe_dir("left")).grid(row=1, column=0, padx=1)
+        ttk.Button(nav, text="•", width=4, command=self._center_tap).grid(row=1, column=1)
+        ttk.Button(nav, text="→", width=4, command=lambda: self._swipe_dir("right")).grid(row=1, column=2, padx=1)
+        ttk.Button(nav, text="↓", width=4, command=lambda: self._swipe_dir("down")).grid(row=2, column=1, pady=1)
+        for c in range(3):
+            nav.columnconfigure(c, weight=1)
+        pg = ttk.Frame(nav)
+        pg.grid(row=3, column=0, columnspan=3, sticky="we", pady=(4, 0))
+        ttk.Button(pg, text="⇞ PgUp", command=lambda: self._page("up")).pack(side="left", expand=True, fill="x", padx=1)
+        ttk.Button(pg, text="⇟ PgDn", command=lambda: self._page("down")).pack(side="left", expand=True, fill="x", padx=1)
+
+        # Text actions
+        txt = ttk.LabelFrame(right, text="Text", padding=6)
+        txt.pack(fill="x", pady=(8, 0))
+        ttk.Button(txt, text="⌫ Clear field", command=lambda: self._send(
+            lambda: self.client.rpc("clear_text"), "clear_text")).pack(fill="x", pady=1)
+        ttk.Button(txt, text="⏎ Submit", command=lambda: self._send(
+            lambda: self.client.type_text("", submit=True), "submit")).pack(fill="x", pady=1)
+
+        # Status (bottom of panel)
+        self.status = tk.StringVar(value="Idle")
+        ttk.Label(right, textvariable=self.status, foreground="#0a7", wraplength=200).pack(
+            side="bottom", fill="x", pady=(8, 0))
+        ttk.Label(right, text="click=tap · drag=swipe · dbl=double · right=long-press",
+                  foreground="#888", wraplength=200).pack(side="bottom", fill="x")
 
     # ---- connection ----
     def on_connect(self):
@@ -370,6 +434,59 @@ class App:
             ch = e.char
             self._send(lambda: self.client.type_text(ch), f"type '{ch}'")
 
+    # ---- right-panel actions ----
+    def _guard(self):
+        """Return True if connected; else set a status hint."""
+        if not self.client or not self.running:
+            self.set_status("Connect first", "#fa0")
+            return False
+        return True
+
+    def _swipe_dir(self, direction):
+        """Direction pad: swipe across the middle of the screen. On a phone this
+        is the natural 'arrow key' — a directional scroll/navigation gesture."""
+        if not self._guard():
+            return
+        w, h = self.pt_w or 390, self.pt_h or 844
+        cx, cy = w / 2, h / 2
+        d = min(w, h) * 0.35  # travel distance in points
+        vec = {"up": (0, -d), "down": (0, d), "left": (-d, 0), "right": (d, 0)}[direction]
+        # Swiping content up means dragging the finger downward, etc. We map the
+        # arrow to the finger travel direction directly (arrow ↑ = swipe upward).
+        x2, y2 = cx + vec[0], cy + vec[1]
+        self._send(lambda: self.client.swipe(cx, cy, x2, y2), f"swipe {direction}")
+
+    def _lock_confirm(self):
+        """Lock the device — requires an explicit confirmation, since locking
+        interrupts the session (and can require a passcode to get back in)."""
+        if not self._guard():
+            return
+        if messagebox.askyesno("Lock device?",
+                               "Lock the phone now?\n\nThis ends the current view; "
+                               "unlocking again may need the passcode entered on the device."):
+            self._send(lambda: self.client.rpc("lock"), "lock")
+
+    def _page(self, direction):
+        if not self._guard():
+            return
+        self._send(lambda: self.client.rpc("page", {"direction": direction}), f"page {direction}")
+
+    def _center_tap(self):
+        if not self._guard():
+            return
+        w, h = self.pt_w or 390, self.pt_h or 844
+        self._send(lambda: self.client.tap(w / 2, h / 2), "tap center")
+
+    def _save_shot(self):
+        """Fetch one screenshot and write it to a PNG next to the tool."""
+        import base64
+        shot = self.client.screenshot(scale=1)
+        data = base64.b64decode(shot["data"])
+        path = os.path.join(os.getcwd(), f"ictrl-shot-{int(time.time())}.png")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path  # shown in status by _send wrapper
+
     # ---- async send with status ----
     def _send(self, fn, label):
         def worker():
@@ -396,6 +513,11 @@ def main():
     args = ap.parse_args()
 
     root = tk.Tk()
+    if root.tk.call("info", "patchlevel").split(".")[:2] < ["8", "6"]:
+        # Tk 8.5 can't decode base64 PNG and renders ttk poorly. uv gives 8.6.
+        import sys
+        print("iCTRL GUI needs Tk >= 8.6 — run it with uv:  uv run tools/ictrl_gui.py",
+              file=sys.stderr)
     root.geometry("380x780")
     App(root, host=args.host, token=args.token)
     root.mainloop()

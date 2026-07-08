@@ -412,7 +412,11 @@ class JSONRPCServer {
 
     private func sendJSONRPCError(_ id: JSONValue?, error: JSONRPCError, connection: NWConnection) {
         let response = JSONRPCResponse(result: nil, error: error, id: id)
-        let statusCode = error.code == -32000 ? 401 : 200
+        // Only a genuine auth failure maps to HTTP 401. Every other JSON-RPC error
+        // (business/timeout/-32000, parse, invalid params, …) is a processed
+        // request whose failure travels in the JSON body, so HTTP stays 200 — else
+        // a slow/timed-out action reads as "unauthorized" to clients.
+        let statusCode = error.code == JSONRPCError.unauthorizedCode ? 401 : 200
         if let data = try? JSONEncoder().encode(response), let str = String(data: data, encoding: .utf8) {
             sendHTTPResponse(connection: connection, status: statusCode, contentType: "application/json", body: str)
         }

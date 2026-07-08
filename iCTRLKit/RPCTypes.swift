@@ -26,7 +26,12 @@ struct JSONRPCError: Encodable {
     static let methodNotFound = JSONRPCError(code: -32601, message: "Method not found", data: nil)
     static let invalidParams = JSONRPCError(code: -32602, message: "Invalid params", data: nil)
     static let internalError = JSONRPCError(code: -32603, message: "Internal error", data: nil)
-    static let unauthorized = JSONRPCError(code: -32000, message: "Unauthorized: valid auth token required", data: nil)
+    /// Auth failure. Distinct code (-32099) so the HTTP layer can map ONLY this to
+    /// 401 — business errors use serverError(-32000) and must return HTTP 200 with
+    /// the failure in the JSON-RPC error body (otherwise a slow/timed-out action
+    /// looks like "unauthorized" to clients).
+    static let unauthorizedCode = -32099
+    static let unauthorized = JSONRPCError(code: unauthorizedCode, message: "Unauthorized: valid auth token required", data: nil)
 
     static func serverError(_ msg: String) -> JSONRPCError {
         JSONRPCError(code: -32000, message: msg, data: nil)
