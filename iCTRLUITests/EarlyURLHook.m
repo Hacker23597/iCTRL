@@ -12,6 +12,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <fcntl.h>
+#import <unistd.h>
 
 // Thread-safe stash of early-captured URLs. URLSchemeHandler (Swift) reads these
 // via +[EarlyURLHook drainURLs] and merges them into its pending queue.
@@ -50,13 +52,38 @@ static BOOL sReKicked = NO;
 + (void)reKickIfNeeded:(id)delegate;
 @end
 
-/// Record an event both to the console AND to a buffer the Swift LogBuffer drains
-/// into the persisted log file (these +load-era events run before Swift logging).
+/// Append one +load-era line DIRECTLY to today's persisted log file. These lines
+/// run before Swift logging exists and are normally only flushed when setUp/URL
+/// handling drains the buffer — but if the first-launch passcode interrupts
+/// bootstrap, setUp never runs and those lines (incl. the bootstrap watchdog /
+/// fallback activity) are lost, creating an observability black hole. So we also
+/// write straight to the file here, so the recovery path is always traceable.
+static void earlyLogWriteToFile(NSString *msg) {
+    @try {
+        NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+        if (dirs.count == 0) { return; }
+        NSString *dir = [dirs[0] stringByAppendingPathComponent:@"Logs/iCTRL"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"yyyy-MM-dd"; df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        NSString *day = [df stringFromDate:[NSDate date]];
+        NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"ictrl-%@.log", day]];
+        NSDateFormatter *tf = [[NSDateFormatter alloc] init]; tf.dateFormat = @"HH:mm:ss.SSS";
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [tf stringFromDate:[NSDate date]], msg];
+        int fd = open(path.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (fd >= 0) { write(fd, line.UTF8String, strlen(line.UTF8String)); close(fd); }
+    } @catch (__unused NSException *e) {}
+}
+
+/// Record an event to the console, the drain buffer (for the in-memory log), AND
+/// straight to the persisted file (so it survives a bootstrap that never reaches
+/// setUp — see earlyLogWriteToFile).
 static void earlyLog(NSString *msg) {
     NSLog(@"%@", msg);
     [sEarlyLock lock];
     if (sEarlyLogs) { [sEarlyLogs addObject:msg]; }
     [sEarlyLock unlock];
+    earlyLogWriteToFile(msg);
 }
 
 static void stashURL(NSURL *url) {
@@ -177,6 +204,8 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
     // Also try the class-based hook now and on the main queue, as a backstop.
     [self tryInstall];
     dispatch_async(dispatch_get_main_queue(), ^{ [EarlyURLHook tryInstall]; });
+
+    earlyLog(@"🟩 +load reached — early hooks + bootstrap fallback arming");
 
     // Absolute-fallback bootstrap watchdog, armed HERE at +load (runs the instant
     // the process starts, before any delegate callback). The delegate-callback
