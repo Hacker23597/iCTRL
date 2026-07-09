@@ -71,19 +71,34 @@ class ICtrlClient:
         self.host = host
         self.token = token  # supplied by the caller (CLI arg / UI field)
         self._id = 0
+        # The frame loop (screenshot) and input handlers call this client from
+        # different threads. The server processes one connection at a time, so
+        # overlapping requests can interfere; serialize all HTTP on one lock.
+        self._http_lock = threading.Lock()
 
     # --- low-level HTTP ---
     def _post(self, path, payload, timeout=30, auth=True):
-        data = json.dumps(payload).encode("utf-8")
+        # allow_nan=False: never emit NaN/Infinity (invalid JSON) — a bad coordinate
+        # would otherwise reach the server as `{"x": NaN}` and fail as a parse error.
+        data = json.dumps(payload, allow_nan=False).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if auth and self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         req = urllib.request.Request(self.base + path, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        try:
+            with self._http_lock, urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # Non-2xx (e.g. 401) still carries a JSON-RPC error body — read it so
+            # the real message ("Unauthorized", a timeout, …) surfaces instead of
+            # a misleading generic/parse error.
+            try:
+                return json.loads(e.read().decode("utf-8"))
+            except Exception:
+                raise RuntimeError(f"HTTP {e.code} {e.reason}")
 
     def _get(self, path, timeout=10):
-        with urllib.request.urlopen(self.base + path, timeout=timeout) as r:
+        with self._http_lock, urllib.request.urlopen(self.base + path, timeout=timeout) as r:
             return r.read()
 
     # --- lifecycle ---
@@ -518,7 +533,10 @@ def main():
         import sys
         print("iCTRL GUI needs Tk >= 8.6 — run it with uv:  uv run tools/ictrl_gui.py",
               file=sys.stderr)
-    root.geometry("380x780")
+    # Size for both columns up front: a portrait phone canvas (~360) + the
+    # 240-wide control panel, so it's usable without dragging. Enforce a minimum.
+    root.geometry("620x820")
+    root.minsize(520, 640)
     App(root, host=args.host, token=args.token)
     root.mainloop()
 

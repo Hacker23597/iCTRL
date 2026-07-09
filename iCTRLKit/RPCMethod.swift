@@ -296,7 +296,7 @@ struct RPCMethodRegistry {
                 "skill": "GET /skill — START HERE. The operating manual in Skill (Markdown) format; read it ONCE to learn the fast-path workflow and best practices, then treat iCTRL as a Skill.",
                 "auth": "POST /auth  {client_name} → {token}. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. Returns 403 if denied.",
                 "rpc": "POST /rpc   {jsonrpc, method, params, id}  (Authorization: Bearer <token>)",
-                "logs": "GET /logs   plain-text recent logs (current process, in-memory), no auth, sensitive values redacted",
+                "logs": "GET /logs   plain-text recent logs (current process, in-memory). REQUIRES Authorization: Bearer <token>. Sensitive values are redacted",
                 "logs_files": "GET /logs/files   list persisted daily log files (survive crashes/restarts)",
                 "logs_history": "GET /logs/history?date=YYYY-MM-DD   dump a persisted day's log (redacted). Use this to recover logs from BEFORE a crash — /logs only holds the current process's memory",
                 "schema": "GET /schema  this document",
@@ -504,7 +504,7 @@ struct RPCMethodRegistry {
         </div>
 
         <div class="info">
-        <p><strong>Diagnostics &amp; logs (no auth, redacted):</strong></p>
+        <p><strong>Diagnostics &amp; logs (Bearer token required, redacted):</strong></p>
         <ul style="margin:6px 0 0 18px;color:#6e6e73;font-size:14px;line-height:1.6">
         <li><code>GET /logs</code> — recent in-memory logs for the current process (includes <code>⏱ ✓ &lt;method&gt; &lt;ms&gt;</code> timings).</li>
         <li><code>GET /logs/files</code> — list persisted daily log files (survive crashes/restarts).</li>

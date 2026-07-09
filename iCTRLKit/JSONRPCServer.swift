@@ -11,7 +11,7 @@ class JSONRPCServer {
 
     var onRPCRequest: ((String, [String: JSONValue]?, @escaping ([String: JSONValue]?, JSONRPCError?) -> Void) -> Void)?
     var onStateChange: ((Bool) -> Void)?
-    /// Returns redacted log text for the public (no-auth) GET /logs endpoint.
+    /// Returns redacted log text for the (auth-required) GET /logs endpoint.
     var onLogsRequest: (() -> String)?
 
     /// Lists persisted daily log files (names + sizes) for GET /logs/files.
@@ -115,24 +115,65 @@ class JSONRPCServer {
         connection.start(queue: queue)
     }
 
-    private func receiveHTTP(from connection: NWConnection) {
+    private func receiveHTTP(from connection: NWConnection, buffer: Data = Data()) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
 
-            if let data = data, !data.isEmpty {
-                self.processHTTPRequest(data, from: connection)
-            }
+            var acc = buffer
+            if let data = data, !data.isEmpty { acc.append(data) }
 
-            if isComplete || error != nil {
-                connection.cancel()
+            // A full HTTP request needs the header terminator AND, for a body, the
+            // whole Content-Length. If we don't have it all yet, keep receiving —
+            // TCP can split a request across segments (common under concurrent /
+            // rapid requests), and parsing a half-received body was the cause of
+            // spurious "parse error" responses.
+            switch Self.requestState(of: acc) {
+            case .incomplete:
+                if isComplete || error != nil {
+                    connection.cancel()  // peer closed before sending it all
+                } else {
+                    self.receiveHTTP(from: connection, buffer: acc)  // wait for more
+                }
+            case .complete(let headerEnd, let contentLength):
+                self.processHTTPRequest(acc, headerEnd: headerEnd, contentLength: contentLength, from: connection)
+                if isComplete || error != nil { connection.cancel() }
             }
         }
     }
 
     // MARK: - HTTP Parsing
 
-    private func processHTTPRequest(_ data: Data, from connection: NWConnection) {
-        guard let raw = String(data: data, encoding: .utf8) else {
+    private enum RequestState {
+        case incomplete
+        case complete(headerEnd: Int, contentLength: Int)
+    }
+
+    /// Determine whether `acc` holds a complete HTTP request. Operates on raw
+    /// bytes (binary-safe) and honors Content-Length.
+    private static func requestState(of acc: Data) -> RequestState {
+        // Find the CRLFCRLF header/body separator.
+        let sep = Data([0x0D, 0x0A, 0x0D, 0x0A])
+        guard let r = acc.range(of: sep) else { return .incomplete }
+        let headerEnd = r.upperBound
+        // Parse Content-Length from the header block (case-insensitive).
+        let headerData = acc.subdata(in: acc.startIndex..<r.lowerBound)
+        let headerStr = String(data: headerData, encoding: .utf8) ?? ""
+        var contentLength = 0
+        for line in headerStr.components(separatedBy: "\r\n") {
+            let p = line.split(separator: ":", maxSplits: 1)
+            if p.count == 2, p[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" {
+                contentLength = Int(p[1].trimmingCharacters(in: .whitespaces)) ?? 0
+                break
+            }
+        }
+        let haveBody = acc.count - headerEnd
+        return haveBody >= contentLength ? .complete(headerEnd: headerEnd, contentLength: contentLength)
+                                         : .incomplete
+    }
+
+    private func processHTTPRequest(_ data: Data, headerEnd: Int, contentLength: Int, from connection: NWConnection) {
+        let headerData = data.subdata(in: data.startIndex..<headerEnd)
+        guard let raw = String(data: headerData, encoding: .utf8) else {
             sendHTTPResponse(connection: connection, status: 400, body: "Bad Request")
             return
         }
@@ -163,13 +204,11 @@ class JSONRPCServer {
             }
         }
 
-        // Extract body
+        // Extract the body as raw bytes (exactly Content-Length), binary-safe.
         var body: Data?
-        if let range = raw.range(of: "\r\n\r\n") {
-            let bodyString = String(raw[range.upperBound...])
-            if !bodyString.isEmpty {
-                body = bodyString.data(using: .utf8)
-            }
+        if contentLength > 0 {
+            let end = min(data.count, headerEnd + contentLength)
+            body = data.subdata(in: headerEnd..<end)
         }
 
         route(method: method, path: path, headers: headers, body: body, connection: connection)
@@ -196,13 +235,18 @@ class JSONRPCServer {
         case ("GET", "/docs"):
             handleDocsPage(connection: connection)
 
+        // Logs can contain sensitive context even when redacted, so they now
+        // require a valid bearer token — same as /rpc.
         case ("GET", "/logs/files"):
+            guard isAuthorized(headers) else { return sendUnauthorizedHTTP(connection) }
             handleLogFiles(connection: connection)
 
         case ("GET", "/logs/history"):
+            guard isAuthorized(headers) else { return sendUnauthorizedHTTP(connection) }
             handleLogHistory(connection: connection, query: query)
 
         case ("GET", "/logs"):
+            guard isAuthorized(headers) else { return sendUnauthorizedHTTP(connection) }
             handleLogs(connection: connection)
 
         case ("POST", "/auth"):
@@ -286,7 +330,7 @@ class JSONRPCServer {
     }
 
     private func handleLogs(connection: NWConnection) {
-        // Public, no-auth endpoint. Content is redacted by the log provider.
+        // Auth-required (checked in route()). Content is still redacted as defense in depth.
         let logs = onLogsRequest?() ?? "(no logs available)"
         let header = "# iCTRL logs (redacted — sensitive values masked)\n\n"
         sendHTTPResponse(connection: connection, status: 200, contentType: "text/plain; charset=utf-8", body: header + logs)
@@ -353,6 +397,20 @@ class JSONRPCServer {
                 self?.sendHTTPResponse(connection: connection, status: 200, contentType: "application/json", body: jsonString)
             }
         }
+    }
+
+    /// True if the request carries a valid bearer token.
+    private func isAuthorized(_ headers: [String: String]) -> Bool {
+        guard let authHeader = headers["authorization"],
+              authHeader.lowercased().hasPrefix("bearer ") else { return false }
+        let token = String(authHeader.dropFirst(7)).trimmingCharacters(in: .whitespaces)
+        return AuthManager.shared.validateToken(token)
+    }
+
+    /// Plain-text 401 for non-RPC (e.g. GET /logs) endpoints.
+    private func sendUnauthorizedHTTP(_ connection: NWConnection) {
+        sendHTTPResponse(connection: connection, status: 401,
+                         body: "Unauthorized: a valid Bearer token is required to read logs.")
     }
 
     private func handleRPC(headers: [String: String], body: Data?, connection: NWConnection) {
