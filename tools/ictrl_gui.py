@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = ["pillow"]
 # ///
 """
 iCTRL GUI — a minimal live viewer + input passthrough for the iCTRL phone
@@ -58,6 +58,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import urllib.request
 import urllib.error
+from io import BytesIO
+from PIL import Image, ImageTk  # smooth (LANCZOS) scaling; uv installs it
 
 DEFAULT_HOST = "10.1.1.43:8200"
 
@@ -226,14 +228,16 @@ class App:
         # Stream settings
         strm = ttk.LabelFrame(right, text="Stream", padding=6)
         strm.pack(fill="x", pady=(8, 0))
-        ttk.Label(strm, text="FPS").grid(row=0, column=0, sticky="w")
+        # Vertical layout so neither field gets clipped in the narrow panel.
+        ttk.Label(strm, text="FPS").grid(row=0, column=0, sticky="w", pady=2)
         self.fps_var = tk.StringVar(value="1")
-        ttk.Combobox(strm, textvariable=self.fps_var, width=5,
-                     values=["0.5", "1", "2", "3", "5"]).grid(row=0, column=1, sticky="w", padx=4)
-        ttk.Label(strm, text="Quality").grid(row=0, column=2, sticky="w")
-        self.scale_var = tk.StringVar(value="1")
-        ttk.Combobox(strm, textvariable=self.scale_var, width=4,
-                     values=["0.5", "1", "2"]).grid(row=0, column=3, sticky="w", padx=4)
+        ttk.Combobox(strm, textvariable=self.fps_var, width=6,
+                     values=["0.5", "1", "2", "3", "5"]).grid(row=0, column=1, sticky="we", padx=4, pady=2)
+        ttk.Label(strm, text="Quality").grid(row=1, column=0, sticky="w", pady=2)
+        self.scale_var = tk.StringVar(value="2")  # full device resolution by default
+        ttk.Combobox(strm, textvariable=self.scale_var, width=6,
+                     values=["0.5", "1", "2", "3"]).grid(row=1, column=1, sticky="we", padx=4, pady=2)
+        strm.columnconfigure(1, weight=1)
 
         # Device buttons
         dev = ttk.LabelFrame(right, text="Device", padding=6)
@@ -303,6 +307,14 @@ class App:
             self.set_status("Token invalid/expired — press Authorize", "#f33")
             return
         self.set_status("Connected", "#0a7")
+        # Show the device name in the window title.
+        try:
+            info = c.rpc("device_info", timeout=8)
+            name = info.get("device_name") or info.get("name")
+            if name:
+                self.root.after(0, lambda: self.root.title(f"iCTRL GUI — {name}"))
+        except Exception:
+            pass
         self.running = True
         self.root.after(0, lambda: self.stop_btn.config(state="normal"))
         self.root.after(0, lambda: self.connect_btn.config(state="disabled"))
@@ -335,6 +347,7 @@ class App:
         self.stop_btn.config(state="disabled")
         self.connect_btn.config(state="normal")
         self.set_status("Stopped", "#888")
+        self.root.title("iCTRL GUI")
 
     # ---- frame loop (fixed rate) ----
     def _frame_loop(self):
@@ -365,29 +378,33 @@ class App:
         b64 = shot.get("data", "")
         if not b64:
             return
-        # decode on the Tk thread
-        self.root.after(0, lambda: self._render(b64))
-
-    def _render(self, b64):
+        # Decode the PNG off the Tk thread (heavier work), then hand the PIL image
+        # to _render on the Tk thread for smooth scaling + display.
         try:
-            img = tk.PhotoImage(data=b64)  # Tk 8.6 decodes base64 PNG directly
+            import base64 as _b64
+            pil = Image.open(BytesIO(_b64.b64decode(b64)))
+            pil.load()
         except Exception as e:
             self.set_status(f"decode error: {e}", "#f33")
             return
-        cw = self.canvas.winfo_width() or img.width()
-        ch = self.canvas.winfo_height() or img.height()
-        # fit-to-window by integer subsampling (PhotoImage can't upscale cheaply)
-        factor = 1
-        while (img.width() // (factor + 1)) >= 1 and (
-                img.width() / factor > cw or img.height() / factor > ch):
-            factor += 1
-        shown = img.subsample(factor) if factor > 1 else img
-        self.disp_scale = shown.width() / img.width()  # canvas px per image px
-        self._img = shown
-        self.img_x0 = max(0, (cw - shown.width()) // 2)
-        self.img_y0 = max(0, (ch - shown.height()) // 2)
+        self.root.after(0, lambda: self._render(pil))
+
+    def _render(self, pil):
+        cw = self.canvas.winfo_width() or pil.width
+        ch = self.canvas.winfo_height() or pil.height
+        # Fit-to-window preserving aspect, with SMOOTH (LANCZOS) scaling — up or
+        # down — so the phone screen is crisp at any window size (no integer-only
+        # subsampling artifacts).
+        ratio = min(cw / pil.width, ch / pil.height)
+        dw, dh = max(1, int(pil.width * ratio)), max(1, int(pil.height * ratio))
+        resized = pil.resize((dw, dh), Image.LANCZOS) if (dw, dh) != (pil.width, pil.height) else pil
+        self._img = ImageTk.PhotoImage(resized)
+        # canvas px per IMAGE pixel — image pixels == screenshot pixels (pix_w/h)
+        self.disp_scale = dw / pil.width
+        self.img_x0 = max(0, (cw - dw) // 2)
+        self.img_y0 = max(0, (ch - dh) // 2)
         self.canvas.delete("all")
-        self.canvas.create_image(self.img_x0, self.img_y0, anchor="nw", image=shown)
+        self.canvas.create_image(self.img_x0, self.img_y0, anchor="nw", image=self._img)
 
     # ---- coordinate conversion: canvas → device points ----
     def canvas_to_point(self, cx, cy):

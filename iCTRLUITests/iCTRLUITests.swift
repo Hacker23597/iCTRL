@@ -209,15 +209,15 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             } else {
                 Self.logBuffer.append("🔒 Server started on 127.0.0.1:8200 (local only)")
                 sendNotification(
-                    title: "🟢 iCTRL Server Ready",
-                    body: "Running on 127.0.0.1:8200 (local only)\nLong press for Remote Access or Stop Server",
+                    title: L10n.t(.serverReadyTitle),
+                    body: L10n.t(.localOnlyBody) + "\n" + L10n.t(.longPressRemoteOrStop),
                     category: Self.serverReadyCategoryID
                 )
             }
         } catch {
             Self.logBuffer.append("🔴 Failed to start server: \(error)")
             sendNotification(
-                title: "🔴 iCTRL Server Failed",
+                title: L10n.t(.serverFailedTitle),
                 body: error.localizedDescription
             )
         }
@@ -373,12 +373,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Register auth category with Allow/Deny actions
         let allowAction = UNNotificationAction(
             identifier: Self.allowActionID,
-            title: "Allow",
+            title: L10n.t(.allow),
             options: [.authenticationRequired]
         )
         let denyAction = UNNotificationAction(
             identifier: Self.denyActionID,
-            title: "Deny",
+            title: L10n.t(.deny),
             options: [.destructive]
         )
         let authCategory = UNNotificationCategory(
@@ -391,12 +391,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Register server-ready category with actions
         let enableRemoteAction = UNNotificationAction(
             identifier: Self.enableRemoteActionID,
-            title: "Enable Remote Access",
+            title: L10n.t(.enableRemote),
             options: [.authenticationRequired]
         )
         let stopServerAction = UNNotificationAction(
             identifier: Self.stopServerActionID,
-            title: "Stop Server",
+            title: L10n.t(.stopServer),
             options: [.destructive, .authenticationRequired]
         )
         let serverReadyCategory = UNNotificationCategory(
@@ -409,7 +409,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Remote-enabled category: Disable Remote + Stop
         let disableRemoteAction = UNNotificationAction(
             identifier: Self.disableRemoteActionID,
-            title: "Disable Remote Access",
+            title: L10n.t(.disableRemote),
             options: [.authenticationRequired]
         )
         let serverRemoteCategory = UNNotificationCategory(
@@ -422,7 +422,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Stopped category: Copy Logs
         let copyLogsAction = UNNotificationAction(
             identifier: Self.copyLogsActionID,
-            title: "Copy Logs",
+            title: L10n.t(.copyLogs),
             options: []
         )
         let serverStoppedCategory = UNNotificationCategory(
@@ -532,8 +532,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 Self.logBuffer.append("Server stopped")
                 self?.keepRunning = false
                 self?.sendNotification(
-                    title: "⏹️ iCTRL Server Stopped",
-                    body: "The automation server has stopped.\nLong press to Copy Logs",
+                    title: L10n.t(.serverStoppedTitle),
+                    body: L10n.t(.serverStoppedBody) + "\n" + L10n.t(.longPressCopyLogs),
                     category: Self.serverStoppedCategoryID
                 )
             }
@@ -951,8 +951,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             reportedRemoteFailure = false
             clearRemoteFailedNotification()
             sendNotification(
-                title: "🟢 iCTRL Server Ready",
-                body: "Listening on \(address):8200 (\(net == .cellular ? "mobile data" : "no Wi-Fi") — reachable on-device only; connect over Wi-Fi for LAN access).\nLong press to Disable Remote or Stop Server",
+                title: L10n.t(.serverReadyTitle),
+                body: "\(address):8200 — " + L10n.t(.onDeviceOnlySuffix) + "\n" + L10n.t(.longPressDisableOrStop),
                 category: Self.serverRemoteCategoryID
             )
         }
@@ -972,8 +972,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             try newServer.start()
             Self.logBuffer.append("🔒 Remote access disabled, local only")
             sendNotification(
-                title: "🔒 Remote Access Disabled",
-                body: "Now local only at 127.0.0.1:8200\nLong press for Remote Access or Stop Server",
+                title: L10n.t(.remoteDisabledTitle),
+                body: L10n.t(.remoteDisabledBody) + "\n" + L10n.t(.longPressRemoteOrStop),
                 category: Self.serverReadyCategoryID
             )
         } catch {
@@ -983,8 +983,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
     private func sendAuthNotification(clientName: String, requestID: String) {
         let content = UNMutableNotificationContent()
-        content.title = "🔐 Authorization Request"
-        content.body = "\"\(clientName)\" wants to control this device.\nLong press to Allow or Deny"
+        content.title = L10n.t(.authRequestTitle)
+        content.body = String(format: L10n.t(.authRequestBody), clientName)
         content.sound = .default
         content.categoryIdentifier = Self.authCategoryID
 
@@ -1074,8 +1074,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 self.clearRemoteFailedNotification()
                 if announceSuccess || recovering {
                     self.sendNotification(
-                        title: "🟢 iCTRL Server Ready",
-                        body: "Running on \(address):\(portNum) (remote access)\nLong press to Disable Remote or Stop Server",
+                        title: L10n.t(.serverReadyTitle),
+                        body: "\(address):\(portNum)\n" + L10n.t(.longPressDisableOrStop),
                         category: Self.serverRemoteCategoryID
                     )
                 }
@@ -1086,8 +1086,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 if !wasFailed {
                     self.reportedRemoteFailure = true
                     self.sendNotification(
-                        title: "🔴 Remote Access Failed",
-                        body: "iCTRL is listening but \(address):\(portNum) can't be reached — likely the Local Network permission. Open the iCTRL app once and allow Local Network, then reconnect. (localhost still works.)",
+                        title: L10n.t(.remoteFailedTitle),
+                        body: String(format: L10n.t(.remoteFailedBody), "\(address):\(portNum)"),
                         identifier: Self.remoteFailedNotifID
                     )
                 }
