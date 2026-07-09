@@ -1,21 +1,21 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pillow"]
+# dependencies = []
 # ///
 """
 iCTRL GUI — a minimal live viewer + input passthrough for the iCTRL phone
 automation service.
 
 Run with uv (gives a modern Python with Tk 8.6 — needed for base64-PNG decode):
-    uv run tools/ictrl_gui.py --host 10.1.1.43:8200 --token <token>
+    uv run tools/ictrl_gui.py --host <host:port> --token <token>
 (uv reads the inline PEP 723 header above; no venv/deps setup needed.)
 
 - Connect to an iCTRL host (host:port). The auth TOKEN is provided by the caller
   (a --token CLI arg or the token field in the UI) — this tool does NOT read the
   token cache file; per the iCTRL SKILL, the token lives at ~/.ictrl/token.json,
   so callers can pass it in, e.g.:
-      /usr/bin/python3 tools/ictrl_gui.py --host 10.1.1.43:8200 \\
+      /usr/bin/python3 tools/ictrl_gui.py --host <host:port> \\
           --token "$(python3 -c 'import json;print(json.load(open(__import__("os").path.expanduser("~/.ictrl/token.json")))["token"])')"
   If no token is given, use the "Authorize" button to grant one on the device.
 - Poll the device screen at a fixed frame rate (default 1 Hz) and show it.
@@ -31,7 +31,7 @@ Run with uv (gives a modern Python with Tk 8.6 — needed for base64-PNG decode)
 
 Zero third-party deps: uses only the Python standard library (tkinter + urllib).
 Tkinter's PhotoImage decodes PNG natively on Tk 8.6+, so no Pillow is needed —
-which is why we run under uv (its Python ships Tk 8.6); the macOS system Python
+uv gives a Tk 8.6 Python; the macOS system Python
 is Tk 8.5 and can't decode a base64 PNG.
 """
 
@@ -58,10 +58,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import urllib.request
 import urllib.error
-from io import BytesIO
-from PIL import Image, ImageTk  # smooth (LANCZOS) scaling; uv installs it
 
-DEFAULT_HOST = "10.1.1.43:8200"
+# Generic default — not a specific device. Override with --host or the UI field.
+DEFAULT_HOST = "127.0.0.1:8200"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -378,29 +377,36 @@ class App:
         b64 = shot.get("data", "")
         if not b64:
             return
-        # Decode the PNG off the Tk thread (heavier work), then hand the PIL image
-        # to _render on the Tk thread for smooth scaling + display.
+        # Render with tkinter's native PhotoImage (Tk 8.6 decodes base64 PNG). We
+        # deliberately DON'T use Pillow's ImageTk here: under uv's standalone
+        # Python its _imagingtk C extension isn't registered with our Tk
+        # ("invalid command name PyImagingPhoto"), so ImageTk.PhotoImage fails.
+        self.root.after(0, lambda: self._render(b64))
+
+    def _render(self, b64):
         try:
-            import base64 as _b64
-            pil = Image.open(BytesIO(_b64.b64decode(b64)))
-            pil.load()
+            img = tk.PhotoImage(data=b64)
         except Exception as e:
             self.set_status(f"decode error: {e}", "#f33")
             return
-        self.root.after(0, lambda: self._render(pil))
-
-    def _render(self, pil):
-        cw = self.canvas.winfo_width() or pil.width
-        ch = self.canvas.winfo_height() or pil.height
-        # Fit-to-window preserving aspect, with SMOOTH (LANCZOS) scaling — up or
-        # down — so the phone screen is crisp at any window size (no integer-only
-        # subsampling artifacts).
-        ratio = min(cw / pil.width, ch / pil.height)
-        dw, dh = max(1, int(pil.width * ratio)), max(1, int(pil.height * ratio))
-        resized = pil.resize((dw, dh), Image.LANCZOS) if (dw, dh) != (pil.width, pil.height) else pil
-        self._img = ImageTk.PhotoImage(resized)
-        # canvas px per IMAGE pixel — image pixels == screenshot pixels (pix_w/h)
-        self.disp_scale = dw / pil.width
+        # winfo_width() is 1 (not 0) before the canvas is laid out — guard with a
+        # threshold, else scaling collapses and the image renders ~invisible.
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw <= 1: cw = img.width()
+        if ch <= 1: ch = img.height()
+        # Fit-to-window with integer subsampling (PhotoImage only scales by whole
+        # factors). Quality=2 gives a full-res source so the down-scaled result is
+        # still crisp.
+        factor = 1
+        while (img.width() // (factor + 1)) >= 1 and (
+                img.width() / factor > cw or img.height() / factor > ch):
+            factor += 1
+        img = img.subsample(factor) if factor > 1 else img
+        dw, dh = img.width(), img.height()
+        self._img = img
+        # canvas px per IMAGE pixel = 1/factor (subsample shrinks by whole factors)
+        self.disp_scale = 1.0 / factor
         self.img_x0 = max(0, (cw - dw) // 2)
         self.img_y0 = max(0, (ch - dh) // 2)
         self.canvas.delete("all")
