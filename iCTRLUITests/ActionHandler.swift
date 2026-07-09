@@ -737,6 +737,18 @@ class ActionHandler {
         return false
     }
 
+    /// Advisory keyboard-focus warning, computed AFTER the text has been
+    /// synthesized. Best-effort and cheap: a single keyboards.count probe on the
+    /// foreground app (the cross-app SpringBoard probe is skipped — it's the
+    /// slowest and this is only for a soft hint, never to block or fail typing).
+    private func keyboardWarningAfterType() -> String? {
+        let bid = resolveForegroundBundleId()
+        let target: XCUIApplication = bid.map { XCUIApplication(bundleIdentifier: $0) } ?? app
+        if target.keyboards.count > 0 { return nil }
+        return "Could not confirm a focused text field / visible keyboard (detection can't see all keyboards). " +
+            "If the text didn't appear, tap a real textfield first (find_element{element_type:\"textfield\"} → tap{ref}), wait ~1s, then type again. A home-screen 'search bar' is often a button that opens a separate search page."
+    }
+
     private func typeText(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         let clearFirst = cmd.clear == true
         // text is optional when clear:true (type{clear:true} just empties the field).
@@ -757,27 +769,24 @@ class ActionHandler {
         // clear:true empties the field before typing (tap to focus first, above).
         if clearFirst { clearFocusedField() }
 
-        // Focus check is a SOFT signal only — keyboard detection can't see
-        // third-party keyboards, so we must NOT block typing on it (that produced
-        // false "no keyboard" errors even when the keyboard was clearly up). We
-        // type regardless and, if we couldn't confirm a keyboard, attach a warning
-        // so the caller verifies the text landed (e.g. screenshot after).
-        let keyboardConfirmed = hasKeyboardFocus()
-        let focusWarning = keyboardConfirmed ? nil :
-            "Could not confirm a focused text field / visible keyboard (detection can't see all keyboards). " +
-            "If the text didn't appear, tap a real textfield first (find_element{element_type:\"textfield\"} → tap{ref}), wait ~1s, then type again. A home-screen 'search bar' is often a button that opens a separate search page."
-
         // submit:true appends a Return/Search keystroke so the field's action
         // (search/go/send) fires — synthesized text alone often doesn't trigger it.
         let submit = cmd.submit == true
 
+        // NOTE: keyboard detection (hasKeyboardFocus) is a SOFT warning only, and
+        // its keyboards.count queries wait for quiescence — on a live/animating
+        // page (e.g. char-by-char typing) they can block until the 6s RPC watchdog
+        // fires, making a SUCCESSFUL type look like a timeout. So we do NOT probe
+        // the keyboard before typing. Synthesize first (the actual input), return
+        // immediately, and only then do a best-effort keyboard check for the
+        // advisory warning — computed AFTER the text is already in.
         if cmd.fast == true {
             let r = fastHandler.fastTypeText(text)
             if submit, r.1 == nil { sendReturnKey() }
             if var data = r.0 {
                 let prefix = clearFirst ? "Cleared then typed: " : "Typed: "
                 data["message"] = .string(text.isEmpty && clearFirst ? "Cleared focused field" : (prefix + text + (submit ? " + Return" : "")))
-                if let w = focusWarning { data["warning"] = .string(w) }
+                if let w = keyboardWarningAfterType() { data["warning"] = .string(w) }
                 return (data, r.1)
             }
             return r
@@ -794,7 +803,7 @@ class ActionHandler {
             let prefix = clearFirst ? "Cleared then typed: " : "Typed: "
             let msg = text.isEmpty && clearFirst ? "Cleared focused field" : (prefix + text + (submit ? " + Return" : ""))
             var out: [String: JSONValue] = ["message": .string(msg)]
-            if let w = focusWarning { out["warning"] = .string(w) }
+            if let w = keyboardWarningAfterType() { out["warning"] = .string(w) }
             return (out, nil)
         } catch {
             let guidance = focusedByTap
