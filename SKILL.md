@@ -21,6 +21,8 @@ On subsequent runs, **before calling `/auth`**: read `~/.ictrl/token.json`, and 
 
 Full machine-readable method list + parameters + guidance: **`GET /schema`** (JSON). This SKILL is the how; `/schema` is the exact what (method names, params, return shapes). Method set can change — trust `/schema` for the current list.
 
+**Capability negotiation.** `/schema` includes `protocol_version` and `capabilities`. v1 = Bearer-token plaintext only (`/auth` + `/rpc`). v2 = also an encrypted channel (`/pair` + `/rpc/secure`, Curve25519 ECDH + AES-GCM, with an ADB-style fingerprint confirmation on the device). The plaintext Bearer path always works on any version, so a client that doesn't upgrade keeps working; a client that wants encryption reads `capabilities.auth_encrypted` and, if true, pairs via `/pair` (see tools/ictrl_secure.py). Older servers without the field → treat as v1 (plaintext).
+
 ## The golden rules (this is where speed comes from)
 
 Most automation is slow because of three anti-patterns. Avoid them:

@@ -289,9 +289,24 @@ struct RPCMethodRegistry {
 
     /// A self-describing document for models: top-level guidance + methods.
     /// Returned from GET /schema and GET / (Accept: application/json).
+    /// Server capability/protocol version. Clients read this from /schema to
+    /// negotiate: v1 = Bearer-token plaintext only; v2 = also the Curve25519
+    /// encrypted channel (/pair + /rpc/secure). Bump when the wire capabilities
+    /// change so clients can auto-detect what the server supports.
+    static let protocolVersion = 2
+
     static func generateSchemaDocument() -> [String: Any] {
         [
             "protocol": "JSON-RPC 2.0",
+            // Capability version — clients negotiate against this. v1: Bearer only.
+            // v2: Bearer (plaintext, always available) + Curve25519 encrypted
+            // channel. Older/plaintext clients keep working on any version.
+            "protocol_version": protocolVersion,
+            "capabilities": [
+                "auth_bearer": true,                         // /auth + /rpc (plaintext) — always
+                "auth_encrypted": protocolVersion >= 2,      // /pair + /rpc/secure (Curve25519)
+                "encryption": (protocolVersion >= 2 ? "x25519-ecdh+hkdf-sha256+aes-256-gcm" : "") as Any,
+            ] as [String: Any],
             "endpoints": [
                 "skill": "GET /skill — START HERE. The operating manual in Skill (Markdown) format; read it ONCE to learn the fast-path workflow and best practices, then treat iCTRL as a Skill.",
                 "auth": "POST /auth  {client_name} → {token}. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. Returns 403 if denied.",

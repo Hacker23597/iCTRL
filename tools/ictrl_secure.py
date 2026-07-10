@@ -122,9 +122,32 @@ class SecureClient:
         except urllib.error.HTTPError as e:
             return json.loads(e.read().decode())
 
+    # ---- capability negotiation ----
+    def server_info(self):
+        """Read GET /schema → {protocol_version, capabilities, ...}."""
+        req = urllib.request.Request(self.base + "/schema",
+                                     headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
+
+    def supports_encryption(self):
+        """True if the server advertises the encrypted channel (protocol v2+).
+        A v1 server (or one without the field) → fall back to Bearer /auth."""
+        try:
+            info = self.server_info()
+        except Exception:
+            return False
+        if info.get("capabilities", {}).get("auth_encrypted"):
+            return True
+        return int(info.get("protocol_version", 1)) >= 2
+
     # ---- pairing ----
     def pair(self, client_name="ictrl secure client"):
         """One-time pairing. BLOCKS until the user confirms on the device."""
+        if not self.supports_encryption():
+            raise RuntimeError(
+                "this server does not support the encrypted channel (protocol_version < 2). "
+                "Use the plaintext Bearer flow (POST /auth) instead.")
         print(f"Pairing… confirm on the device. Your key fingerprint: {self.fingerprint(self._pub_raw)}",
               file=sys.stderr)
         res = self._post("/pair", {"client_name": client_name,
