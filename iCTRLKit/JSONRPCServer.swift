@@ -248,6 +248,12 @@ class JSONRPCServer {
         case ("GET", "/stream"), ("GET", "/stream.ts"):
             handleVideoStream(headers: headers, query: query, connection: connection)
 
+        case ("GET", "/remote"):
+            // The page itself is unauthenticated (it needs to load so the user can
+            // paste a token). The RPC + stream calls it makes are authenticated.
+            sendHTTPResponse(connection: connection, status: 200,
+                             contentType: "text/html; charset=utf-8", body: RemoteHTML.page)
+
         // Logs can contain sensitive context even when redacted, so they now
         // require a valid bearer token — same as /rpc.
         case ("GET", "/logs/files"):
