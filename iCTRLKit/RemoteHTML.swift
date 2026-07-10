@@ -13,22 +13,16 @@ import Foundation
 /// The page uses the SAME token as /rpc (it's the query token passed by the
 /// user when they open /remote?token=…) and re-uses it on every RPC call.
 enum RemoteHTML {
-    /// Full HTML for GET /remote, with mpegts.js inlined so the page has no
-    /// external network dependency (fully self-contained: CSS, JS, decoder).
-    static var page: String { pageHead + MpegtsJS.source + pageBody }
-
-    private static let pageHead: String = #"""
+    /// Full HTML for GET /remote. The stream is fragmented MP4 (`Content-Type:
+    /// video/mp4`) via MSE — every major browser decodes it natively, so this
+    /// page has zero JS decoder dependency.
+    static let page: String = #"""
 <!doctype html>
 <html lang="en" class="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>iCTRL Remote</title>
-<script>
-"""#
-
-    private static let pageBody: String = #"""
-</script>
 <style>
   /* ── shadcn-inspired tokens (dark) ── */
   :root {
@@ -607,13 +601,11 @@ enum RemoteHTML {
       try { localStorage.setItem(STORE_KEY, token); } catch (_) {}
     } catch (err) { setStatus('rpc: ' + err.message, 'err'); return; }
 
-    // mpegts.js is bundled inline; this guards against an accidental strip.
-    if (!window.mpegts) {
-      setStatus('mpegts.js not available (bundle stripped?)', 'err');
-      return;
-    }
-    if (!mpegts.isSupported()) {
-      setStatus('mpegts.js not supported in this browser (needs MSE)', 'err');
+    // Native MSE — Chrome / Firefox / Edge / Safari all support fMP4 via
+    // MediaSource. No JS decoder library needed.
+    if (!('MediaSource' in window) ||
+        !MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01F"')) {
+      setStatus('browser lacks MSE + H.264 support', 'err');
       return;
     }
 
@@ -621,53 +613,13 @@ enum RemoteHTML {
     const verbose = verboseChk?.checked ? '&verbose=1' : '';
     const src = `/stream?token=${encodeURIComponent(token)}&fps=${fps}${verbose}`;
 
-    // NOTE: no preflight fetch — the /stream endpoint is a single-client-
-    // per-connection push, so opening a second GET (even briefly) would
-    // spin the encoder up/down and confuse the real player. Trust the
-    // player's own error events instead.
-
-    if (player) { try { player.destroy(); } catch(_){} player = null; }
-    player = mpegts.createPlayer({ type: 'mpegts', isLive: true, url: src }, {
-      // We want minimal end-to-end latency for a control UI:
-      // - stashBuffer OFF: don't hold frames waiting for a batch to fill; at
-      //   2–5 fps the previous 128 KB stash added ~3 s of built-in delay.
-      // - liveBufferLatencyChasing ON with a small window so if playback ever
-      //   falls behind (tab was backgrounded, tap RPC blocked the encoder…)
-      //   we skip forward to the newest frame instead of catching up in slow
-      //   motion.
-      enableStashBuffer: false,
-      lazyLoad: false,
-      liveBufferLatencyChasing: true,
-      liveBufferLatencyMaxDelay: 0.6,
-      liveBufferLatencyChasingOnPaused: true,
-      autoCleanupSourceBuffer: true,
-      autoCleanupMaxBackwardDuration: 3,
-      autoCleanupMinBackwardDuration: 2,
+    // Tear any previous MSE + fetch down before starting a new one.
+    if (player) { try { player.stop(); } catch(_){} player = null; }
+    player = mseFragmentPlayer(video, src, {
+      onOpen: (info) => setStatus(`streaming` + (info?.mime ? ` (${info.mime})` : ''), 'ok'),
+      onError: (msg) => setStatus('stream: ' + msg, 'err'),
     });
-    // Best-effort: keep <video> playback rate slightly ahead of real time so
-    // small stalls don't accumulate.
-    video.playbackRate = 1.0;
-    // Surface mpegts / MSE errors so the user isn't stuck on a black screen.
-    player.on(mpegts.Events.ERROR, (type, detail, info) => {
-      console.error('mpegts error', type, detail, info);
-      setStatus(`stream: ${type} ${detail||''}`, 'err');
-    });
-    player.on(mpegts.Events.MEDIA_INFO, (info) => {
-      console.log('media info', info);
-      setStatus(`streaming ${info.width||'?'}×${info.height||'?'}`, 'ok');
-    });
-    player.on(mpegts.Events.STATISTICS_INFO, (s) => {
-      // First few chunks are useful to confirm data actually flows.
-      if (s.decodedFrames < 3) console.log('mpegts stats', s);
-    });
-    video.addEventListener('error', () => {
-      const e = video.error;
-      if (e) setStatus(`video: ${e.code} ${e.message||''}`, 'err');
-    }, { once: false });
-
-    player.attachMediaElement(video);
-    player.load();
-    try { await video.play(); } catch (err) {
+    try { await video.play(); } catch (_) {
       setStatus('autoplay blocked — click the video', 'err');
     }
     connectBtn.disabled = true; stopBtn.disabled = false;
@@ -675,10 +627,80 @@ enum RemoteHTML {
     overlay.focus();
   }
   function stop() {
-    if (player) { try { player.destroy(); } catch(_){} player = null; }
+    if (player) { try { player.stop(); } catch(_){} player = null; }
     connectBtn.disabled = false; stopBtn.disabled = true;
     setStatus('stopped');
     hudDot.className = 'dot off';
+  }
+
+  // --- Minimal fMP4-over-HTTP MSE player -------------------------------
+  // Streams the /stream endpoint via fetch(), pumps chunks into an
+  // SourceBuffer as they arrive. Init segment (ftyp+moov) comes first
+  // and MSE picks up the codec automatically; each subsequent moof+mdat
+  // fragment shows on <video> within one frame time.
+  function mseFragmentPlayer(videoEl, url, { onOpen, onError }) {
+    const ms = new MediaSource();
+    videoEl.src = URL.createObjectURL(ms);
+    const ac = new AbortController();
+    let sb = null;
+    const queue = [];      // pending Uint8Arrays waiting for updateend
+    let running = true;
+
+    function pump() {
+      if (!running || !sb || sb.updating || queue.length === 0) return;
+      try { sb.appendBuffer(queue.shift()); }
+      catch (err) { onError?.(err.message); running = false; ac.abort(); }
+    }
+
+    ms.addEventListener('sourceopen', async () => {
+      // Baseline is what our VT encoder emits (kVTProfileLevel_H264_Baseline).
+      // 42E0 = Baseline profile + no constraint set + level auto — the level
+      // byte is placeholder; MSE only checks the profile/constraint prefix.
+      const mime = 'video/mp4; codecs="avc1.42E01F"';
+      sb = ms.addSourceBuffer(mime);
+      sb.mode = 'segments';
+      sb.addEventListener('updateend', () => {
+        pump();
+        // Keep the buffered window short so backgrounded tabs don't accumulate.
+        try {
+          if (videoEl.buffered.length && videoEl.currentTime - videoEl.buffered.start(0) > 4) {
+            sb.remove(0, videoEl.currentTime - 2);
+          }
+        } catch (_) {}
+        // Chase live: if the player has fallen more than 0.6s behind, jump.
+        try {
+          const end = videoEl.buffered.end(videoEl.buffered.length - 1);
+          if (end - videoEl.currentTime > 0.6) videoEl.currentTime = end - 0.1;
+        } catch (_) {}
+      });
+      onOpen?.({ mime });
+
+      let resp;
+      try {
+        resp = await fetch(url, { signal: ac.signal });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      } catch (err) {
+        if (err.name !== 'AbortError') onError?.(err.message);
+        return;
+      }
+      const reader = resp.body.getReader();
+      while (running) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        queue.push(value); pump();
+      }
+    });
+
+    ms.addEventListener('sourceclose', () => { running = false; });
+
+    return {
+      stop() {
+        running = false;
+        try { ac.abort(); } catch (_) {}
+        try { if (ms.readyState === 'open') ms.endOfStream(); } catch (_) {}
+        try { URL.revokeObjectURL(videoEl.src); } catch (_) {}
+      },
+    };
   }
   connectBtn.addEventListener('click', connect);
   stopBtn.addEventListener('click', stop);

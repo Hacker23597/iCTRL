@@ -52,18 +52,28 @@ final class VideoBroadcaster {
     static var verbose: Bool = false
 
     private let queue = DispatchQueue(label: "com.openminis.ictrl.video.broadcast")
-    private var subscribers: [ObjectIdentifier: (Data) -> Void] = [:]
+    /// Each subscriber holds a sink + whether it's already received the fMP4
+    /// init segment (`ftyp`+`moov`). The muxer emits init once per encoder
+    /// lifetime; new subscribers get the cached copy when they join.
+    private struct Subscriber {
+        let sink: (Data) -> Void
+        var inited: Bool
+    }
+    private var subscribers: [ObjectIdentifier: Subscriber] = [:]
     private var grabFrame: (() -> UIImage?)?
     private var fps: Double = 2
 
     private var timer: DispatchSourceTimer?
     private var session: VTCompressionSession?
-    private var muxer: TSMuxer?
+    private var muxer: FMP4Muxer?
+    /// Cached fMP4 init segment (ftyp+moov) — sent to every new subscriber.
+    /// Built after the first keyframe (that's when we know SPS/PPS).
+    private var initSegment: Data?
     private var width = 0, height = 0
     private var frameIndex: Int64 = 0
-    /// Cached SPS/PPS from the format description so a client joining mid-stream
-    /// (and each keyframe) gets parameter sets.
-    private var parameterSets: [Data] = []
+    /// Cached SPS/PPS captured from the first keyframe's format description.
+    private var sps: Data = Data()
+    private var pps: Data = Data()
 
     // Rolling stats — printed every ~5s even without verbose, so operators see
     // encoder health without opting in to per-frame spam.
@@ -95,12 +105,24 @@ final class VideoBroadcaster {
     }
 
     /// Subscribe a sink (a per-connection sender). Starts the encoder if it's the
-    /// first subscriber. Returns a token used to unsubscribe.
+    /// first subscriber. Late joiners get the cached init segment automatically
+    /// and then receive fragments from the next keyframe onward.
     func subscribe(_ sink: @escaping (Data) -> Void, token: ObjectIdentifier) {
         queue.async {
             let wasEmpty = self.subscribers.isEmpty
-            self.subscribers[token] = sink
+            var sub = Subscriber(sink: sink, inited: false)
+            // If the encoder is already up and we have an init segment,
+            // deliver it immediately so the browser can start MSE right away.
+            if let seg = self.initSegment {
+                sink(seg); sub.inited = true
+            }
+            self.subscribers[token] = sub
             if wasEmpty { self.startEncoding() }
+            else if self.initSegment == nil {
+                // Encoder is running but hasn't produced a keyframe yet —
+                // ask for one so the new subscriber gets going quickly.
+                self.captureAndEncode(forceKeyframe: true)
+            }
         }
     }
 
@@ -130,7 +152,11 @@ final class VideoBroadcaster {
         }
         width = cg.width; height = cg.height
         guard setupEncoder(width: width, height: height) else { return }
-        muxer = TSMuxer()
+        // muxer is built lazily on the first keyframe (that's when we know
+        // SPS/PPS). initSegment is filled in the same place.
+        muxer = nil
+        initSegment = nil
+        sps = Data(); pps = Data()
         frameIndex = 0
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: 1.0 / fps)
@@ -144,7 +170,10 @@ final class VideoBroadcaster {
         timer?.cancel(); timer = nil
         if let s = session { VTCompressionSessionInvalidate(s); session = nil }
         muxer = nil
-        parameterSets = []
+        initSegment = nil
+        sps = Data(); pps = Data()
+        // Existing subscribers will need a new init segment; mark them uninited.
+        for token in subscribers.keys { subscribers[token]?.inited = false }
         // Reset rolling stats so the next run doesn't average across a restart.
         statsStartAt = 0; statsFrames = 0
         statsCaptureMs = 0; statsPixbufMs = 0
@@ -205,8 +234,17 @@ final class VideoBroadcaster {
         statsKeyframes = 0; statsDrops = 0
     }
 
-    private func fanout(_ data: Data) {
-        for sink in subscribers.values { sink(data) }
+    /// Fan out a fragment. Any subscriber that hasn't seen the init segment
+    /// yet gets it prepended (rare — normally handled in subscribe()).
+    private func fanout(_ fragment: Data) {
+        guard let init_ = initSegment else { return }
+        for (token, sub) in subscribers {
+            if !sub.inited {
+                sub.sink(init_)
+                subscribers[token]?.inited = true
+            }
+            sub.sink(fragment)
+        }
     }
 
     // MARK: VideoToolbox
@@ -258,34 +296,57 @@ final class VideoBroadcaster {
     }
 
     private func handleEncoded(_ sb: CMSampleBuffer, metric: FrameMetric?) {
-        guard let muxer = muxer else { return }
         let tEncDone = CACurrentMediaTime()
         let notSync = (CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
             as? [[CFString: Any]])?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
         let isKeyframe = !notSync
 
-        var nalus: [Data] = []
-        var vclBytes = 0
-        if isKeyframe {
-            if parameterSets.isEmpty, let fmt = CMSampleBufferGetFormatDescription(sb) {
-                parameterSets = extractParameterSets(from: fmt)
+        // On the first keyframe we capture SPS/PPS from the format description
+        // and build the fMP4 muxer + init segment. Fragments before that are
+        // useless (no init segment → browser can't decode them) so we drop them.
+        if isKeyframe, muxer == nil {
+            if let fmt = CMSampleBufferGetFormatDescription(sb) {
+                let sets = extractParameterSets(from: fmt)
+                if let s = sets.first(where: { $0.first.map { ($0 & 0x1F) == 7 } ?? false }) { sps = s }
+                if let p = sets.first(where: { $0.first.map { ($0 & 0x1F) == 8 } ?? false }) { pps = p }
+                if !sps.isEmpty, !pps.isEmpty {
+                    muxer = FMP4Muxer(width: width, height: height, sps: sps, pps: pps)
+                    initSegment = muxer?.initSegment()
+                    log("fMP4 init built (\(initSegment?.count ?? 0) B)")
+                }
             }
-            nalus.append(contentsOf: parameterSets)
         }
+        guard let muxer = muxer, initSegment != nil else {
+            queue.async { self.statsDrops += 1 }
+            return
+        }
+
+        // Collect VCL NALs (skip SPS/PPS — they're in the init segment already).
+        var vclNalus: [Data] = []
+        var vclBytes = 0
         if let block = CMSampleBufferGetDataBuffer(sb) {
             var lenAt = 0, total = 0; var ptr: UnsafeMutablePointer<Int8>?
             if CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: &lenAt,
                                            totalLengthOut: &total, dataPointerOut: &ptr) == noErr, let p = ptr {
                 let extracted = annexBNalus(fromAVCC: p, length: total)
-                vclBytes = extracted.reduce(0) { $0 + $1.count }
-                nalus.append(contentsOf: extracted)
+                for n in extracted where !n.isEmpty {
+                    let type = n[0] & 0x1F
+                    // 7 = SPS, 8 = PPS, 9 = AUD. All belong out-of-band in fMP4.
+                    if type == 7 || type == 8 || type == 9 { continue }
+                    vclBytes += n.count
+                    vclNalus.append(n)
+                }
             }
         }
-        guard !nalus.isEmpty else { return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sb)
-        let tsData = muxer.package(nalus: nalus, pts: pts, keyframe: isKeyframe)
+        guard !vclNalus.isEmpty else { return }
+
+        // Fragment duration in the muxer's 90 kHz timescale.
+        let durationTicks = UInt32(max(1, Int(90_000.0 / fps)))
+        let fragData = muxer.fragment(nalus: vclNalus,
+                                      durationTicks: durationTicks,
+                                      keyframe: isKeyframe)
         let tMuxDone = CACurrentMediaTime()
-        fanout(tsData)
+        fanout(fragData)
 
         // Timing bookkeeping. Runs on the encoder's callback thread; hop back
         // to the private queue to touch the accumulators safely.
@@ -297,14 +358,14 @@ final class VideoBroadcaster {
             self.statsPixbufMs += metric?.pixbufMs ?? 0
             self.statsEncodeMs += encodeMs
             self.statsMuxMs += muxMs
-            self.statsBytes += tsData.count
+            self.statsBytes += fragData.count
             if isKeyframe { self.statsKeyframes += 1 }
             if Self.verbose {
                 self.log(String(format: "f#%d %@ cap %.1f pb %.1f enc %.1f mux %.1f — vcl %d B → ts %d B (%d subs)",
                                 metric?.index ?? -1,
                                 isKeyframe ? "IDR" : "P",
                                 metric?.captureMs ?? 0, metric?.pixbufMs ?? 0,
-                                encodeMs, muxMs, vclBytes, tsData.count, self.subscribers.count))
+                                encodeMs, muxMs, vclBytes, fragData.count, self.subscribers.count))
             }
             self.maybeFlushStats()
         }
@@ -381,7 +442,7 @@ final class VideoStreamer: Hashable {
         self.onStop = onStop
         let header = """
         HTTP/1.1 200 OK\r
-        Content-Type: video/mp2t\r
+        Content-Type: video/mp4\r
         Cache-Control: no-cache, no-store\r
         Connection: close\r
         Access-Control-Allow-Origin: *\r
