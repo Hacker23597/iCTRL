@@ -633,25 +633,65 @@ enum RemoteHTML {
   }
 
   // --- Minimal fMP4-over-HTTP MSE player -------------------------------
-  // Streams the /stream endpoint via fetch(), pumps chunks into an
-  // SourceBuffer as they arrive. The server's response carries the real
-  // codec string (profile/constraint/level derived from the SPS) in the
-  // X-Codec header — using it verbatim is mandatory: a mismatched profile
-  // makes MSE silently reject every appendBuffer and the video stays black.
+  // Streams /stream via fetch, pumps chunks into a SourceBuffer.
+  //
+  // Design notes (learned the hard way — see git log):
+  //
+  //  1) `sb.updating` covers BOTH appendBuffer and remove. Doing them
+  //     back-to-back in the same updateend handler would set `updating`
+  //     again and the next pump() sees updating=true → nothing appends.
+  //     If the following updateend also fires remove, pump is starved
+  //     forever. Fix: a single state machine drives one op at a time
+  //     (append preferred over cleanup) and every updateend re-enters
+  //     it.
+  //
+  //  2) Setting `videoEl.currentTime` while `sb.updating === true` is
+  //     illegal → InvalidStateError. Do the seek only from tick(), not
+  //     from updateend.
+  //
+  //  3) The server's X-Codec header carries the REAL profile/level
+  //     from the SPS. Guessing (avc1.42E01F) makes MSE silently
+  //     reject appends and the picture stays black.
   function mseFragmentPlayer(videoEl, url, { onOpen, onError }) {
     const ms = new MediaSource();
     videoEl.src = URL.createObjectURL(ms);
     const ac = new AbortController();
     let sb = null;
-    const queue = [];      // pending Uint8Arrays waiting for updateend
+    const queue = [];              // pending Uint8Arrays
     let running = true;
     let sourceOpen = false;
     let pendingCodec = null;
+    let removePending = false;     // set by maintenance, cleared in tick
 
-    function pump() {
-      if (!running || !sb || sb.updating || queue.length === 0) return;
-      try { sb.appendBuffer(queue.shift()); }
-      catch (err) { onError?.(err.message); running = false; ac.abort(); }
+    function reportError(where, err) {
+      const msg = (err && err.name === 'QuotaExceededError')
+        ? 'MSE buffer full' : (err?.message || where);
+      onError?.(where + ': ' + msg);
+    }
+
+    // Single serialized state machine. Called after every updateend, after
+    // every new chunk, and from a rescue watchdog. It picks the next legal
+    // action and does exactly one of them.
+    function tick() {
+      if (!running || !sb || sb.updating) return;
+      // 1) Drain the append queue first — never let bytes stall.
+      if (queue.length) {
+        try { sb.appendBuffer(queue.shift()); }
+        catch (err) { reportError('append', err); running = false; ac.abort(); }
+        return;
+      }
+      // 2) Trim old data when the window grows past ~4 s behind currentTime.
+      if (removePending) {
+        removePending = false;
+        try {
+          if (videoEl.buffered.length) {
+            const start = videoEl.buffered.start(0);
+            const cutoff = Math.max(start, videoEl.currentTime - 2);
+            if (cutoff - start > 0.5) sb.remove(start, cutoff);
+          }
+        } catch (_) {}
+        return;
+      }
     }
 
     function attachSourceBuffer(codec) {
@@ -662,20 +702,8 @@ enum RemoteHTML {
       }
       sb = ms.addSourceBuffer(mime);
       sb.mode = 'segments';
-      sb.addEventListener('updateend', () => {
-        pump();
-        // Keep the buffered window short so backgrounded tabs don't accumulate.
-        try {
-          if (videoEl.buffered.length && videoEl.currentTime - videoEl.buffered.start(0) > 4) {
-            sb.remove(0, videoEl.currentTime - 2);
-          }
-        } catch (_) {}
-        // Chase live: if the player has fallen more than 0.6s behind, jump.
-        try {
-          const end = videoEl.buffered.end(videoEl.buffered.length - 1);
-          if (end - videoEl.currentTime > 0.6) videoEl.currentTime = end - 0.1;
-        } catch (_) {}
-      });
+      sb.addEventListener('updateend', tick);
+      sb.addEventListener('error', (e) => reportError('sourceBuffer', e));
       onOpen?.({ mime });
       return true;
     }
@@ -683,12 +711,41 @@ enum RemoteHTML {
     function maybeStart() {
       if (sourceOpen && pendingCodec && !sb) {
         if (!attachSourceBuffer(pendingCodec)) return;
-        pump();
+        tick();
       }
     }
 
     ms.addEventListener('sourceopen', () => { sourceOpen = true; maybeStart(); });
     ms.addEventListener('sourceclose', () => { running = false; });
+
+    // Watchdog: every 500 ms, mark old data for removal + chase live if the
+    // player drifted more than 0.6 s behind the buffered edge. Both are done
+    // OUTSIDE updateend so they can't compete with the append pipeline.
+    const watchdog = setInterval(() => {
+      if (!running || !sb) return;
+      // Live chase — only safe when sb is idle.
+      if (!sb.updating) {
+        try {
+          const bl = videoEl.buffered.length;
+          if (bl) {
+            const end = videoEl.buffered.end(bl - 1);
+            if (end - videoEl.currentTime > 0.6) {
+              videoEl.currentTime = end - 0.1;
+            }
+          }
+        } catch (_) {}
+      }
+      // Ask tick to remove a chunk next time it's idle.
+      try {
+        if (videoEl.buffered.length &&
+            videoEl.currentTime - videoEl.buffered.start(0) > 4) {
+          removePending = true;
+        }
+      } catch (_) {}
+      // If updateend was somehow missed (shouldn't happen, but observed on
+      // Chrome after long uptime) — force-progress the state machine.
+      tick();
+    }, 500);
 
     (async () => {
       let resp;
@@ -705,16 +762,21 @@ enum RemoteHTML {
 
       const reader = resp.body.getReader();
       while (running) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        // Queue even before sourceOpen so no bytes are dropped.
-        queue.push(value); pump();
+        let value, done;
+        try { ({ value, done } = await reader.read()); }
+        catch (err) {
+          if (err.name !== 'AbortError') onError?.('read: ' + err.message);
+          break;
+        }
+        if (done) { onError?.('stream ended'); break; }
+        queue.push(value); tick();
       }
     })();
 
     return {
       stop() {
         running = false;
+        clearInterval(watchdog);
         try { ac.abort(); } catch (_) {}
         try { if (ms.readyState === 'open') ms.endOfStream(); } catch (_) {}
         try { URL.revokeObjectURL(videoEl.src); } catch (_) {}
