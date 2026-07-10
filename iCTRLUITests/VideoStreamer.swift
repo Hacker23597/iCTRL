@@ -65,6 +65,36 @@ final class VideoBroadcaster {
     private var grabFrame: (() -> UIImage?)?
     private var fps: Double = 2
 
+    /// Encoder quality preset. Controls both the target bitrate (via
+    /// AverageBitRate + DataRateLimits) and the encoding resolution (source
+    /// screenshot is downscaled during pixelBuffer conversion). "auto" leaves
+    /// bitrate unset — VideoToolbox picks a default (what we shipped before).
+    enum Quality: String {
+        case auto, low, medium, high
+        /// Multiplier applied to the source screenshot dimensions before encode.
+        /// Down-scaling saves both encode time and bandwidth quadratically.
+        var scale: Double {
+            switch self {
+            case .low:    return 0.5
+            case .medium: return 0.75
+            case .high, .auto: return 1.0
+            }
+        }
+        /// Target average bitrate in bits/sec at 5 fps. Actual value scales
+        /// with fps so a 10 fps stream isn't starved. `nil` = let VT decide.
+        func targetBitrateAt(fps: Double) -> Int? {
+            let base: Int
+            switch self {
+            case .low:    base = 400_000
+            case .medium: base = 900_000
+            case .high:   base = 1_800_000
+            case .auto:   return nil
+            }
+            return Int(Double(base) * max(0.5, fps / 5.0))
+        }
+    }
+    private var quality: Quality = .auto
+
     private var timer: DispatchSourceTimer?
     private var session: VTCompressionSession?
     private var muxer: FMP4Muxer?
@@ -89,17 +119,21 @@ final class VideoBroadcaster {
     private var statsKeyframes = 0
     private var statsDrops = 0
 
-    /// Configure the frame source + rate. If encoding is already running with a
-    /// different fps, restart the pipeline so the new rate takes effect
-    /// immediately (existing subscribers see a fresh keyframe and continue).
-    func configure(fps: Double, grabFrame: @escaping () -> UIImage?) {
+    /// Configure the frame source + rate + quality. If encoding is already
+    /// running with different parameters, restart the pipeline so the new
+    /// settings take effect immediately (existing subscribers see a fresh
+    /// init segment + keyframe and continue).
+    func configure(fps: Double,
+                   quality: Quality = .auto,
+                   grabFrame: @escaping () -> UIImage?) {
         queue.async {
             let newFps = max(0.5, min(fps, 10))
-            let restart = (self.timer != nil) && (self.fps != newFps)
+            let restart = (self.timer != nil) && (self.fps != newFps || self.quality != quality)
             self.fps = newFps
+            self.quality = quality
             self.grabFrame = grabFrame
             if restart {
-                self.log("fps changed to \(newFps) — restarting encoder")
+                self.log("params changed (fps=\(newFps) quality=\(quality.rawValue)) — restarting encoder")
                 self.stopEncoding()
                 self.startEncoding()
             }
@@ -157,7 +191,11 @@ final class VideoBroadcaster {
             log("no first frame — cannot start encoding (grabFrame returned nil)")
             return
         }
-        width = cg.width; height = cg.height
+        // Downscale target follows the quality preset. Snap to even numbers —
+        // H.264 encoders reject odd dimensions on many profiles.
+        let s = quality.scale
+        width  = max(2, Int(Double(cg.width)  * s) & ~1)
+        height = max(2, Int(Double(cg.height) * s) & ~1)
         guard setupEncoder(width: width, height: height) else { return }
         // muxer is built lazily on the first keyframe (that's when we know
         // SPS/PPS). initSegment is filled in the same place.
@@ -277,6 +315,18 @@ final class VideoBroadcaster {
         let kfInterval = max(1, Int(fps * 2))   // keyframe ~every 2s for quick join
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
                              value: NSNumber(value: kfInterval))
+        // Quality preset → target bitrate. Pair AverageBitRate with a burst
+        // ceiling (1.5× over 1s) so momentary detail spikes don't blow the
+        // stream's bandwidth budget.
+        if let bps = quality.targetBitrateAt(fps: fps) {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
+                                 value: NSNumber(value: bps))
+            let cap: [NSNumber] = [NSNumber(value: Int(Double(bps) * 1.5 / 8)),  // bytes
+                                   NSNumber(value: 1)]                            // per 1 s
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
+                                 value: cap as CFArray)
+            log("bitrate cap \(bps/1000) kbps (quality=\(quality.rawValue))")
+        }
         VTCompressionSessionPrepareToEncodeFrames(session)
         self.session = session
         return true

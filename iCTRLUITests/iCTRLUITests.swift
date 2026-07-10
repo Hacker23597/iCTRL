@@ -699,15 +699,16 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // capture + encode a fresh keyframe instead of waiting for the next
         // 1/fps tick (a full 500 ms at 2 fps).
         srv.onRPCUIChanged = { VideoBroadcaster.shared.nudgeKeyframe() }
-        srv.onVideoStream = { [weak self] connection, fps, verbose in
+        srv.onVideoStream = { [weak self] connection, fps, qualityRaw, verbose in
             guard self != nil else { connection.cancel(); return }
             // Verbose logging is global to the shared broadcaster (all clients
             // share one encoder); last connection wins — good enough for debug.
             VideoBroadcaster.verbose = verbose
+            let quality = VideoBroadcaster.Quality(rawValue: qualityRaw) ?? .auto
             // XCUIScreen.main.screenshot() is a private XCTest API that must run
             // on the main thread — hop over there synchronously from whatever
             // queue the broadcaster ticks on.
-            VideoBroadcaster.shared.configure(fps: fps) {
+            VideoBroadcaster.shared.configure(fps: fps, quality: quality) {
                 if Thread.isMainThread {
                     return XCUIScreen.main.screenshot().image
                 }

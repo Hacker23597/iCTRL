@@ -275,8 +275,11 @@ enum RemoteHTML {
         </div>
         <div>
           <label class="label">Quality</label>
-          <select class="input" id="qSel" disabled title="Encoded server-side">
-            <option>auto</option>
+          <select class="input" id="qSel" title="Bitrate + resolution preset — auto lets VideoToolbox pick.">
+            <option value="auto" selected>auto</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
           </select>
         </div>
       </div>
@@ -343,7 +346,7 @@ enum RemoteHTML {
   // ── DOM ──
   const $ = s => document.querySelector(s);
   const video = $('#video'), stage = $('#stage'), overlay = $('#overlay');
-  const tokenInput = $('#tokenInput'), fpsSel = $('#fpsSel'), verboseChk = $('#verboseChk');
+  const tokenInput = $('#tokenInput'), fpsSel = $('#fpsSel'), qSel = $('#qSel'), verboseChk = $('#verboseChk');
   const connectBtn = $('#connectBtn'), stopBtn = $('#stopBtn');
   const statusText = $('#statusText'), statusDot = $('#statusDotBar');
   const lastAction = $('#lastAction');
@@ -618,8 +621,9 @@ enum RemoteHTML {
     }
 
     const fps = fpsSel.value;
+    const quality = qSel?.value || 'auto';
     const verbose = verboseChk?.checked ? '&verbose=1' : '';
-    const src = `/stream?token=${encodeURIComponent(token)}&fps=${fps}${verbose}`;
+    const src = `/stream?token=${encodeURIComponent(token)}&fps=${fps}&quality=${quality}${verbose}`;
 
     // Tear any previous MSE + fetch down before starting a new one.
     if (player) { try { player.stop(); } catch(_){} player = null; }
@@ -798,6 +802,9 @@ enum RemoteHTML {
   // (broadcaster restarts the encoder at the new rate).
   fpsSel.addEventListener('change', () => {
     if (player) { setStatus(`switching to ${fpsSel.value} fps…`); connect(); }
+  });
+  qSel?.addEventListener('change', () => {
+    if (player) { setStatus(`switching to quality ${qSel.value}…`); connect(); }
   });
   verboseChk?.addEventListener('change', () => {
     if (player) { setStatus(`verbose ${verboseChk.checked ? 'on' : 'off'}…`); connect(); }
