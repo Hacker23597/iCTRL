@@ -17,7 +17,14 @@ enum RemoteHTML {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>iCTRL Remote</title>
-<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"
+        onerror="window.__mpegtsCDNFailed=true"></script>
+<script>
+  // Fallback CDN — some networks block jsdelivr but reach unpkg.
+  if (window.__mpegtsCDNFailed || !window.mpegts) {
+    document.write('<scr' + 'ipt src="https://unpkg.com/mpegts.js@1.7.3/dist/mpegts.js"></scr' + 'ipt>');
+  }
+</script>
 <style>
   /* ── shadcn-inspired tokens (dark) ── */
   :root {
@@ -503,23 +510,60 @@ enum RemoteHTML {
     try {
       deviceInfo = await rpc('device_info');
       hudDevice.textContent = deviceInfo.device_name || 'iPhone';
-    } catch (err) { setStatus(err.message, 'err'); return; }
-    // Start the video player.
-    const fps = fpsSel.value;
-    const src = `/stream?token=${encodeURIComponent(token)}&fps=${fps}`;
-    if (!window.mpegts || !mpegts.isSupported()) {
-      setStatus('mpegts.js unavailable (needs a network to CDN)', 'err');
+    } catch (err) { setStatus('rpc: ' + err.message, 'err'); return; }
+
+    // Check mpegts.js loaded (both CDNs may be blocked on some networks).
+    if (!window.mpegts) {
+      setStatus('mpegts.js failed to load — check network / CDN access', 'err');
       return;
     }
-    if (player) { player.destroy(); player = null; }
+    if (!mpegts.isSupported()) {
+      setStatus('mpegts.js not supported in this browser (needs MSE)', 'err');
+      return;
+    }
+
+    const fps = fpsSel.value;
+    const src = `/stream?token=${encodeURIComponent(token)}&fps=${fps}`;
+
+    // Preflight the stream endpoint: HEAD may be rejected, so do a range GET
+    // and immediately abort — we only need the status code + Content-Type.
+    try {
+      const ac = new AbortController();
+      const r = await fetch(src, { signal: ac.signal, headers: { 'Range': 'bytes=0-0' } });
+      ac.abort();   // don't drain the stream
+      if (r.status === 401 || r.status === 403) throw new Error(`stream auth failed (${r.status})`);
+      if (r.status >= 400) throw new Error(`stream endpoint ${r.status}`);
+      const ct = r.headers.get('content-type') || '';
+      if (!ct.includes('video/mp2t') && !ct.includes('mpeg')) {
+        console.warn('unexpected stream content-type:', ct);
+      }
+    } catch (err) {
+      // AbortError from our own abort is expected — ignore it.
+      if (err.name !== 'AbortError') { setStatus('stream: ' + err.message, 'err'); return; }
+    }
+
+    if (player) { try { player.destroy(); } catch(_){} player = null; }
     player = mpegts.createPlayer({ type: 'mpegts', isLive: true, url: src }, {
       enableStashBuffer: false, lazyLoad: false, liveBufferLatencyChasing: true,
     });
+    // Surface mpegts / MSE errors so the user isn't stuck on a black screen.
+    player.on(mpegts.Events.ERROR, (type, detail, info) => {
+      console.error('mpegts error', type, detail, info);
+      setStatus(`stream: ${type} ${detail}`, 'err');
+    });
+    player.on(mpegts.Events.MEDIA_INFO, () => setStatus('streaming', 'ok'));
+    video.addEventListener('error', () => {
+      const e = video.error;
+      if (e) setStatus(`video: ${e.code} ${e.message||''}`, 'err');
+    }, { once: false });
+
     player.attachMediaElement(video);
     player.load();
-    try { await video.play(); } catch (_) { /* autoplay ok when muted */ }
+    try { await video.play(); } catch (err) {
+      setStatus('autoplay blocked — click the video', 'err');
+    }
     connectBtn.disabled = true; stopBtn.disabled = false;
-    setStatus('connected', 'ok');
+    setStatus('connected — waiting for first frame…', 'ok');
     overlay.focus();
   }
   function stop() {
