@@ -509,6 +509,19 @@ struct RPCMethodRegistry {
         </p>
         </div>
 
+        <div class="info" style="border-left:4px solid #5856d6">
+        <p><strong>🔐 Two auth modes + version negotiation.</strong></p>
+        <p style="margin-top:6px;color:#6e6e73;font-size:14px">
+        <code>device_info</code> (and <code>/schema</code>) report <code>server_version</code>, <code>protocol_version</code>
+        and a <code>capabilities</code> array — feature-detect from ONE call. <strong>v1</strong> = plaintext Bearer only
+        (<code>/auth</code> + <code>/rpc</code>). <strong>v2</strong> = also an <strong>encrypted channel</strong>: pair once via
+        <code>POST /pair {client_name, client_pubkey}</code> (the device shows a key <em>fingerprint</em> to confirm, ADB-style),
+        then send <code>POST /rpc/secure</code> with an AES-GCM envelope (Curve25519 ECDH → HKDF → AES-256-GCM; anti-replay via
+        nonce + timestamp). The plaintext Bearer path always works, so old clients keep running. See
+        <code>tools/ictrl_secure.py</code>.
+        </p>
+        </div>
+
         <div class="info" style="border-left:4px solid #ff3b30">
         <p><strong>⚠️ Reliability &amp; timeouts — read before automating.</strong></p>
         <ul style="margin:6px 0 0 18px;color:#6e6e73;font-size:14px;line-height:1.6">

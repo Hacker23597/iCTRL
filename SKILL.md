@@ -13,6 +13,10 @@ iCTRL runs on an iPhone and exposes iOS UI automation as a **JSON-RPC 2.0 API ov
 2. **Get a token**: `POST /auth` with `{"client_name":"<you>"}`. **This BLOCKS until the device user taps Allow on-screen** — use a client timeout ≥ 60s and do NOT retry early (each retry pops another prompt). On approval you get a token (valid 30 days, survives restarts); denial returns HTTP 403.
 3. **Call methods**: `POST /rpc` with `{"jsonrpc":"2.0","method":"…","params":{…},"id":1}` and header `Authorization: Bearer <token>`.
 
+**Detect capabilities from `device_info`.** The first `device_info` call returns `server_version` (semver), `protocol_version` (`1` = Bearer plaintext only; `2` = also encrypted), and a `capabilities` array (`bearer_auth`, `encrypted_channel`, `page_source_filter`, `max_depth`, `find_element_ref`, `scroll_to_element`, `clear_text`, `open_url`, `resolve_app`, `page`, `stop_server`, `logs_history`). Feature-detect against these — no separate `/schema` fetch — and don't assume a method exists on an older `server_version`.
+
+**Optional encrypted channel (protocol_version ≥ 2).** For LAN traffic that can't be sniffed/MITM'd: `POST /pair {client_name, client_pubkey(base64 Curve25519)}` — the device shows a key **fingerprint** to confirm (ADB-style) → `{server_pubkey, pairing_id}`. Then send `POST /rpc/secure` (header `X-ICTRL-Pairing: <id>`) with an AES-GCM envelope `{nonce, ts, ciphertext}` wrapping the JSON-RPC body; the response is an envelope too. Session key = X25519 ECDH → HKDF-SHA256; anti-replay = timestamp ±60s + nonce. Ready-made client: `tools/ictrl_secure.py`. The plaintext Bearer path always works, so only pair if `capabilities` includes `encrypted_channel` and you want encryption.
+
 **Cache the token so you don't re-prompt the user every run.** On first successful `/auth`, persist it to **`~/.ictrl/token.json`** as:
 ```json
 {"host": "<host>:8200", "token": "<token>", "granted_at": "<ISO8601>", "client_name": "<you>"}
@@ -106,6 +110,14 @@ After `launch_app`/`activate_app`, that app is the **sticky target**.
 - Use generous `/rpc` client timeouts (≥ 30s, ideally 60–120s): `/rpc` drives a real device; a cold launch or heavy page takes seconds.
 - **A client timeout ≠ failure.** The device keeps executing. Before retrying, `GET /logs` and look for `⏱ ✓ <method>` — if present, it already succeeded and retrying would DOUBLE the action (e.g. a tap fires twice).
 - **Cheap recovery** if the service drops: reuse the cached token (`~/.ictrl/token.json`) and `bundle_id` (don't `resolve_app` again); re-`/auth` only if a call actually returns 401; if you know a deep link back (`open_url`), use it instead of re-navigating from the app's home screen.
+- **Cellular vs Wi-Fi.** On Wi-Fi the device's LAN address is remotely reachable. On **cellular/mobile data** the address is a public/CGNAT one that's **reachable on-device only** — the server still runs and localhost/on-device clients work, but a LAN peer can't connect, and that's expected (the server won't self-check or raise a "Local Network" prompt on cellular). If you're driving iCTRL from another host, use Wi-Fi; from on-device (e.g. the same phone) it works on any network.
+
+## Reading the UI (`page_source` params)
+
+- `filter` — return only matching nodes + ancestors: `{label:"<substr>"}`, `{type:"button"}`, or `{text:"<substr>"}`. Also the cheapest way to harvest repeated values (filter by a common substring).
+- `max_depth` — cap tree depth. WARNING: labels live near the LEAVES, so a shallow depth (3–4) returns structure with NO useful labels — use it only to preview layout, not to find an element.
+- `max_elements` — cap node count (default 500, hard cap 2000). If hit, the response is `truncated:true` — narrow with `filter` instead of raising this.
+- To LOCATE a control, prefer `find_element{element_id:"<label>"}` (add `element_type:"button"/"textfield"/…` to disambiguate) → it returns a stable `ref` you then `tap{ref}`. Off-screen → `scroll_to_element{element_id}` returns the ref after scrolling. A `ref` beats coordinates (survives scroll/animation).
 
 ## Safety
 
