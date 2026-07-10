@@ -206,14 +206,17 @@ class ActionHandler {
     ///   - if it's already frontmost (or was just launched), no-op.
     /// Returns an error to abort the action, or nil to proceed. `note` (if set) is
     /// attached to the successful response so the model learns what happened.
-    private func ensureBoundAppForeground() -> (error: JSONRPCError?, note: String?) {
-        // A system alert (permission prompt, etc.) sits above the app — acting on
-        // the app underneath silently misbehaves. Surface it. (WDA: shouldRespectSystemAlerts)
-        if ForegroundApp.hasSystemAlert() {
+    private func ensureBoundAppForeground(allowOverAlert: Bool = false) -> (error: JSONRPCError?, note: String?) {
+        // A system alert (permission prompt, etc.) sits above the app. A ref/
+        // element interaction on the bound app underneath would misfire, so we
+        // surface guidance — BUT a raw coordinate tap can legitimately target the
+        // alert's own button, so allowOverAlert lets those through.
+        if !allowOverAlert, ForegroundApp.hasSystemAlert() {
             return (JSONRPCError(code: -32000, message:
-                "A system alert/permission dialog is currently on screen, covering the app. Handle it first: " +
-                "page_source{bundle_id:\"com.apple.springboard\"} to read it, then tap its button (Allow/OK/Don't Allow). " +
-                "Actions on the app underneath won't work until it's dismissed.", data: nil), nil)
+                "A system alert/permission dialog is currently on screen, covering the app. To tap ITS buttons, " +
+                "use raw coordinates: page_source{bundle_id:\"com.apple.springboard\"} to read the alert's button " +
+                "frames, then tap{x,y} (coordinate taps are allowed to hit the alert). Ref/element actions on the " +
+                "app underneath won't work until the alert is dismissed.", data: nil), nil)
         }
 
         guard let bound = boundBundleId, !bound.isEmpty else { return (nil, nil) }
@@ -259,7 +262,15 @@ class ActionHandler {
         // passed an explicit bundle_id for this call (they want that app instead).
         var foregroundNote: String? = nil
         if Self.uiActionMethods.contains(method), cmd.bundleId == nil {
-            let prep = ensureBoundAppForeground()
+            // A raw coordinate tap/swipe (x,y given) synthesizes a touch at that
+            // exact screen point regardless of which layer owns it — so it CAN hit
+            // a system alert's button. Don't block those on an alert; only block
+            // ref/element interactions on the bound app (those act on the app
+            // underneath and would misfire while an alert covers it).
+            let hasCoords = cmd.x != nil && cmd.y != nil
+            let hasCoordPair = cmd.fromX != nil && cmd.fromY != nil
+            let coordinateBased = hasCoords || hasCoordPair
+            let prep = ensureBoundAppForeground(allowOverAlert: coordinateBased)
             if let err = prep.error { return (nil, err) }   // alert up / app crashed → abort with guidance
             foregroundNote = prep.note
         }

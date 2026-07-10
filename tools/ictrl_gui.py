@@ -55,7 +55,7 @@ def _fix_tcl_tk_paths():
 _fix_tcl_tk_paths()
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 import urllib.request
 import urllib.error
 
@@ -250,6 +250,8 @@ class App:
         for i, (label, cmd) in enumerate(buttons):
             ttk.Button(dev, text=label, width=9, command=cmd).grid(
                 row=i // 2, column=i % 2, sticky="we", padx=2, pady=2)
+        ttk.Button(dev, text="📱 Open App…", command=self.on_open_app).grid(
+            row=2, column=0, columnspan=2, sticky="we", padx=2, pady=2)
         dev.columnconfigure(0, weight=1); dev.columnconfigure(1, weight=1)
 
         # Direction pad (swipe-based) + paging
@@ -270,6 +272,9 @@ class App:
         # Text actions
         txt = ttk.LabelFrame(right, text="Text", padding=6)
         txt.pack(fill="x", pady=(8, 0))
+        ttk.Button(txt, text="⌨️ Type text…", command=self.on_type_text).pack(fill="x", pady=1)
+        self.submit_after_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(txt, text="Submit after typing", variable=self.submit_after_var).pack(anchor="w", pady=1)
         ttk.Button(txt, text="⌫ Clear field", command=lambda: self._send(
             lambda: self.client.rpc("clear_text"), "clear_text")).pack(fill="x", pady=1)
         ttk.Button(txt, text="⏎ Submit", command=lambda: self._send(
@@ -503,6 +508,49 @@ class App:
                                "Lock the phone now?\n\nThis ends the current view; "
                                "unlocking again may need the passcode entered on the device."):
             self._send(lambda: self.client.rpc("lock"), "lock")
+
+    def on_open_app(self):
+        """Prompt for an app name, resolve it to a bundle_id (resolve_app), then
+        launch it (launch_app)."""
+        if not self._guard():
+            return
+        name = simpledialog.askstring("Open App", "App name to open:", parent=self.root)
+        if not name:
+            return
+
+        def worker():
+            try:
+                self.set_status(f"resolving “{name}”…", "#fa0")
+                res = self.client.rpc("resolve_app", {"text": name}, timeout=20)
+                apps = res.get("apps") or []
+                if not apps:
+                    self.set_status(f"no app found for “{name}”", "#f33")
+                    return
+                bid = apps[0].get("bundle_id")
+                disp = apps[0].get("name", name)
+                if not bid:
+                    self.set_status(f"no bundle_id for “{name}”", "#f33")
+                    return
+                self.set_status(f"launching {disp} ({bid})…", "#fa0")
+                self.client.rpc("launch_app", {"bundle_id": bid}, timeout=20)
+                self.set_status(f"opened {disp}", "#0a7")
+            except Exception as e:
+                self.set_status(f"open app failed: {e}", "#f33")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_type_text(self):
+        """Prompt for a string and type it into the device's focused field.
+        Tap a text field on the screen first so it has keyboard focus."""
+        if not self._guard():
+            return
+        text = simpledialog.askstring("Type text", "Text to type into the focused field:",
+                                      parent=self.root)
+        if not text:  # cancelled or empty
+            return
+        submit = self.submit_after_var.get()
+        self._send(lambda: self.client.type_text(text, submit=submit),
+                   f"type {text!r}" + (" + submit" if submit else ""))
 
     def _page(self, direction):
         if not self._guard():
