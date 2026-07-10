@@ -160,13 +160,29 @@ enum RemoteHTML {
   .input:focus { outline: 2px solid var(--ring); outline-offset: 0; border-color: var(--border-hi); }
   .label { font-size: 12px; color: var(--muted); margin-bottom: 4px; display: block; }
 
-  /* ── status ── */
+  /* ── status bar (fixed bottom, always visible) ── */
   #status {
-    padding: 10px 12px; border-top: 1px solid var(--border);
-    font-size: 12px; color: var(--muted); background: var(--card);
-    display: flex; align-items: center; gap: 6px;
-    min-height: 34px;
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+    padding: 8px 12px;
+    border-top: 1px solid var(--border);
+    font-size: 12px; color: var(--muted);
+    background: rgba(24,24,27,.92);
+    backdrop-filter: blur(6px);
+    display: flex; align-items: center; gap: 8px;
+    min-height: 30px;
   }
+  #status .sep { color: var(--border-hi); }
+  #status .toast {
+    padding: 1px 8px; border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--card-hi);
+    color: var(--fg);
+    animation: toastIn .18s ease;
+  }
+  #status .toast.ok    { color: #86efac; border-color: #14532d; background: #052e16; }
+  #status .toast.err   { color: #fca5a5; border-color: #7f1d1d; background: #450a0a; }
+  #status .toast.warn  { color: #fcd34d; border-color: #78350f; background: #451a03; }
+  @keyframes toastIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
   .kbd {
     background: var(--card-hi); border: 1px solid var(--border-hi);
     padding: 1px 6px; border-radius: 4px; font-size: 11px; color: var(--muted);
@@ -315,7 +331,12 @@ enum RemoteHTML {
 <div id="scrim"></div>
 <button id="fab" aria-label="Open controls" title="Controls">⚙︎</button>
 
-<div id="status"><span class="dot off"></span><span id="statusText">Idle</span></div>
+<div id="status">
+  <span class="dot off" id="statusDotBar"></span>
+  <span id="statusText">Idle</span>
+  <span class="sep">•</span>
+  <span id="lastAction" class="toast" style="display:none"></span>
+</div>
 
 <script>
 (() => {
@@ -324,8 +345,10 @@ enum RemoteHTML {
   const video = $('#video'), stage = $('#stage'), overlay = $('#overlay');
   const tokenInput = $('#tokenInput'), fpsSel = $('#fpsSel');
   const connectBtn = $('#connectBtn'), stopBtn = $('#stopBtn');
-  const statusText = $('#statusText'), statusDot = $('#status .dot');
+  const statusText = $('#statusText'), statusDot = $('#statusDotBar');
+  const lastAction = $('#lastAction');
   const hudState = $('#hudState'), hudDevice = $('#hudDevice'), hudDot = $('#statusDot');
+  let toastTimer = null;
 
   // ── state ──
   let player = null;
@@ -340,11 +363,32 @@ enum RemoteHTML {
   let dragStart = null;
 
   // ── status ──
-  function setStatus(msg, kind = 'idle') {
+  // Two channels:
+  //   setConn(msg, kind)  → the LEFT half of the status bar + video HUD,
+  //                         a sticky connection state ("connected", "streaming …").
+  //   setToast(msg, kind) → a transient badge on the RIGHT of the status bar,
+  //                         auto-clears after ~2.4s. Used for per-action feedback
+  //                         (tap ok, swipe ok, rpc failed, …).
+  function setConn(msg, kind = 'idle') {
     statusText.textContent = msg;
     hudState.textContent = msg;
-    statusDot.className = 'dot ' + (kind === 'ok' ? 'on' : kind === 'err' ? 'err' : 'off');
-    hudDot.className = 'dot ' + (kind === 'ok' ? 'on' : kind === 'err' ? 'err' : 'off');
+    const cls = 'dot ' + (kind === 'ok' ? 'on' : kind === 'err' ? 'err' : 'off');
+    statusDot.className = cls; hudDot.className = cls;
+  }
+  function setToast(msg, kind = 'ok', ttl = 2400) {
+    lastAction.textContent = msg;
+    lastAction.className = 'toast ' + (kind || '');
+    lastAction.style.display = '';
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { lastAction.style.display = 'none'; }, ttl);
+  }
+  // Legacy shim: existing call sites use setStatus(msg, kind). Route lifecycle
+  // words to the sticky connection line, everything else to the toast.
+  const CONN_WORDS = ['idle','connecting','stopped','connected','streaming','switching','waiting'];
+  function setStatus(msg, kind = 'idle') {
+    const isConn = CONN_WORDS.some(w => msg.toLowerCase().startsWith(w));
+    if (isConn) setConn(msg, kind);
+    else setToast(msg, kind === 'err' ? 'err' : kind === 'ok' ? 'ok' : 'warn');
   }
 
   // ── RPC ──
@@ -363,6 +407,22 @@ enum RemoteHTML {
     const j = await r.json();
     if (j.error) throw new Error(j.error.message || 'rpc failed');
     return j.result || {};
+  }
+
+  // ── HUD device badge (short label + full details on hover) ──
+  function updateHudDevice(info) {
+    if (!info) { hudDevice.textContent = '—'; hudDevice.title = ''; return; }
+    const name = info.device_name || info.model || 'iPhone';
+    const os = info.system_version ? ` · iOS ${info.system_version}` : '';
+    hudDevice.textContent = name + os;
+    const lines = [
+      `Name:    ${info.device_name || '—'}`,
+      `Model:   ${info.model || '—'}`,
+      `iOS:     ${info.system_version || '—'}`,
+      `Screen:  ${info.point_width}×${info.point_height} pt (${info.pixel_width}×${info.pixel_height} px, ${info.scale}x)`,
+      `Server:  ${info.server_version || '—'}${info.protocol_version != null ? ' (proto ' + info.protocol_version + ')' : ''}`,
+    ];
+    hudDevice.title = lines.join('\n');
   }
 
   // ── coordinate conversion ──
@@ -538,7 +598,7 @@ enum RemoteHTML {
     // Prime device_info for coord conversion + title.
     try {
       deviceInfo = await rpc('device_info');
-      hudDevice.textContent = deviceInfo.device_name || 'iPhone';
+      updateHudDevice(deviceInfo);
       // Auth confirmed by a successful RPC — remember the token for next visit.
       try { localStorage.setItem(STORE_KEY, token); } catch (_) {}
     } catch (err) { setStatus('rpc: ' + err.message, 'err'); return; }
