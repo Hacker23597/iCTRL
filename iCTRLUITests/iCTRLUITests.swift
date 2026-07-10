@@ -689,8 +689,11 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Pipe VideoBroadcaster's internal events into the shared log buffer
         // so `GET /logs` shows encoder start/stop/failure alongside RPC calls.
         VideoBroadcaster.onLog = { msg in Self.logBuffer.append(msg) }
-        srv.onVideoStream = { [weak self] connection, fps in
+        srv.onVideoStream = { [weak self] connection, fps, verbose in
             guard self != nil else { connection.cancel(); return }
+            // Verbose logging is global to the shared broadcaster (all clients
+            // share one encoder); last connection wins — good enough for debug.
+            VideoBroadcaster.verbose = verbose
             // XCUIScreen.main.screenshot() is a private XCTest API that must run
             // on the main thread — hop over there synchronously from whatever
             // queue the broadcaster ticks on.

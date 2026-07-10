@@ -284,6 +284,10 @@ enum RemoteHTML {
           </select>
         </div>
       </div>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer">
+        <input type="checkbox" id="verboseChk">
+        Verbose encoder log <span class="kbd">/logs</span>
+      </label>
     </div>
 
     <div class="panel section">
@@ -343,7 +347,7 @@ enum RemoteHTML {
   // ── DOM ──
   const $ = s => document.querySelector(s);
   const video = $('#video'), stage = $('#stage'), overlay = $('#overlay');
-  const tokenInput = $('#tokenInput'), fpsSel = $('#fpsSel');
+  const tokenInput = $('#tokenInput'), fpsSel = $('#fpsSel'), verboseChk = $('#verboseChk');
   const connectBtn = $('#connectBtn'), stopBtn = $('#stopBtn');
   const statusText = $('#statusText'), statusDot = $('#statusDotBar');
   const lastAction = $('#lastAction');
@@ -614,7 +618,8 @@ enum RemoteHTML {
     }
 
     const fps = fpsSel.value;
-    const src = `/stream?token=${encodeURIComponent(token)}&fps=${fps}`;
+    const verbose = verboseChk?.checked ? '&verbose=1' : '';
+    const src = `/stream?token=${encodeURIComponent(token)}&fps=${fps}${verbose}`;
 
     // NOTE: no preflight fetch — the /stream endpoint is a single-client-
     // per-connection push, so opening a second GET (even briefly) would
@@ -671,6 +676,9 @@ enum RemoteHTML {
   // (broadcaster restarts the encoder at the new rate).
   fpsSel.addEventListener('change', () => {
     if (player) { setStatus(`switching to ${fpsSel.value} fps…`); connect(); }
+  });
+  verboseChk?.addEventListener('change', () => {
+    if (player) { setStatus(`verbose ${verboseChk.checked ? 'on' : 'off'}…`); connect(); }
   });
 
   // ── mobile drawer (FAB opens/closes the sidebar as a bottom sheet) ──

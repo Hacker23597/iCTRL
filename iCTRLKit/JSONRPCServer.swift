@@ -17,7 +17,7 @@ class JSONRPCServer {
     /// Hand off an authorized connection to the video streamer (host owns the
     /// frame grabber + VideoStreamer). The server stops managing this connection
     /// once handed off — the streamer keeps it alive and closes it on disconnect.
-    var onVideoStream: ((NWConnection, _ fps: Double) -> Void)?
+    var onVideoStream: ((NWConnection, _ fps: Double, _ verbose: Bool) -> Void)?
     /// Returns redacted log text for the (auth-required) GET /logs endpoint.
     var onLogsRequest: (() -> String)?
 
@@ -434,12 +434,18 @@ class JSONRPCServer {
             return
         }
         var fps = 2.0
+        var verbose = false
         for pair in query.split(separator: "&") {
             let kv = pair.split(separator: "=", maxSplits: 1)
-            if kv.count == 2, kv[0] == "fps", let v = Double(kv[1]) { fps = v }
+            guard kv.count == 2 else { continue }
+            switch kv[0] {
+            case "fps":     if let v = Double(kv[1]) { fps = v }
+            case "verbose": verbose = (kv[1] == "1" || kv[1] == "true")
+            default: break
+            }
         }
         handedOff.insert(ObjectIdentifier(connection))
-        handoff(connection, fps)
+        handoff(connection, fps, verbose)
     }
 
     /// True if the request carries a valid token via EITHER `Authorization:

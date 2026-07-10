@@ -21,6 +21,20 @@ import UIKit
 
 // MARK: - Broadcaster (shared encoder, one per process)
 
+/// Per-frame timing captured across submit → encode-callback → mux, carried
+/// through VideoToolbox via sourceFrameRefcon so the async callback can join
+/// it back with the enqueue timings.
+private final class FrameMetric {
+    let index: Int64
+    let submittedAt: CFTimeInterval
+    let captureMs: Double
+    let pixbufMs: Double
+    init(index: Int64, submittedAt: CFTimeInterval, captureMs: Double, pixbufMs: Double) {
+        self.index = index; self.submittedAt = submittedAt
+        self.captureMs = captureMs; self.pixbufMs = pixbufMs
+    }
+}
+
 final class VideoBroadcaster {
     static let shared = VideoBroadcaster()
 
@@ -31,6 +45,11 @@ final class VideoBroadcaster {
         NSLog("iCTRL video: %@", msg)
         Self.onLog?("🎥 " + msg)
     }
+
+    /// When true, emit a one-liner per encoded frame with capture / pixbuf /
+    /// encode / mux timings + output bytes. Default off — a 5 fps run would
+    /// otherwise flood the log buffer.
+    static var verbose: Bool = false
 
     private let queue = DispatchQueue(label: "com.openminis.ictrl.video.broadcast")
     private var subscribers: [ObjectIdentifier: (Data) -> Void] = [:]
@@ -45,6 +64,18 @@ final class VideoBroadcaster {
     /// Cached SPS/PPS from the format description so a client joining mid-stream
     /// (and each keyframe) gets parameter sets.
     private var parameterSets: [Data] = []
+
+    // Rolling stats — printed every ~5s even without verbose, so operators see
+    // encoder health without opting in to per-frame spam.
+    private var statsStartAt: CFTimeInterval = 0
+    private var statsFrames = 0
+    private var statsCaptureMs: Double = 0
+    private var statsPixbufMs: Double = 0
+    private var statsEncodeMs: Double = 0
+    private var statsMuxMs: Double = 0
+    private var statsBytes = 0
+    private var statsKeyframes = 0
+    private var statsDrops = 0
 
     /// Configure the frame source + rate. If encoding is already running with a
     /// different fps, restart the pipeline so the new rate takes effect
@@ -104,17 +135,60 @@ final class VideoBroadcaster {
         if let s = session { VTCompressionSessionInvalidate(s); session = nil }
         muxer = nil
         parameterSets = []
+        // Reset rolling stats so the next run doesn't average across a restart.
+        statsStartAt = 0; statsFrames = 0
+        statsCaptureMs = 0; statsPixbufMs = 0
+        statsEncodeMs = 0; statsMuxMs = 0
+        statsBytes = 0; statsKeyframes = 0; statsDrops = 0
         log("encoding stopped (no subscribers)")
     }
 
     private func captureAndEncode() {
-        guard let session = session, let grab = grabFrame,
-              let image = grab(), let pb = pixelBuffer(from: image) else { return }
-        let pts = CMTime(value: frameIndex, timescale: Int32(max(1, fps.rounded())))
-        frameIndex += 1
+        guard let session = session, let grab = grabFrame else { return }
+        let t0 = CACurrentMediaTime()
+        guard let image = grab() else {
+            statsDrops += 1
+            if Self.verbose { log("f#\(frameIndex) DROP: grabFrame returned nil") }
+            return
+        }
+        let t1 = CACurrentMediaTime()
+        guard let pb = pixelBuffer(from: image) else {
+            statsDrops += 1
+            if Self.verbose { log("f#\(frameIndex) DROP: pixelBuffer conversion failed") }
+            return
+        }
+        let t2 = CACurrentMediaTime()
+
+        let idx = frameIndex; frameIndex += 1
+        let pts = CMTime(value: idx, timescale: Int32(max(1, fps.rounded())))
+        let metric = FrameMetric(index: idx, submittedAt: t2,
+                                 captureMs: (t1 - t0) * 1000,
+                                 pixbufMs:  (t2 - t1) * 1000)
+        // Retain across the async encoder callback; released in handleEncoded.
+        let refcon = Unmanaged.passRetained(metric).toOpaque()
         VTCompressionSessionEncodeFrame(session, imageBuffer: pb, presentationTimeStamp: pts,
                                         duration: .invalid, frameProperties: nil,
-                                        sourceFrameRefcon: nil, infoFlagsOut: nil)
+                                        sourceFrameRefcon: refcon, infoFlagsOut: nil)
+    }
+
+    /// Print rolling stats every ~5s of wall-clock. Cheap; called from the
+    /// callback thread — accumulators are private-queue-owned so we hop back.
+    private func maybeFlushStats() {
+        let now = CACurrentMediaTime()
+        if statsStartAt == 0 { statsStartAt = now; return }
+        guard now - statsStartAt >= 5.0, statsFrames > 0 else { return }
+        let win = now - statsStartAt
+        let n = Double(statsFrames)
+        let avgCap = statsCaptureMs / n, avgPb = statsPixbufMs / n
+        let avgEnc = statsEncodeMs / n,  avgMux = statsMuxMs / n
+        let kbps = Double(statsBytes) * 8 / 1000 / win
+        log(String(format: "stats %.1fs: %d frames (%.1f fps), key=%d drop=%d — cap %.1fms · pb %.1fms · enc %.1fms · mux %.1fms · %.0f kbps",
+                   win, statsFrames, Double(statsFrames)/win, statsKeyframes, statsDrops,
+                   avgCap, avgPb, avgEnc, avgMux, kbps))
+        statsStartAt = now
+        statsFrames = 0; statsCaptureMs = 0; statsPixbufMs = 0
+        statsEncodeMs = 0; statsMuxMs = 0; statsBytes = 0
+        statsKeyframes = 0; statsDrops = 0
     }
 
     private func fanout(_ data: Data) {
@@ -147,19 +221,37 @@ final class VideoBroadcaster {
         return true
     }
 
-    private static let encodeCallback: VTCompressionOutputCallback = { refcon, _, status, _, sampleBuffer in
-        guard status == noErr, let refcon = refcon, let sb = sampleBuffer,
-              CMSampleBufferDataIsReady(sb) else { return }
-        Unmanaged<VideoBroadcaster>.fromOpaque(refcon).takeUnretainedValue().handleEncoded(sb)
+    private static let encodeCallback: VTCompressionOutputCallback = { refcon, sourceFrameRefcon, status, _, sampleBuffer in
+        // Retrieve (and release) the per-frame metric regardless of outcome so we
+        // don't leak on encode errors.
+        var metric: FrameMetric?
+        if let s = sourceFrameRefcon {
+            metric = Unmanaged<FrameMetric>.fromOpaque(s).takeRetainedValue()
+        }
+        guard let refcon = refcon else { return }
+        let self_ = Unmanaged<VideoBroadcaster>.fromOpaque(refcon).takeUnretainedValue()
+        if status != noErr {
+            self_.queue.async {
+                self_.statsDrops += 1
+                if VideoBroadcaster.verbose {
+                    self_.log("f#\(metric?.index ?? -1) DROP: VT status=\(status)")
+                }
+            }
+            return
+        }
+        guard let sb = sampleBuffer, CMSampleBufferDataIsReady(sb) else { return }
+        self_.handleEncoded(sb, metric: metric)
     }
 
-    private func handleEncoded(_ sb: CMSampleBuffer) {
+    private func handleEncoded(_ sb: CMSampleBuffer, metric: FrameMetric?) {
         guard let muxer = muxer else { return }
+        let tEncDone = CACurrentMediaTime()
         let notSync = (CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
             as? [[CFString: Any]])?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
         let isKeyframe = !notSync
 
         var nalus: [Data] = []
+        var vclBytes = 0
         if isKeyframe {
             if parameterSets.isEmpty, let fmt = CMSampleBufferGetFormatDescription(sb) {
                 parameterSets = extractParameterSets(from: fmt)
@@ -170,12 +262,38 @@ final class VideoBroadcaster {
             var lenAt = 0, total = 0; var ptr: UnsafeMutablePointer<Int8>?
             if CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: &lenAt,
                                            totalLengthOut: &total, dataPointerOut: &ptr) == noErr, let p = ptr {
-                nalus.append(contentsOf: annexBNalus(fromAVCC: p, length: total))
+                let extracted = annexBNalus(fromAVCC: p, length: total)
+                vclBytes = extracted.reduce(0) { $0 + $1.count }
+                nalus.append(contentsOf: extracted)
             }
         }
         guard !nalus.isEmpty else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
-        fanout(muxer.package(nalus: nalus, pts: pts, keyframe: isKeyframe))
+        let tsData = muxer.package(nalus: nalus, pts: pts, keyframe: isKeyframe)
+        let tMuxDone = CACurrentMediaTime()
+        fanout(tsData)
+
+        // Timing bookkeeping. Runs on the encoder's callback thread; hop back
+        // to the private queue to touch the accumulators safely.
+        queue.async {
+            let encodeMs = metric.map { (tEncDone - $0.submittedAt) * 1000 } ?? 0
+            let muxMs = (tMuxDone - tEncDone) * 1000
+            self.statsFrames += 1
+            self.statsCaptureMs += metric?.captureMs ?? 0
+            self.statsPixbufMs += metric?.pixbufMs ?? 0
+            self.statsEncodeMs += encodeMs
+            self.statsMuxMs += muxMs
+            self.statsBytes += tsData.count
+            if isKeyframe { self.statsKeyframes += 1 }
+            if Self.verbose {
+                self.log(String(format: "f#%d %@ cap %.1f pb %.1f enc %.1f mux %.1f — vcl %d B → ts %d B (%d subs)",
+                                metric?.index ?? -1,
+                                isKeyframe ? "IDR" : "P",
+                                metric?.captureMs ?? 0, metric?.pixbufMs ?? 0,
+                                encodeMs, muxMs, vclBytes, tsData.count, self.subscribers.count))
+            }
+            self.maybeFlushStats()
+        }
     }
 
     private func extractParameterSets(from fmt: CMFormatDescription) -> [Data] {
