@@ -46,11 +46,20 @@ final class VideoBroadcaster {
     /// (and each keyframe) gets parameter sets.
     private var parameterSets: [Data] = []
 
-    /// Configure the frame source + rate (called once by the host before use).
+    /// Configure the frame source + rate. If encoding is already running with a
+    /// different fps, restart the pipeline so the new rate takes effect
+    /// immediately (existing subscribers see a fresh keyframe and continue).
     func configure(fps: Double, grabFrame: @escaping () -> UIImage?) {
         queue.async {
-            self.fps = max(0.5, min(fps, 10))
+            let newFps = max(0.5, min(fps, 10))
+            let restart = (self.timer != nil) && (self.fps != newFps)
+            self.fps = newFps
             self.grabFrame = grabFrame
+            if restart {
+                self.log("fps changed to \(newFps) — restarting encoder")
+                self.stopEncoding()
+                self.startEncoding()
+            }
         }
     }
 

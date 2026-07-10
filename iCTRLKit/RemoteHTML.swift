@@ -102,7 +102,22 @@ enum RemoteHTML {
   .dot.err { background: var(--danger); }
 
   /* ── sidebar ── */
-  aside { display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
+  aside {
+    display: flex; flex-direction: column; gap: 12px;
+    overflow-y: auto; overflow-x: hidden;
+    /* Bound the sidebar to the grid row so overflow triggers the scrollbar
+       instead of the whole page scrolling. */
+    min-height: 0; max-height: 100%;
+    /* subtle scrollbar */
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-hi) transparent;
+  }
+  aside::-webkit-scrollbar { width: 8px; }
+  aside::-webkit-scrollbar-track { background: transparent; }
+  aside::-webkit-scrollbar-thumb {
+    background: var(--border-hi); border-radius: 999px; border: 2px solid var(--card);
+  }
+  aside::-webkit-scrollbar-thumb:hover { background: #52525b; }
   .section { padding: 12px; }
   .section h3 {
     margin: 0 0 10px; font-size: 12px; font-weight: 600;
@@ -592,6 +607,11 @@ enum RemoteHTML {
   }
   connectBtn.addEventListener('click', connect);
   stopBtn.addEventListener('click', stop);
+  // Changing FPS mid-stream: reconnect so the server sees the new ?fps=…
+  // (broadcaster restarts the encoder at the new rate).
+  fpsSel.addEventListener('change', () => {
+    if (player) { setStatus(`switching to ${fpsSel.value} fps…`); connect(); }
+  });
 
   // ── mobile drawer (FAB opens/closes the sidebar as a bottom sheet) ──
   const app = document.getElementById('app');

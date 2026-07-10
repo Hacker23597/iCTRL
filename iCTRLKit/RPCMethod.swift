@@ -293,7 +293,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.2.3"
+    static let serverVersion = "1.2.4"
 
     /// Server capability/protocol version. v1 = Bearer-token auth over /auth +
     /// /rpc. Bump when the wire capabilities change so clients can auto-detect.
