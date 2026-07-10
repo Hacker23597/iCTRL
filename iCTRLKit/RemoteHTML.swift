@@ -7,23 +7,27 @@ import Foundation
 /// Radix-ish surfaces (zinc, subtle border, rounded, focus rings) — hand-written
 /// in CSS so the page stays a single self-contained file.
 ///
+/// The page has NO external network dependency: CSS is inline, mpegts.js is
+/// vendored into MpegtsJS.swift and inlined at build time. Works fully offline.
+///
 /// The page uses the SAME token as /rpc (it's the query token passed by the
 /// user when they open /remote?token=…) and re-uses it on every RPC call.
 enum RemoteHTML {
-    static let page: String = #"""
+    /// Full HTML for GET /remote, with mpegts.js inlined so the page has no
+    /// external network dependency (fully self-contained: CSS, JS, decoder).
+    static var page: String { pageHead + MpegtsJS.source + pageBody }
+
+    private static let pageHead: String = #"""
 <!doctype html>
 <html lang="en" class="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>iCTRL Remote</title>
-<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"
-        onerror="window.__mpegtsCDNFailed=true"></script>
 <script>
-  // Fallback CDN — some networks block jsdelivr but reach unpkg.
-  if (window.__mpegtsCDNFailed || !window.mpegts) {
-    document.write('<scr' + 'ipt src="https://unpkg.com/mpegts.js@1.7.3/dist/mpegts.js"></scr' + 'ipt>');
-  }
+"""#
+
+    private static let pageBody: String = #"""
 </script>
 <style>
   /* ── shadcn-inspired tokens (dark) ── */
@@ -512,9 +516,9 @@ enum RemoteHTML {
       hudDevice.textContent = deviceInfo.device_name || 'iPhone';
     } catch (err) { setStatus('rpc: ' + err.message, 'err'); return; }
 
-    // Check mpegts.js loaded (both CDNs may be blocked on some networks).
+    // mpegts.js is bundled inline; this guards against an accidental strip.
     if (!window.mpegts) {
-      setStatus('mpegts.js failed to load — check network / CDN access', 'err');
+      setStatus('mpegts.js not available (bundle stripped?)', 'err');
       return;
     }
     if (!mpegts.isSupported()) {
