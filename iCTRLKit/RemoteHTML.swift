@@ -314,7 +314,12 @@ enum RemoteHTML {
 
   // ── state ──
   let player = null;
-  let token = new URLSearchParams(location.search).get('token') || '';
+  // Token precedence: ?token= query wins (explicit) > localStorage (last used).
+  // localStorage is scoped per (host, port) — safe for switching between
+  // multiple iCTRL devices — and we only persist on a successful connect.
+  const STORE_KEY = 'ictrl.token';
+  const qToken = new URLSearchParams(location.search).get('token') || '';
+  let token = qToken || localStorage.getItem(STORE_KEY) || '';
   if (token) tokenInput.value = token;
   let deviceInfo = null;   // {point_width, point_height}
   let dragStart = null;
@@ -335,6 +340,11 @@ enum RemoteHTML {
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
       body: JSON.stringify({ jsonrpc: '2.0', method, params, id: Date.now() }),
     });
+    if (r.status === 401 || r.status === 403) {
+      // Server rejected the token — forget it so the next visit doesn't loop.
+      try { localStorage.removeItem(STORE_KEY); } catch (_) {}
+      throw new Error('token rejected (' + r.status + ')');
+    }
     const j = await r.json();
     if (j.error) throw new Error(j.error.message || 'rpc failed');
     return j.result || {};
@@ -514,6 +524,8 @@ enum RemoteHTML {
     try {
       deviceInfo = await rpc('device_info');
       hudDevice.textContent = deviceInfo.device_name || 'iPhone';
+      // Auth confirmed by a successful RPC — remember the token for next visit.
+      try { localStorage.setItem(STORE_KEY, token); } catch (_) {}
     } catch (err) { setStatus('rpc: ' + err.message, 'err'); return; }
 
     // mpegts.js is bundled inline; this guards against an accidental strip.
@@ -529,33 +541,35 @@ enum RemoteHTML {
     const fps = fpsSel.value;
     const src = `/stream?token=${encodeURIComponent(token)}&fps=${fps}`;
 
-    // Preflight the stream endpoint: HEAD may be rejected, so do a range GET
-    // and immediately abort — we only need the status code + Content-Type.
-    try {
-      const ac = new AbortController();
-      const r = await fetch(src, { signal: ac.signal, headers: { 'Range': 'bytes=0-0' } });
-      ac.abort();   // don't drain the stream
-      if (r.status === 401 || r.status === 403) throw new Error(`stream auth failed (${r.status})`);
-      if (r.status >= 400) throw new Error(`stream endpoint ${r.status}`);
-      const ct = r.headers.get('content-type') || '';
-      if (!ct.includes('video/mp2t') && !ct.includes('mpeg')) {
-        console.warn('unexpected stream content-type:', ct);
-      }
-    } catch (err) {
-      // AbortError from our own abort is expected — ignore it.
-      if (err.name !== 'AbortError') { setStatus('stream: ' + err.message, 'err'); return; }
-    }
+    // NOTE: no preflight fetch — the /stream endpoint is a single-client-
+    // per-connection push, so opening a second GET (even briefly) would
+    // spin the encoder up/down and confuse the real player. Trust the
+    // player's own error events instead.
 
     if (player) { try { player.destroy(); } catch(_){} player = null; }
     player = mpegts.createPlayer({ type: 'mpegts', isLive: true, url: src }, {
-      enableStashBuffer: false, lazyLoad: false, liveBufferLatencyChasing: true,
+      // 2 fps is a very sparse stream — stashing helps mpegts.js batch
+      // demux work; latency-chasing would fight it. Live-sync disabled
+      // for the same reason (would seek past every idle gap).
+      enableStashBuffer: true,
+      stashInitialSize: 128,
+      lazyLoad: false,
+      liveBufferLatencyChasing: false,
+      autoCleanupSourceBuffer: true,
     });
     // Surface mpegts / MSE errors so the user isn't stuck on a black screen.
     player.on(mpegts.Events.ERROR, (type, detail, info) => {
       console.error('mpegts error', type, detail, info);
-      setStatus(`stream: ${type} ${detail}`, 'err');
+      setStatus(`stream: ${type} ${detail||''}`, 'err');
     });
-    player.on(mpegts.Events.MEDIA_INFO, () => setStatus('streaming', 'ok'));
+    player.on(mpegts.Events.MEDIA_INFO, (info) => {
+      console.log('media info', info);
+      setStatus(`streaming ${info.width||'?'}×${info.height||'?'}`, 'ok');
+    });
+    player.on(mpegts.Events.STATISTICS_INFO, (s) => {
+      // First few chunks are useful to confirm data actually flows.
+      if (s.decodedFrames < 3) console.log('mpegts stats', s);
+    });
     video.addEventListener('error', () => {
       const e = video.error;
       if (e) setStatus(`video: ${e.code} ${e.message||''}`, 'err');
