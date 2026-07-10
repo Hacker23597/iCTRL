@@ -555,6 +555,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         "scroll_to_element", "scroll_to", "find_element", "tap_element",
         "launch_app", "activate_app", "terminate_app",
         "home", "lock", "unlock",
+        // device_info touches XCUIApplication.frame on the first call (to
+        // cache the point-space size). Every XCTest UI API asserts on
+        // XCTContext.currentContext, which is only valid on the test's main
+        // thread — so it must hop like the interaction methods above. Later
+        // calls are cached and cheap, so the hop cost is one-shot.
+        "device_info",
     ]
 
     /// Compact one-line summary of the most useful params for the request log.
