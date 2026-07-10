@@ -28,9 +28,19 @@ final class FMP4Muxer {
     let height: Int
 
     init?(width: Int, height: Int, sps: Data, pps: Data) {
-        guard !sps.isEmpty, !pps.isEmpty else { return nil }
+        guard !sps.isEmpty, !pps.isEmpty, sps.count >= 4 else { return nil }
         self.width = width; self.height = height
         self.sps = sps; self.pps = pps
+    }
+
+    /// RFC 6381 codec string derived from the SPS. Format: `avc1.PPCCLL`
+    ///   PP = profile_idc          (sps[1])
+    ///   CC = constraint_set_flags (sps[2])
+    ///   LL = level_idc            (sps[3])
+    /// Must be handed to MSE (`addSourceBuffer("video/mp4; codecs=…")`) or
+    /// the browser silently rejects the init segment.
+    var codecString: String {
+        String(format: "avc1.%02X%02X%02X", sps[1], sps[2], sps[3])
     }
 
     // MARK: - Public API

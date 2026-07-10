@@ -52,11 +52,13 @@ final class VideoBroadcaster {
     static var verbose: Bool = false
 
     private let queue = DispatchQueue(label: "com.openminis.ictrl.video.broadcast")
-    /// Each subscriber holds a sink + whether it's already received the fMP4
-    /// init segment (`ftyp`+`moov`). The muxer emits init once per encoder
-    /// lifetime; new subscribers get the cached copy when they join.
+    /// Each subscriber holds a sink + a header-sender + whether it's already
+    /// been "handshook" (HTTP header + fMP4 init segment sent). The header
+    /// callback receives the actual codec string once known (only after the
+    /// first keyframe — the encoder emits SPS/PPS with the first IDR).
     private struct Subscriber {
         let sink: (Data) -> Void
+        let sendHeader: (String) -> Void   // codec → response headers
         var inited: Bool
     }
     private var subscribers: [ObjectIdentifier: Subscriber] = [:]
@@ -104,23 +106,28 @@ final class VideoBroadcaster {
         }
     }
 
-    /// Subscribe a sink (a per-connection sender). Starts the encoder if it's the
-    /// first subscriber. Late joiners get the cached init segment automatically
-    /// and then receive fragments from the next keyframe onward.
-    func subscribe(_ sink: @escaping (Data) -> Void, token: ObjectIdentifier) {
+    /// Subscribe a per-connection sink + a header sender. The header sender is
+    /// invoked exactly once with the real codec string derived from the SPS
+    /// (only known after the first keyframe); the sink then receives the init
+    /// segment followed by fragments.
+    func subscribe(sink: @escaping (Data) -> Void,
+                   sendHeader: @escaping (String) -> Void,
+                   token: ObjectIdentifier) {
         queue.async {
             let wasEmpty = self.subscribers.isEmpty
-            var sub = Subscriber(sink: sink, inited: false)
-            // If the encoder is already up and we have an init segment,
-            // deliver it immediately so the browser can start MSE right away.
-            if let seg = self.initSegment {
-                sink(seg); sub.inited = true
+            var sub = Subscriber(sink: sink, sendHeader: sendHeader, inited: false)
+            // If the encoder is already up and the muxer has the init segment
+            // ready, handshake this subscriber immediately.
+            if let seg = self.initSegment, let m = self.muxer {
+                sendHeader(m.codecString)
+                sink(seg)
+                sub.inited = true
             }
             self.subscribers[token] = sub
             if wasEmpty { self.startEncoding() }
             else if self.initSegment == nil {
-                // Encoder is running but hasn't produced a keyframe yet —
-                // ask for one so the new subscriber gets going quickly.
+                // Encoder is running but hasn't produced a keyframe yet — ask
+                // for one so the new subscriber gets going quickly.
                 self.captureAndEncode(forceKeyframe: true)
             }
         }
@@ -234,12 +241,14 @@ final class VideoBroadcaster {
         statsKeyframes = 0; statsDrops = 0
     }
 
-    /// Fan out a fragment. Any subscriber that hasn't seen the init segment
-    /// yet gets it prepended (rare — normally handled in subscribe()).
+    /// Fan out a fragment. Any subscriber that hasn't been handshook yet gets
+    /// its HTTP header + init segment first (using the real codec string from
+    /// the muxer). This runs when the first keyframe just built the muxer.
     private func fanout(_ fragment: Data) {
-        guard let init_ = initSegment else { return }
+        guard let init_ = initSegment, let m = muxer else { return }
         for (token, sub) in subscribers {
             if !sub.inited {
+                sub.sendHeader(m.codecString)
                 sub.sink(init_)
                 subscribers[token]?.inited = true
             }
@@ -440,25 +449,36 @@ final class VideoStreamer: Hashable {
     /// when the client disconnects (server drops the connection then).
     func start(onStop: @escaping () -> Void) {
         self.onStop = onStop
-        let header = """
-        HTTP/1.1 200 OK\r
-        Content-Type: video/mp4\r
-        Cache-Control: no-cache, no-store\r
-        Connection: close\r
-        Access-Control-Allow-Origin: *\r
-        \r
-
-        """
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .failed, .cancelled: self?.stop()
             default: break
             }
         }
+        // The HTTP header is deferred until the broadcaster knows the real
+        // codec string (populated from the SPS on the first keyframe). That
+        // way MSE clients can `addSourceBuffer("video/mp4; codecs=<exact>")`.
+        // The header sender fires exactly once, before the init segment.
+        VideoBroadcaster.shared.subscribe(
+            sink: { [weak self] data in self?.send(data) },
+            sendHeader: { [weak self] codec in self?.sendHTTPHeader(codec: codec) },
+            token: self.token)
+    }
+
+    private func sendHTTPHeader(codec: String) {
+        let header = """
+        HTTP/1.1 200 OK\r
+        Content-Type: video/mp4\r
+        X-Codec: \(codec)\r
+        Cache-Control: no-cache, no-store\r
+        Connection: close\r
+        Access-Control-Allow-Origin: *\r
+        Access-Control-Expose-Headers: X-Codec\r
+        \r
+
+        """
         connection.send(content: header.data(using: .utf8), completion: .contentProcessed { [weak self] err in
-            guard let self = self else { return }
-            if err != nil { self.stop(); return }
-            VideoBroadcaster.shared.subscribe({ [weak self] data in self?.send(data) }, token: self.token)
+            if err != nil { self?.stop() }
         })
     }
 

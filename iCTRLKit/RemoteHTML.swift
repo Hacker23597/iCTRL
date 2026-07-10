@@ -603,9 +603,8 @@ enum RemoteHTML {
 
     // Native MSE — Chrome / Firefox / Edge / Safari all support fMP4 via
     // MediaSource. No JS decoder library needed.
-    if (!('MediaSource' in window) ||
-        !MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01F"')) {
-      setStatus('browser lacks MSE + H.264 support', 'err');
+    if (!('MediaSource' in window)) {
+      setStatus('browser lacks MediaSource', 'err');
       return;
     }
 
@@ -635,9 +634,10 @@ enum RemoteHTML {
 
   // --- Minimal fMP4-over-HTTP MSE player -------------------------------
   // Streams the /stream endpoint via fetch(), pumps chunks into an
-  // SourceBuffer as they arrive. Init segment (ftyp+moov) comes first
-  // and MSE picks up the codec automatically; each subsequent moof+mdat
-  // fragment shows on <video> within one frame time.
+  // SourceBuffer as they arrive. The server's response carries the real
+  // codec string (profile/constraint/level derived from the SPS) in the
+  // X-Codec header — using it verbatim is mandatory: a mismatched profile
+  // makes MSE silently reject every appendBuffer and the video stays black.
   function mseFragmentPlayer(videoEl, url, { onOpen, onError }) {
     const ms = new MediaSource();
     videoEl.src = URL.createObjectURL(ms);
@@ -645,6 +645,8 @@ enum RemoteHTML {
     let sb = null;
     const queue = [];      // pending Uint8Arrays waiting for updateend
     let running = true;
+    let sourceOpen = false;
+    let pendingCodec = null;
 
     function pump() {
       if (!running || !sb || sb.updating || queue.length === 0) return;
@@ -652,11 +654,12 @@ enum RemoteHTML {
       catch (err) { onError?.(err.message); running = false; ac.abort(); }
     }
 
-    ms.addEventListener('sourceopen', async () => {
-      // Baseline is what our VT encoder emits (kVTProfileLevel_H264_Baseline).
-      // 42E0 = Baseline profile + no constraint set + level auto — the level
-      // byte is placeholder; MSE only checks the profile/constraint prefix.
-      const mime = 'video/mp4; codecs="avc1.42E01F"';
+    function attachSourceBuffer(codec) {
+      const mime = `video/mp4; codecs="${codec}"`;
+      if (!MediaSource.isTypeSupported(mime)) {
+        onError?.(`browser doesn't support ${mime}`);
+        return false;
+      }
       sb = ms.addSourceBuffer(mime);
       sb.mode = 'segments';
       sb.addEventListener('updateend', () => {
@@ -674,7 +677,20 @@ enum RemoteHTML {
         } catch (_) {}
       });
       onOpen?.({ mime });
+      return true;
+    }
 
+    function maybeStart() {
+      if (sourceOpen && pendingCodec && !sb) {
+        if (!attachSourceBuffer(pendingCodec)) return;
+        pump();
+      }
+    }
+
+    ms.addEventListener('sourceopen', () => { sourceOpen = true; maybeStart(); });
+    ms.addEventListener('sourceclose', () => { running = false; });
+
+    (async () => {
       let resp;
       try {
         resp = await fetch(url, { signal: ac.signal });
@@ -683,15 +699,18 @@ enum RemoteHTML {
         if (err.name !== 'AbortError') onError?.(err.message);
         return;
       }
+      // Codec string from the server (real profile+level from SPS).
+      pendingCodec = resp.headers.get('X-Codec') || 'avc1.42E01F';
+      maybeStart();
+
       const reader = resp.body.getReader();
       while (running) {
         const { value, done } = await reader.read();
         if (done) break;
+        // Queue even before sourceOpen so no bytes are dropped.
         queue.push(value); pump();
       }
-    });
-
-    ms.addEventListener('sourceclose', () => { running = false; });
+    })();
 
     return {
       stop() {
