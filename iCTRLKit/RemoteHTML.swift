@@ -468,14 +468,21 @@ enum RemoteHTML {
         await rpc('tap', { x: Math.round(p.x), y: Math.round(p.y) });
         setStatus(`tap (${Math.round(p.x)},${Math.round(p.y)})`, 'ok');
       } else {
+        // The server distinguishes the two arbitrary-A→B gesture APIs:
+        //   swipe(x, y, direction, distance)          fixed axes, from a point
+        //   drag (from_x, from_y, to_x, to_y)         truly arbitrary two-point
+        // Browser pointer drag is the second — send drag, not swipe.
         const p1 = clientToPoint(s.x, s.y), p2 = clientToPoint(e.clientX, e.clientY);
         if (!p1 || !p2) return;
-        await rpc('swipe', {
+        // Duration proportional to gesture time makes flicks feel like flicks
+        // and slow drags feel deliberate — capped for sanity.
+        const dur = Math.max(0.15, Math.min(0.8, (Date.now() - s.t) / 1000));
+        await rpc('drag', {
           from_x: Math.round(p1.x), from_y: Math.round(p1.y),
           to_x:   Math.round(p2.x), to_y:   Math.round(p2.y),
-          velocity: 'normal',
+          duration: dur,
         });
-        setStatus(`swipe → (${Math.round(p2.x)},${Math.round(p2.y)})`, 'ok');
+        setStatus(`drag → (${Math.round(p2.x)},${Math.round(p2.y)})`, 'ok');
       }
     } catch (err) { setStatus(err.message, 'err'); }
   });
