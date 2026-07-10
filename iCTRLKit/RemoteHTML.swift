@@ -628,15 +628,25 @@ enum RemoteHTML {
 
     if (player) { try { player.destroy(); } catch(_){} player = null; }
     player = mpegts.createPlayer({ type: 'mpegts', isLive: true, url: src }, {
-      // 2 fps is a very sparse stream — stashing helps mpegts.js batch
-      // demux work; latency-chasing would fight it. Live-sync disabled
-      // for the same reason (would seek past every idle gap).
-      enableStashBuffer: true,
-      stashInitialSize: 128,
+      // We want minimal end-to-end latency for a control UI:
+      // - stashBuffer OFF: don't hold frames waiting for a batch to fill; at
+      //   2–5 fps the previous 128 KB stash added ~3 s of built-in delay.
+      // - liveBufferLatencyChasing ON with a small window so if playback ever
+      //   falls behind (tab was backgrounded, tap RPC blocked the encoder…)
+      //   we skip forward to the newest frame instead of catching up in slow
+      //   motion.
+      enableStashBuffer: false,
       lazyLoad: false,
-      liveBufferLatencyChasing: false,
+      liveBufferLatencyChasing: true,
+      liveBufferLatencyMaxDelay: 0.6,
+      liveBufferLatencyChasingOnPaused: true,
       autoCleanupSourceBuffer: true,
+      autoCleanupMaxBackwardDuration: 3,
+      autoCleanupMinBackwardDuration: 2,
     });
+    // Best-effort: keep <video> playback rate slightly ahead of real time so
+    // small stalls don't accumulate.
+    video.playbackRate = 1.0;
     // Surface mpegts / MSE errors so the user isn't stuck on a black screen.
     player.on(mpegts.Events.ERROR, (type, detail, info) => {
       console.error('mpegts error', type, detail, info);

@@ -18,6 +18,12 @@ class JSONRPCServer {
     /// frame grabber + VideoStreamer). The server stops managing this connection
     /// once handed off — the streamer keeps it alive and closes it on disconnect.
     var onVideoStream: ((NWConnection, _ fps: Double, _ verbose: Bool) -> Void)?
+
+    /// Fired right after a UI-mutating JSON-RPC completes (tap, swipe, home, …)
+    /// so the host can nudge the video pipeline to emit a keyframe immediately
+    /// instead of waiting for the next 1/fps tick — cuts perceived click-to-
+    /// reflect latency at low fps.
+    var onRPCUIChanged: (() -> Void)?
     /// Returns redacted log text for the (auth-required) GET /logs endpoint.
     var onLogsRequest: (() -> String)?
 
@@ -523,14 +529,32 @@ class JSONRPCServer {
             return
         }
 
-        handler(rpcRequest.method, rpcRequest.params) { [weak self] result, error in
+        let method = rpcRequest.method
+        handler(method, rpcRequest.params) { [weak self] result, error in
             if let error = error {
                 self?.sendJSONRPCError(rpcRequest.id, error: error, connection: connection)
             } else {
                 self?.sendJSONRPCResult(rpcRequest.id, result: result ?? [:], connection: connection)
             }
+            // Latency shortcut: when a UI-mutating RPC finishes, tell the video
+            // pipeline to grab an extra keyframe *now* instead of waiting for
+            // the next 1/fps tick. Without this, a 2 fps tap can wait up to
+            // ~500 ms before the user sees the reaction.
+            if Self.uiMutatingMethods.contains(method) {
+                self?.onRPCUIChanged?()
+            }
         }
     }
+
+    /// RPCs that visibly change what's on screen — used to trigger an out-of-
+    /// band keyframe on the video stream so the browser reflects the change
+    /// with sub-500 ms delay instead of waiting for the next capture tick.
+    private static let uiMutatingMethods: Set<String> = [
+        "tap", "double_tap", "long_press", "swipe", "drag_up", "drag_down",
+        "drag_move", "scroll", "scroll_to_element", "tap_element", "page",
+        "type", "clear_text", "home", "lock", "unlock",
+        "launch_app", "activate_app", "terminate_app", "open_url",
+    ]
 
     // MARK: - Response Helpers
 

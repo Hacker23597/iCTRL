@@ -104,6 +104,16 @@ final class VideoBroadcaster {
         }
     }
 
+    /// Request an immediate out-of-band frame. Used by the host after a
+    /// UI-mutating RPC (tap, swipe, home…) so the browser reflects the change
+    /// without waiting for the next 1/fps tick. Cheap no-op when idle.
+    func nudgeKeyframe() {
+        queue.async {
+            guard self.timer != nil else { return }
+            self.captureAndEncode(forceKeyframe: true)
+        }
+    }
+
     func unsubscribe(_ token: ObjectIdentifier) {
         queue.async {
             self.subscribers.removeValue(forKey: token)
@@ -143,18 +153,18 @@ final class VideoBroadcaster {
         log("encoding stopped (no subscribers)")
     }
 
-    private func captureAndEncode() {
+    private func captureAndEncode(forceKeyframe: Bool = false) {
         guard let session = session, let grab = grabFrame else { return }
         let t0 = CACurrentMediaTime()
         guard let image = grab() else {
             statsDrops += 1
-            if Self.verbose { log("f#\(frameIndex) DROP: grabFrame returned nil") }
+            if VideoBroadcaster.verbose { log("f#\(frameIndex) DROP: grabFrame returned nil") }
             return
         }
         let t1 = CACurrentMediaTime()
         guard let pb = pixelBuffer(from: image) else {
             statsDrops += 1
-            if Self.verbose { log("f#\(frameIndex) DROP: pixelBuffer conversion failed") }
+            if VideoBroadcaster.verbose { log("f#\(frameIndex) DROP: pixelBuffer conversion failed") }
             return
         }
         let t2 = CACurrentMediaTime()
@@ -166,8 +176,12 @@ final class VideoBroadcaster {
                                  pixbufMs:  (t2 - t1) * 1000)
         // Retain across the async encoder callback; released in handleEncoded.
         let refcon = Unmanaged.passRetained(metric).toOpaque()
+        var frameProps: CFDictionary?
+        if forceKeyframe {
+            frameProps = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
+        }
         VTCompressionSessionEncodeFrame(session, imageBuffer: pb, presentationTimeStamp: pts,
-                                        duration: .invalid, frameProperties: nil,
+                                        duration: .invalid, frameProperties: frameProps,
                                         sourceFrameRefcon: refcon, infoFlagsOut: nil)
     }
 

@@ -689,6 +689,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Pipe VideoBroadcaster's internal events into the shared log buffer
         // so `GET /logs` shows encoder start/stop/failure alongside RPC calls.
         VideoBroadcaster.onLog = { msg in Self.logBuffer.append(msg) }
+        // Cut click-to-reflect latency: when a UI-mutating RPC completes,
+        // capture + encode a fresh keyframe instead of waiting for the next
+        // 1/fps tick (a full 500 ms at 2 fps).
+        srv.onRPCUIChanged = { VideoBroadcaster.shared.nudgeKeyframe() }
         srv.onVideoStream = { [weak self] connection, fps, verbose in
             guard self != nil else { connection.cancel(); return }
             // Verbose logging is global to the shared broadcaster (all clients
