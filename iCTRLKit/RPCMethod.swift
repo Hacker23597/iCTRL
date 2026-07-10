@@ -304,6 +304,8 @@ struct RPCMethodRegistry {
     /// actually implements.
     static let capabilityTags: [String] = [
         "bearer_auth",         // /auth + /rpc (Bearer token)
+        "basic_auth",          // Also HTTP Basic + ?token=<token> for player/browser URLs
+        "video_stream",        // GET /stream (H.264-in-MPEG-TS live screen)
         "page_source_filter",  // page_source{filter:{...}}
         "max_depth",           // page_source{max_depth}
         "find_element_ref",    // find_element → ref; tap{ref}
@@ -329,6 +331,7 @@ struct RPCMethodRegistry {
                 "skill": "GET /skill — START HERE. The operating manual in Skill (Markdown) format; read it ONCE to learn the fast-path workflow and best practices, then treat iCTRL as a Skill.",
                 "auth": "POST /auth  {client_name} → {token}. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. Returns 403 if denied.",
                 "rpc": "POST /rpc   {jsonrpc, method, params, id}  (Authorization: Bearer <token>)",
+                "stream": "GET /stream[.ts]  live H.264-in-MPEG-TS screen video (~2 fps, ?fps=N to change). Auth via Bearer, HTTP Basic, or ?token=<token> so a browser/player can open the URL directly. Play in VLC: `vlc http://<token>@<host>:8200/stream`. One shared encoder fans out to all clients; encoding stops when the last client disconnects.",
                 "logs": "GET /logs   plain-text recent logs (current process, in-memory). REQUIRES Authorization: Bearer <token>. Sensitive values are redacted",
                 "logs_files": "GET /logs/files   list persisted daily log files (survive crashes/restarts)",
                 "logs_history": "GET /logs/history?date=YYYY-MM-DD   dump a persisted day's log (redacted). Use this to recover logs from BEFORE a crash — /logs only holds the current process's memory",

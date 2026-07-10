@@ -9,6 +9,9 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private var actionHandler: ActionHandler?
     private var pendingAuthCompletions: [String: (Bool) -> Void] = [:]
     private let authLock = NSLock()
+    /// Live per-connection video streamers, retained while streaming.
+    private var videoStreamers: Set<VideoStreamer> = []
+    private let videoStreamersLock = NSLock()
 
     static let authCategoryID = "AUTH_REQUEST"
     static let allowActionID = "AUTH_ALLOW"
@@ -682,6 +685,25 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Persisted-log endpoints (crash recovery — survive process restarts).
         srv.onLogFilesRequest = { Self.logBuffer.listLogFiles() }
         srv.onLogHistoryRequest = { Self.logBuffer.readLogFile(date: $0) }
+        // Live video: shared encoder grabs the current screen via XCUIScreen.
+        srv.onVideoStream = { [weak self] connection, fps in
+            guard self != nil else { connection.cancel(); return }
+            VideoBroadcaster.shared.configure(fps: fps) {
+                XCUIScreen.main.screenshot().image
+            }
+            let streamer = VideoStreamer(connection: connection)
+            self?.videoStreamersLock.lock()
+            self?.videoStreamers.insert(streamer)
+            self?.videoStreamersLock.unlock()
+            Self.logBuffer.append("🎥 video stream client connected (fps \(fps))")
+            streamer.start(onStop: { [weak self, weak streamer] in
+                Self.logBuffer.append("🎥 video stream client disconnected")
+                guard let streamer = streamer else { return }
+                self?.videoStreamersLock.lock()
+                self?.videoStreamers.remove(streamer)
+                self?.videoStreamersLock.unlock()
+            })
+        }
     }
 
     // MARK: - Config RPC

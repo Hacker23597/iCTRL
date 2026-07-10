@@ -4,6 +4,9 @@ import Network
 class JSONRPCServer {
     private var listener: NWListener?
     private var connections: [NWConnection] = []
+    /// Connections handed off to a long-lived streamer (video) — the base receive
+    /// loop must not cancel these.
+    private var handedOff: Set<ObjectIdentifier> = []
     let port: UInt16
     private let localOnly: Bool
     private let queue = DispatchQueue(label: "com.openminis.ictrl.server")
@@ -11,6 +14,10 @@ class JSONRPCServer {
 
     var onRPCRequest: ((String, [String: JSONValue]?, @escaping ([String: JSONValue]?, JSONRPCError?) -> Void) -> Void)?
     var onStateChange: ((Bool) -> Void)?
+    /// Hand off an authorized connection to the video streamer (host owns the
+    /// frame grabber + VideoStreamer). The server stops managing this connection
+    /// once handed off — the streamer keeps it alive and closes it on disconnect.
+    var onVideoStream: ((NWConnection, _ fps: Double) -> Void)?
     /// Returns redacted log text for the (auth-required) GET /logs endpoint.
     var onLogsRequest: (() -> String)?
 
@@ -136,6 +143,9 @@ class JSONRPCServer {
                 }
             case .complete(let headerEnd, let contentLength):
                 self.processHTTPRequest(acc, headerEnd: headerEnd, contentLength: contentLength, from: connection)
+                // A streaming route (e.g. /stream) takes ownership of the socket
+                // and keeps it open — don't cancel it here.
+                if self.handedOff.contains(ObjectIdentifier(connection)) { return }
                 if isComplete || error != nil { connection.cancel() }
             }
         }
@@ -234,6 +244,9 @@ class JSONRPCServer {
 
         case ("GET", "/docs"):
             handleDocsPage(connection: connection)
+
+        case ("GET", "/stream"), ("GET", "/stream.ts"):
+            handleVideoStream(headers: headers, query: query, connection: connection)
 
         // Logs can contain sensitive context even when redacted, so they now
         // require a valid bearer token — same as /rpc.
@@ -399,12 +412,60 @@ class JSONRPCServer {
         }
     }
 
-    /// True if the request carries a valid bearer token.
-    private func isAuthorized(_ headers: [String: String]) -> Bool {
-        guard let authHeader = headers["authorization"],
-              authHeader.lowercased().hasPrefix("bearer ") else { return false }
-        let token = String(authHeader.dropFirst(7)).trimmingCharacters(in: .whitespaces)
-        return AuthManager.shared.validateToken(token)
+    /// GET /stream[.ts] — live H.264-in-MPEG-TS screen video. Auth via Bearer /
+    /// Basic / ?token=. Optional ?fps=N (0.5–10, default 2). Hands the connection
+    /// to the host's video streamer (kept open until the client disconnects).
+    private func handleVideoStream(headers: [String: String], query: String, connection: NWConnection) {
+        guard isAuthorized(headers, query: query) else {
+            // Send a Basic-auth challenge so browsers/players prompt for creds.
+            sendHTTPResponse(connection: connection, status: 401,
+                             headers: ["WWW-Authenticate": "Basic realm=\"iCTRL\""],
+                             body: "Unauthorized: pass the token via Bearer, Basic auth, or ?token=.")
+            return
+        }
+        guard let handoff = onVideoStream else {
+            sendHTTPResponse(connection: connection, status: 503, body: "Video streaming unavailable")
+            return
+        }
+        var fps = 2.0
+        for pair in query.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1)
+            if kv.count == 2, kv[0] == "fps", let v = Double(kv[1]) { fps = v }
+        }
+        handedOff.insert(ObjectIdentifier(connection))
+        handoff(connection, fps)
+    }
+
+    /// True if the request carries a valid token via EITHER `Authorization:
+    /// Bearer <token>` OR HTTP Basic auth (so a browser/player can pass the token
+    /// in the URL, e.g. http://<token>@host:8200/stream — username or password may
+    /// be the token; also accepts ?token=<token> as a last resort for players that
+    /// can't set headers). Also accepts a token in the query for URL-only clients.
+    private func isAuthorized(_ headers: [String: String], query: String = "") -> Bool {
+        if let authHeader = headers["authorization"] {
+            let lower = authHeader.lowercased()
+            if lower.hasPrefix("bearer ") {
+                let token = String(authHeader.dropFirst(7)).trimmingCharacters(in: .whitespaces)
+                if AuthManager.shared.validateToken(token) { return true }
+            }
+            if lower.hasPrefix("basic ") {
+                let b64 = String(authHeader.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+                if let data = Data(base64Encoded: b64),
+                   let creds = String(data: data, encoding: .utf8) {
+                    // "user:pass" — the token may be in either field.
+                    let parts = creds.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+                    for p in parts where AuthManager.shared.validateToken(String(p)) { return true }
+                }
+            }
+        }
+        // ?token=<token> in the query string (URL-only players).
+        for pair in query.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1)
+            if kv.count == 2, kv[0] == "token",
+               let tok = String(kv[1]).removingPercentEncoding,
+               AuthManager.shared.validateToken(tok) { return true }
+        }
+        return false
     }
 
     /// Plain-text 401 for non-RPC (e.g. GET /logs) endpoints.
