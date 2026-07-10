@@ -30,9 +30,9 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "device_info",
-            description: "Get device name, model, OS version, and — importantly — the coordinate space: point size (used by tap/swipe), pixel size (of screenshots), and scale. CALL THIS FIRST before any coordinate-based action.",
+            description: "Get device name, model, OS version, the coordinate space (point size for tap/swipe, pixel size for screenshots, scale), AND the server's identity: server_version, protocol_version, and a capabilities array — so ONE device_info call gives you both the device and what this server supports (no separate /schema fetch for feature detection). CALL THIS FIRST before any coordinate-based action.",
             params: [],
-            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, and a 'hint' string explaining the conversion."
+            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, a 'hint' string, plus server_version (semver), protocol_version (int), and capabilities (array of feature tags, e.g. bearer_auth, encrypted_channel, find_element_ref, clear_text, page, stop_server)."
         ),
         RPCMethodDef(
             name: "page_source",
@@ -289,19 +289,46 @@ struct RPCMethodRegistry {
 
     /// A self-describing document for models: top-level guidance + methods.
     /// Returned from GET /schema and GET / (Accept: application/json).
-    /// Server capability/protocol version. Clients read this from /schema to
-    /// negotiate: v1 = Bearer-token plaintext only; v2 = also the Curve25519
-    /// encrypted channel (/pair + /rpc/secure). Bump when the wire capabilities
-    /// change so clients can auto-detect what the server supports.
+    /// Semantic server version — bump on every functional change. 1.2.0 is the
+    /// release that added the encrypted auth channel plus the docs/Skill,
+    /// clear-text, page-source, and reliability improvements. Single source of
+    /// truth for /schema AND device_info.
+    static let serverVersion = "1.2.0"
+
+    /// Server capability/protocol version. Clients read this to negotiate:
+    /// v1 = Bearer-token plaintext only; v2 = also the Curve25519 encrypted
+    /// channel (/pair + /rpc/secure). Bump when the wire capabilities change.
     static let protocolVersion = 2
+
+    /// Capability tags a client can feature-detect against, from ONE device_info
+    /// call (no separate /schema fetch needed). Keep in sync with what the server
+    /// actually implements.
+    static let capabilityTags: [String] = [
+        "bearer_auth",         // /auth + /rpc (plaintext) — always
+        "encrypted_channel",   // /pair + /rpc/secure (Curve25519 + AES-GCM)
+        "page_source_filter",  // page_source{filter:{...}}
+        "max_depth",           // page_source{max_depth}
+        "find_element_ref",    // find_element → ref; tap{ref}
+        "scroll_to_element",   // scroll_to_element → ref
+        "clear_text",          // clear_text + type{clear:true}
+        "open_url",            // open_url deep links
+        "resolve_app",         // resolve_app name → bundle_id
+        "page",                // page{direction} precise paging
+        "stop_server",         // config{stop_server:true}
+        "logs_history",        // GET /logs/history (persisted logs)
+    ]
 
     static func generateSchemaDocument() -> [String: Any] {
         [
             "protocol": "JSON-RPC 2.0",
+            "server_version": serverVersion,
             // Capability version — clients negotiate against this. v1: Bearer only.
             // v2: Bearer (plaintext, always available) + Curve25519 encrypted
             // channel. Older/plaintext clients keep working on any version.
             "protocol_version": protocolVersion,
+            // Feature-detection tags (same list device_info returns, so a client
+            // can negotiate from either one).
+            "capability_tags": capabilityTags,
             "capabilities": [
                 "auth_bearer": true,                         // /auth + /rpc (plaintext) — always
                 "auth_encrypted": protocolVersion >= 2,      // /pair + /rpc/secure (Curve25519)

@@ -355,6 +355,12 @@ class ActionHandler {
             "device_name": .string(device.name),
             "model": .string(device.model),
             "system_version": .string(device.systemVersion),
+            // Server identity + capabilities — a client gets device info AND what
+            // this server supports from a single device_info call (no /schema fetch
+            // needed for feature detection).
+            "server_version": .string(RPCMethodRegistry.serverVersion),
+            "protocol_version": .int(RPCMethodRegistry.protocolVersion),
+            "capabilities": .array(RPCMethodRegistry.capabilityTags.map { .string($0) }),
             // Coordinate space that tap/swipe/drag/long_press use:
             "point_width": .double(frame.width),
             "point_height": .double(frame.height),
