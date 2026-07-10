@@ -38,7 +38,7 @@ enum RemoteHTML {
     --radius: 10px;
   }
   * { box-sizing: border-box; }
-  html, body { height: 100%; }
+  html, body { height: 100%; overscroll-behavior: none; }
   body {
     margin: 0;
     font: 14px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
@@ -47,10 +47,12 @@ enum RemoteHTML {
   }
   .app {
     display: grid;
-    grid-template-columns: 1fr 320px;
-    gap: 16px;
-    padding: 16px;
+    grid-template-columns: minmax(0, 1fr) clamp(280px, 26vw, 340px);
+    gap: 12px;
+    padding: 12px;
+    padding-bottom: 44px;   /* leave room for the fixed #status bar */
     height: 100vh;
+    height: 100dvh;         /* mobile: exclude URL bar */
   }
   /* ── panels ── */
   .panel {
@@ -62,9 +64,11 @@ enum RemoteHTML {
   .stage {
     position: relative; display: flex; align-items: center; justify-content: center;
     background: #000; user-select: none;
+    min-height: 0; min-width: 0;
   }
   #video {
-    max-width: 100%; max-height: 100%; display: block; background: #000;
+    width: 100%; height: 100%; display: block; background: #000;
+    object-fit: contain;
     outline: none;
   }
   .stage .overlay {
@@ -144,13 +148,57 @@ enum RemoteHTML {
   }
   .hint { color: var(--muted-2); font-size: 11px; margin-top: 6px; }
 
-  @media (max-width: 900px) {
-    .app { grid-template-columns: 1fr; grid-template-rows: 60vh 1fr; }
+  /* ── mobile: sidebar collapses into a FAB + bottom-sheet drawer ── */
+  #fab {
+    display: none;
+    position: fixed; right: 16px; bottom: 56px; z-index: 30;
+    width: 56px; height: 56px; border-radius: 999px;
+    background: var(--fg); color: var(--primary-fg);
+    border: none; box-shadow: 0 6px 20px rgba(0,0,0,.5);
+    font-size: 22px; cursor: pointer;
+    align-items: center; justify-content: center;
+  }
+  #fab:active { transform: translateY(1px); }
+  #scrim {
+    display: none;
+    position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 20;
+    backdrop-filter: blur(2px);
+  }
+  .app.drawer aside {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 25;
+    max-height: 78dvh; overflow-y: auto;
+    background: var(--card);
+    border-top: 1px solid var(--border);
+    border-top-left-radius: 16px; border-top-right-radius: 16px;
+    padding: 8px 12px 24px;
+    transform: translateY(100%);
+    transition: transform .22s ease;
+  }
+  .app.drawer aside::before {
+    content: ''; display: block; width: 44px; height: 4px; margin: 6px auto 10px;
+    background: var(--border-hi); border-radius: 999px;
+  }
+  .app.drawer.open aside { transform: translateY(0); }
+  .app.drawer.open #scrim { display: block; }
+
+  @media (max-width: 720px) {
+    .app { grid-template-columns: minmax(0, 1fr); padding: 8px; padding-bottom: 40px; }
+    .app aside { display: none; }               /* hidden until FAB opens drawer */
+    .app.open aside { display: flex; }
+    #fab { display: inline-flex; }
+    .stage { border-radius: 12px; }
+    .section { padding: 10px; }
+    .grid-3 { max-width: 240px; }
+  }
+  /* landscape phones: keep video full width, drawer narrower */
+  @media (max-width: 720px) and (orientation: landscape) {
+    #fab { bottom: 12px; right: 12px; width: 48px; height: 48px; font-size: 20px; }
+    .app.drawer aside { max-height: 92dvh; }
   }
 </style>
 </head>
 <body>
-<div class="app">
+<div class="app drawer" id="app">
   <!-- ── LEFT: video stage ── -->
   <section class="panel stage" id="stage">
     <video id="video" autoplay muted playsinline></video>
@@ -237,6 +285,9 @@ enum RemoteHTML {
     </div>
   </aside>
 </div>
+
+<div id="scrim"></div>
+<button id="fab" aria-label="Open controls" title="Controls">⚙︎</button>
 
 <div id="status"><span class="dot off"></span><span id="statusText">Idle</span></div>
 
@@ -479,6 +530,22 @@ enum RemoteHTML {
   }
   connectBtn.addEventListener('click', connect);
   stopBtn.addEventListener('click', stop);
+
+  // ── mobile drawer (FAB opens/closes the sidebar as a bottom sheet) ──
+  const app = document.getElementById('app');
+  const fab = document.getElementById('fab');
+  const scrim = document.getElementById('scrim');
+  const isMobile = () => window.matchMedia('(max-width: 720px)').matches;
+  function openDrawer() { app.classList.add('open'); }
+  function closeDrawer() { app.classList.remove('open'); }
+  fab.addEventListener('click', () => app.classList.contains('open') ? closeDrawer() : openDrawer());
+  scrim.addEventListener('click', closeDrawer);
+  // Auto-close after tapping a control on mobile — keeps the video visible.
+  document.querySelectorAll('aside [data-act], aside [data-nav], aside [data-page]').forEach(el => {
+    el.addEventListener('click', () => { if (isMobile()) setTimeout(closeDrawer, 120); });
+  });
+  // Prevent the video overlay from stealing swipes over the drawer.
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
 
   // Auto-connect if a token was passed via ?token=
   if (token) queueMicrotask(connect);
