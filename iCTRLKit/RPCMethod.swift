@@ -295,6 +295,8 @@ struct RPCMethodRegistry {
             "endpoints": [
                 "skill": "GET /skill — START HERE. The operating manual in Skill (Markdown) format; read it ONCE to learn the fast-path workflow and best practices, then treat iCTRL as a Skill.",
                 "auth": "POST /auth  {client_name} → {token}. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. Returns 403 if denied.",
+                "pair": "POST /pair  {client_name, client_pubkey(base64 Curve25519)} → {server_pubkey, pairing_id, fingerprint}. ENCRYPTED channel (recommended over auth): the device shows a confirm notification with your key fingerprint (like ADB). After pairing, send requests to /rpc/secure. See tools/ictrl_secure.py.",
+                "rpc_secure": "POST /rpc/secure  (header X-ICTRL-Pairing: <pairing_id>) with an AES-GCM envelope {nonce, ts, ciphertext} wrapping the JSON-RPC body. Response is an envelope too. Session key = X25519 ECDH(client, server) → HKDF-SHA256. Anti-replay: timestamp ±60s + nonce dedup.",
                 "rpc": "POST /rpc   {jsonrpc, method, params, id}  (Authorization: Bearer <token>)",
                 "logs": "GET /logs   plain-text recent logs (current process, in-memory). REQUIRES Authorization: Bearer <token>. Sensitive values are redacted",
                 "logs_files": "GET /logs/files   list persisted daily log files (survive crashes/restarts)",
