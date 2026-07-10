@@ -686,10 +686,21 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         srv.onLogFilesRequest = { Self.logBuffer.listLogFiles() }
         srv.onLogHistoryRequest = { Self.logBuffer.readLogFile(date: $0) }
         // Live video: shared encoder grabs the current screen via XCUIScreen.
+        // Pipe VideoBroadcaster's internal events into the shared log buffer
+        // so `GET /logs` shows encoder start/stop/failure alongside RPC calls.
+        VideoBroadcaster.onLog = { msg in Self.logBuffer.append(msg) }
         srv.onVideoStream = { [weak self] connection, fps in
             guard self != nil else { connection.cancel(); return }
+            // XCUIScreen.main.screenshot() is a private XCTest API that must run
+            // on the main thread — hop over there synchronously from whatever
+            // queue the broadcaster ticks on.
             VideoBroadcaster.shared.configure(fps: fps) {
-                XCUIScreen.main.screenshot().image
+                if Thread.isMainThread {
+                    return XCUIScreen.main.screenshot().image
+                }
+                var img: UIImage?
+                DispatchQueue.main.sync { img = XCUIScreen.main.screenshot().image }
+                return img
             }
             let streamer = VideoStreamer(connection: connection)
             self?.videoStreamersLock.lock()

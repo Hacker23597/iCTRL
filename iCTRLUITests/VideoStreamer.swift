@@ -24,6 +24,14 @@ import UIKit
 final class VideoBroadcaster {
     static let shared = VideoBroadcaster()
 
+    /// Sink for lifecycle events — the host wires this to its logBuffer so
+    /// `GET /logs` shows encoder starts/stops/failures alongside RPC calls.
+    static var onLog: ((String) -> Void)?
+    private func log(_ msg: String) {
+        NSLog("iCTRL video: %@", msg)
+        Self.onLog?("🎥 " + msg)
+    }
+
     private let queue = DispatchQueue(label: "com.openminis.ictrl.video.broadcast")
     private var subscribers: [ObjectIdentifier: (Data) -> Void] = [:]
     private var grabFrame: (() -> UIImage?)?
@@ -67,7 +75,7 @@ final class VideoBroadcaster {
 
     private func startEncoding() {
         guard timer == nil, let grab = grabFrame, let first = grab(), let cg = first.cgImage else {
-            NSLog("iCTRL video: no first frame — cannot start encoding")
+            log("no first frame — cannot start encoding (grabFrame returned nil)")
             return
         }
         width = cg.width; height = cg.height
@@ -79,7 +87,7 @@ final class VideoBroadcaster {
         t.setEventHandler { [weak self] in self?.captureAndEncode() }
         timer = t
         t.resume()
-        NSLog("iCTRL video: encoding started \(width)x\(height) @\(fps)fps")
+        log("encoding started \(width)x\(height) @\(fps)fps")
     }
 
     private func stopEncoding() {
@@ -87,7 +95,7 @@ final class VideoBroadcaster {
         if let s = session { VTCompressionSessionInvalidate(s); session = nil }
         muxer = nil
         parameterSets = []
-        NSLog("iCTRL video: encoding stopped (no subscribers)")
+        log("encoding stopped (no subscribers)")
     }
 
     private func captureAndEncode() {
@@ -115,7 +123,7 @@ final class VideoBroadcaster {
             outputCallback: Self.encodeCallback,
             refcon: Unmanaged.passUnretained(self).toOpaque(), compressionSessionOut: &s)
         guard status == noErr, let session = s else {
-            NSLog("iCTRL video: VTCompressionSessionCreate failed \(status)")
+            log("VTCompressionSessionCreate failed status=\(status)")
             return false
         }
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
