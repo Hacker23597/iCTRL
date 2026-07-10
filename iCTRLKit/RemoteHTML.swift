@@ -175,41 +175,41 @@ enum RemoteHTML {
     position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 20;
     backdrop-filter: blur(2px);
   }
-  .app.drawer aside {
-    position: fixed; left: 0; right: 0; bottom: 0; z-index: 25;
-    max-height: 78dvh; overflow-y: auto;
-    background: var(--card);
-    border-top: 1px solid var(--border);
-    border-top-left-radius: 16px; border-top-right-radius: 16px;
-    padding: 8px 12px 24px;
-    transform: translateY(100%);
-    transition: transform .22s ease;
-  }
-  .app.drawer aside::before {
-    content: ''; display: block; width: 44px; height: 4px; margin: 6px auto 10px;
-    background: var(--border-hi); border-radius: 999px;
-  }
-  .app.drawer.open aside { transform: translateY(0); }
-  .app.drawer.open #scrim { display: block; }
 
+  /* Drawer styling only kicks in on narrow viewports — on desktop the sidebar
+     is a normal grid column. */
   @media (max-width: 720px) {
     .app { grid-template-columns: minmax(0, 1fr); padding: 8px; padding-bottom: 40px; }
-    .app aside { display: none; }               /* hidden until FAB opens drawer */
-    .app.open aside { display: flex; }
+    .app > aside {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 25;
+      max-height: 78dvh; overflow-y: auto;
+      background: var(--card);
+      border-top: 1px solid var(--border);
+      border-top-left-radius: 16px; border-top-right-radius: 16px;
+      padding: 8px 12px 24px;
+      transform: translateY(100%);
+      transition: transform .22s ease;
+    }
+    .app > aside::before {
+      content: ''; display: block; width: 44px; height: 4px; margin: 6px auto 10px;
+      background: var(--border-hi); border-radius: 999px;
+    }
+    .app.open > aside { transform: translateY(0); }
+    .app.open #scrim { display: block; }
     #fab { display: inline-flex; }
     .stage { border-radius: 12px; }
     .section { padding: 10px; }
     .grid-3 { max-width: 240px; }
   }
-  /* landscape phones: keep video full width, drawer narrower */
+  /* landscape phones: keep video full width, drawer larger */
   @media (max-width: 720px) and (orientation: landscape) {
     #fab { bottom: 12px; right: 12px; width: 48px; height: 48px; font-size: 20px; }
-    .app.drawer aside { max-height: 92dvh; }
+    .app > aside { max-height: 92dvh; }
   }
 </style>
 </head>
 <body>
-<div class="app drawer" id="app">
+<div class="app" id="app">
   <!-- ── LEFT: video stage ── -->
   <section class="panel stage" id="stage">
     <video id="video" autoplay muted playsinline></video>
