@@ -43,8 +43,6 @@ enum L10n {
         case remoteFailedBody, remoteDisabledBody
         case authRequestBody       // %@ = client name
         case onDeviceOnlySuffix
-        case pairRequestTitle
-        case pairRequestBody       // %1$@ = client name, %2$@ = fingerprint
     }
 
     // key → (lang → text). English is the required fallback for every key.
@@ -108,16 +106,6 @@ enum L10n {
                            .es: "\"%@\" quiere controlar este dispositivo.\nMantén pulsado para permitir o denegar",
                            .de: "„%@“ möchte dieses Gerät steuern.\nLang drücken zum Zulassen oder Ablehnen",
                            .ru: "«%@» хочет управлять этим устройством.\nУдерживайте, чтобы разрешить или отклонить"],
-        .pairRequestTitle: [.en: "🔑 Pairing Request", .zhHans: "🔑 配对请求", .zhHant: "🔑 配對請求", .ja: "🔑 ペアリング要求",
-                            .ko: "🔑 페어링 요청", .es: "🔑 Solicitud de emparejamiento", .de: "🔑 Kopplungsanfrage", .ru: "🔑 Запрос сопряжения"],
-        .pairRequestBody: [.en: "\"%1$@\" wants to pair (encrypted).\nKey fingerprint: %2$@\nLong press to Allow or Deny",
-                           .zhHans: "“%1$@” 请求配对(加密连接)。\n密钥指纹:%2$@\n长按以允许或拒绝",
-                           .zhHant: "「%1$@」請求配對(加密連線)。\n金鑰指紋:%2$@\n長按以允許或拒絕",
-                           .ja: "「%1$@」がペアリング(暗号化)を要求しています。\n鍵フィンガープリント:%2$@\n長押しで許可または拒否",
-                           .ko: "\"%1$@\"이(가) 페어링(암호화)을 요청합니다.\n키 지문: %2$@\n길게 눌러 허용 또는 거부",
-                           .es: "\"%1$@\" quiere emparejarse (cifrado).\nHuella de clave: %2$@\nMantén pulsado para permitir o denegar",
-                           .de: "„%1$@“ möchte sich koppeln (verschlüsselt).\nSchlüssel-Fingerabdruck: %2$@\nLang drücken zum Zulassen oder Ablehnen",
-                           .ru: "«%1$@» хочет выполнить сопряжение (шифрование).\nОтпечаток ключа: %2$@\nУдерживайте, чтобы разрешить или отклонить"],
         .onDeviceOnlySuffix: [.en: "reachable on-device only; connect over Wi-Fi for LAN access",
                               .zhHans: "仅本机可访问;请连接 Wi-Fi 以支持局域网访问",
                               .zhHant: "僅本機可存取;請連接 Wi-Fi 以支援區域網路存取",

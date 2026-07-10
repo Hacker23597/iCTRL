@@ -13,9 +13,7 @@ iCTRL runs on an iPhone and exposes iOS UI automation as a **JSON-RPC 2.0 API ov
 2. **Get a token**: `POST /auth` with `{"client_name":"<you>"}`. **This BLOCKS until the device user taps Allow on-screen** — use a client timeout ≥ 60s and do NOT retry early (each retry pops another prompt). On approval you get a token (valid 30 days, survives restarts); denial returns HTTP 403.
 3. **Call methods**: `POST /rpc` with `{"jsonrpc":"2.0","method":"…","params":{…},"id":1}` and header `Authorization: Bearer <token>`.
 
-**Detect capabilities from `device_info`.** The first `device_info` call returns `server_version` (semver), `protocol_version` (`1` = Bearer plaintext only; `2` = also encrypted), and a `capabilities` array (`bearer_auth`, `encrypted_channel`, `page_source_filter`, `max_depth`, `find_element_ref`, `scroll_to_element`, `clear_text`, `open_url`, `resolve_app`, `page`, `stop_server`, `logs_history`). Feature-detect against these — no separate `/schema` fetch — and don't assume a method exists on an older `server_version`.
-
-**Optional encrypted channel (protocol_version ≥ 2).** For LAN traffic that can't be sniffed/MITM'd: `POST /pair {client_name, client_pubkey(base64 Curve25519)}` — the device shows a key **fingerprint** to confirm (ADB-style) → `{server_pubkey, pairing_id}`. Then send `POST /rpc/secure` (header `X-ICTRL-Pairing: <id>`) with an AES-GCM envelope `{nonce, ts, ciphertext}` wrapping the JSON-RPC body; the response is an envelope too. Session key = X25519 ECDH → HKDF-SHA256; anti-replay = timestamp ±60s + nonce. Ready-made client: `tools/ictrl_secure.py`. The plaintext Bearer path always works, so only pair if `capabilities` includes `encrypted_channel` and you want encryption.
+**Detect capabilities from `device_info`.** The first `device_info` call returns `server_version` (semver), `protocol_version` (int), and a `capabilities` array (`bearer_auth`, `page_source_filter`, `max_depth`, `find_element_ref`, `scroll_to_element`, `clear_text`, `open_url`, `resolve_app`, `page`, `stop_server`, `logs_history`). Feature-detect against these — no separate `/schema` fetch — and don't assume a method exists on an older `server_version`.
 
 **Cache the token so you don't re-prompt the user every run.** On first successful `/auth`, persist it to **`~/.ictrl/token.json`** as:
 ```json
@@ -25,7 +23,7 @@ On subsequent runs, **before calling `/auth`**: read `~/.ictrl/token.json`, and 
 
 Full machine-readable method list + parameters + guidance: **`GET /schema`** (JSON). This SKILL is the how; `/schema` is the exact what (method names, params, return shapes). Method set can change — trust `/schema` for the current list.
 
-**Capability negotiation.** `/schema` includes `protocol_version` and `capabilities`. v1 = Bearer-token plaintext only (`/auth` + `/rpc`). v2 = also an encrypted channel (`/pair` + `/rpc/secure`, Curve25519 ECDH + AES-GCM, with an ADB-style fingerprint confirmation on the device). The plaintext Bearer path always works on any version, so a client that doesn't upgrade keeps working; a client that wants encryption reads `capabilities.auth_encrypted` and, if true, pairs via `/pair` (see tools/ictrl_secure.py). Older servers without the field → treat as v1 (plaintext).
+**Capability negotiation.** `/schema` and `device_info` include `protocol_version` and a `capabilities` list. Read them and don't assume a method exists on an older `server_version`; older servers without these fields → treat conservatively.
 
 ## The golden rules (this is where speed comes from)
 

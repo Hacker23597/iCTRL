@@ -32,7 +32,7 @@ struct RPCMethodRegistry {
             name: "device_info",
             description: "Get device name, model, OS version, the coordinate space (point size for tap/swipe, pixel size for screenshots, scale), AND the server's identity: server_version, protocol_version, and a capabilities array — so ONE device_info call gives you both the device and what this server supports (no separate /schema fetch for feature detection). CALL THIS FIRST before any coordinate-based action.",
             params: [],
-            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, a 'hint' string, plus server_version (semver), protocol_version (int), and capabilities (array of feature tags, e.g. bearer_auth, encrypted_channel, find_element_ref, clear_text, page, stop_server)."
+            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, a 'hint' string, plus server_version (semver), protocol_version (int), and capabilities (array of feature tags, e.g. bearer_auth, find_element_ref, clear_text, page, stop_server)."
         ),
         RPCMethodDef(
             name: "page_source",
@@ -295,17 +295,15 @@ struct RPCMethodRegistry {
     /// truth for /schema AND device_info.
     static let serverVersion = "1.2.0"
 
-    /// Server capability/protocol version. Clients read this to negotiate:
-    /// v1 = Bearer-token plaintext only; v2 = also the Curve25519 encrypted
-    /// channel (/pair + /rpc/secure). Bump when the wire capabilities change.
-    static let protocolVersion = 2
+    /// Server capability/protocol version. v1 = Bearer-token auth over /auth +
+    /// /rpc. Bump when the wire capabilities change so clients can auto-detect.
+    static let protocolVersion = 1
 
     /// Capability tags a client can feature-detect against, from ONE device_info
     /// call (no separate /schema fetch needed). Keep in sync with what the server
     /// actually implements.
     static let capabilityTags: [String] = [
-        "bearer_auth",         // /auth + /rpc (plaintext) — always
-        "encrypted_channel",   // /pair + /rpc/secure (Curve25519 + AES-GCM)
+        "bearer_auth",         // /auth + /rpc (Bearer token)
         "page_source_filter",  // page_source{filter:{...}}
         "max_depth",           // page_source{max_depth}
         "find_element_ref",    // find_element → ref; tap{ref}
@@ -322,23 +320,14 @@ struct RPCMethodRegistry {
         [
             "protocol": "JSON-RPC 2.0",
             "server_version": serverVersion,
-            // Capability version — clients negotiate against this. v1: Bearer only.
-            // v2: Bearer (plaintext, always available) + Curve25519 encrypted
-            // channel. Older/plaintext clients keep working on any version.
+            // Capability version — clients negotiate against this.
             "protocol_version": protocolVersion,
             // Feature-detection tags (same list device_info returns, so a client
             // can negotiate from either one).
             "capability_tags": capabilityTags,
-            "capabilities": [
-                "auth_bearer": true,                         // /auth + /rpc (plaintext) — always
-                "auth_encrypted": protocolVersion >= 2,      // /pair + /rpc/secure (Curve25519)
-                "encryption": (protocolVersion >= 2 ? "x25519-ecdh+hkdf-sha256+aes-256-gcm" : "") as Any,
-            ] as [String: Any],
             "endpoints": [
                 "skill": "GET /skill — START HERE. The operating manual in Skill (Markdown) format; read it ONCE to learn the fast-path workflow and best practices, then treat iCTRL as a Skill.",
                 "auth": "POST /auth  {client_name} → {token}. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. Returns 403 if denied.",
-                "pair": "POST /pair  {client_name, client_pubkey(base64 Curve25519)} → {server_pubkey, pairing_id, fingerprint}. ENCRYPTED channel (recommended over auth): the device shows a confirm notification with your key fingerprint (like ADB). After pairing, send requests to /rpc/secure. See tools/ictrl_secure.py.",
-                "rpc_secure": "POST /rpc/secure  (header X-ICTRL-Pairing: <pairing_id>) with an AES-GCM envelope {nonce, ts, ciphertext} wrapping the JSON-RPC body. Response is an envelope too. Session key = X25519 ECDH(client, server) → HKDF-SHA256. Anti-replay: timestamp ±60s + nonce dedup.",
                 "rpc": "POST /rpc   {jsonrpc, method, params, id}  (Authorization: Bearer <token>)",
                 "logs": "GET /logs   plain-text recent logs (current process, in-memory). REQUIRES Authorization: Bearer <token>. Sensitive values are redacted",
                 "logs_files": "GET /logs/files   list persisted daily log files (survive crashes/restarts)",
@@ -510,15 +499,11 @@ struct RPCMethodRegistry {
         </div>
 
         <div class="info" style="border-left:4px solid #5856d6">
-        <p><strong>🔐 Two auth modes + version negotiation.</strong></p>
+        <p><strong>🔎 Version &amp; capabilities.</strong></p>
         <p style="margin-top:6px;color:#6e6e73;font-size:14px">
         <code>device_info</code> (and <code>/schema</code>) report <code>server_version</code>, <code>protocol_version</code>
-        and a <code>capabilities</code> array — feature-detect from ONE call. <strong>v1</strong> = plaintext Bearer only
-        (<code>/auth</code> + <code>/rpc</code>). <strong>v2</strong> = also an <strong>encrypted channel</strong>: pair once via
-        <code>POST /pair {client_name, client_pubkey}</code> (the device shows a key <em>fingerprint</em> to confirm, ADB-style),
-        then send <code>POST /rpc/secure</code> with an AES-GCM envelope (Curve25519 ECDH → HKDF → AES-256-GCM; anti-replay via
-        nonce + timestamp). The plaintext Bearer path always works, so old clients keep running. See
-        <code>tools/ictrl_secure.py</code>.
+        and a <code>capabilities</code> array — feature-detect from ONE call and don't assume a method exists on an older
+        <code>server_version</code>.
         </p>
         </div>
 

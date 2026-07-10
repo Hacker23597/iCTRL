@@ -78,53 +78,26 @@ All methods are JSON-RPC 2.0 (`POST /rpc`). Highlights:
 The endpoints `GET /`, `GET /logs`, `GET /logs/files`, and `GET /logs/history?date=`
 expose docs and (redacted) persisted daily logs for diagnostics.
 
-## Auth & encryption
+## Auth & sessions
 
-iCTRL has **two auth modes**. The encrypted one is additive — the plaintext
-Bearer path always works, so a client that doesn't upgrade keeps running.
-
-### Plaintext Bearer (always available)
 - `POST /auth {client_name}` → a UUID token (blocks on the on-device Allow/Deny
   prompt). Send it as `Authorization: Bearer <token>` on `POST /rpc`.
 - Tokens are stored in a sandbox file (`Library/Application Support/iCTRL/`), not
   the Keychain — so OTA re-signing doesn't invalidate them. Sessions expire after
   30 days of inactivity; the store is capped at 100 (least-recently-active dropped).
 
-### Encrypted channel (Curve25519 + AES-GCM)
-An ADB-style paired, end-to-end encrypted channel so LAN traffic can't be sniffed
-or MITM'd, built entirely on CryptoKit (no third-party crypto).
-
-1. **Pair once** — the client generates a Curve25519 key pair and calls
-   `POST /pair {client_name, client_pubkey}`. The device shows a confirm
-   notification with the key **fingerprint** (like ADB "Allow USB debugging" — the
-   user verifies it out-of-band). On approval → `{server_pubkey, pairing_id}`.
-2. **Session key** — both sides do X25519 ECDH(own priv, peer pub) → HKDF-SHA256.
-   Never transmitted.
-3. **Encrypted RPC** — `POST /rpc/secure` (header `X-ICTRL-Pairing: <id>`) with an
-   AES-GCM envelope `{nonce, ts, ciphertext}` wrapping the JSON-RPC body; the
-   response is an envelope too. Anti-replay: timestamp ±60s + nonce dedup.
-
-Client library: [`tools/ictrl_secure.py`](tools/ictrl_secure.py) — keypair and
-per-host pairing cached at `~/.ictrl/keypair.json`.
-
-```bash
-uv run tools/ictrl_secure.py <host:port> pair my-agent      # once, confirm on device
-uv run tools/ictrl_secure.py <host:port> rpc device_info
-```
-
 ### Version negotiation
 `device_info` (and `/schema`) report the server's capabilities, so a client can
 feature-detect from **one call** — no separate `/schema` fetch:
 
 - `server_version` — semver (e.g. `"1.2.0"`), bumped on every functional change.
-- `protocol_version` — `1` = Bearer plaintext only; `2` = also the encrypted
-  channel. Missing field ⇒ treat as v1.
-- `capabilities` — feature tags: `bearer_auth`, `encrypted_channel`,
-  `page_source_filter`, `max_depth`, `find_element_ref`, `scroll_to_element`,
-  `clear_text`, `open_url`, `resolve_app`, `page`, `stop_server`, `logs_history`.
+- `protocol_version` — integer; bumped when the wire capabilities change.
+- `capabilities` — feature tags: `bearer_auth`, `page_source_filter`,
+  `max_depth`, `find_element_ref`, `scroll_to_element`, `clear_text`, `open_url`,
+  `resolve_app`, `page`, `stop_server`, `logs_history`.
 
-A client reads these, then picks Bearer or encrypted accordingly. Old servers
-without the fields work as plaintext-only.
+A client reads these and doesn't assume a method exists on an older
+`server_version`.
 
 ## Building
 

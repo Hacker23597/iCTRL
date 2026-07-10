@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["cryptography"]
+# dependencies = []
 # ///
 """
 iCTRL GUI — a minimal live viewer + input passthrough for the iCTRL phone
@@ -59,13 +59,6 @@ from tkinter import ttk, messagebox, simpledialog
 import urllib.request
 import urllib.error
 
-# Encrypted-channel client (Curve25519 + AES-GCM) lives alongside this file.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-try:
-    from ictrl_secure import SecureClient
-except Exception:
-    SecureClient = None
-
 # Generic default — not a specific device. Override with --host or the UI field.
 DEFAULT_HOST = "127.0.0.1:8200"
 
@@ -83,33 +76,6 @@ class ICtrlClient:
         # different threads. The server processes one connection at a time, so
         # overlapping requests can interfere; serialize all HTTP on one lock.
         self._http_lock = threading.Lock()
-        # Optional encrypted channel: when set, rpc() routes through it instead
-        # of the plaintext Bearer path. Populated by enable_encryption().
-        self._secure = None
-
-    # --- encryption ---
-    def server_capabilities(self, timeout=8):
-        """Read device_info → (server_version, protocol_version, capabilities)."""
-        info = self.rpc("device_info", timeout=timeout)
-        return (info.get("server_version"), int(info.get("protocol_version", 1)),
-                info.get("capabilities", []))
-
-    def enable_encryption(self):
-        """Pair (if needed) and switch rpc() to the encrypted channel. BLOCKS on
-        the device confirm during first pairing. Returns the key fingerprint."""
-        if SecureClient is None:
-            raise RuntimeError("encryption unavailable: the 'cryptography' package didn't load")
-        sc = SecureClient(self.host)
-        if not sc.pairing_id:      # first time on this host → pair (device confirm)
-            sc.pair("iCTRL GUI")
-        else:
-            sc.secure_rpc("device_info")   # verify existing pairing still works
-        self._secure = sc
-        return sc.fingerprint(sc._pub_raw)
-
-    @property
-    def encrypted(self):
-        return self._secure is not None
 
     # --- low-level HTTP ---
     def _post(self, path, payload, timeout=30, auth=True):
@@ -156,10 +122,6 @@ class ICtrlClient:
         return False
 
     def rpc(self, method, params=None, timeout=30):
-        # Encrypted path when paired — same call site, transparently secure.
-        if self._secure is not None:
-            with self._http_lock:
-                return self._secure.secure_rpc(method, params)
         self._id += 1
         res = self._post("/rpc", {"jsonrpc": "2.0", "method": method,
                                   "params": params or {}, "id": self._id}, timeout=timeout)
@@ -260,12 +222,6 @@ class App:
         self.stop_btn.grid(row=2, column=2, sticky="we", pady=(4, 0))
         ttk.Button(conn, text="Authorize on device", command=self.on_authorize).grid(
             row=3, column=0, columnspan=3, sticky="we", pady=(2, 0))
-        # Encrypted channel toggle: pairs (device confirm) and routes all RPC
-        # through Curve25519 + AES-GCM. Only works if the server is protocol v2.
-        self.encrypt_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(conn, text="🔒 Encrypted channel", variable=self.encrypt_var,
-                        command=self.on_toggle_encryption).grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
         conn.columnconfigure(1, weight=1)
 
         # Stream settings
@@ -387,40 +343,6 @@ class App:
                     self.set_status("Authorization denied", "#f33")
             except Exception as e:
                 self.set_status(f"Auth failed: {e}", "#f33")
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def on_toggle_encryption(self):
-        """Enable/disable the encrypted channel. Enabling pairs (device confirm)
-        and routes all subsequent RPC through Curve25519 + AES-GCM."""
-        if not self.encrypt_var.get():
-            if self.client:
-                self.client._secure = None
-            self.set_status("encryption off (plaintext Bearer)", "#888")
-            return
-        if not self.client:
-            self.encrypt_var.set(False)
-            self.set_status("connect first, then enable encryption", "#fa0")
-            return
-        if SecureClient is None:
-            self.encrypt_var.set(False)
-            self.set_status("encryption unavailable (cryptography not loaded)", "#f33")
-            return
-
-        def worker():
-            try:
-                # Gate on server capability (protocol v2 / encrypted_channel tag).
-                _, pv, caps = self.client.server_capabilities()
-                if pv < 2 and "encrypted_channel" not in caps:
-                    self.root.after(0, lambda: self.encrypt_var.set(False))
-                    self.set_status(f"server is v{pv} — no encrypted channel", "#f33")
-                    return
-                self.set_status("pairing… confirm on device", "#fa0")
-                fp = self.client.enable_encryption()
-                self.set_status(f"🔒 encrypted (fp {fp})", "#0a7")
-            except Exception as e:
-                self.root.after(0, lambda: self.encrypt_var.set(False))
-                self.set_status(f"encryption failed: {e}", "#f33")
 
         threading.Thread(target=worker, daemon=True).start()
 

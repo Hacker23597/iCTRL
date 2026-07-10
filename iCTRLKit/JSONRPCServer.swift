@@ -11,10 +11,6 @@ class JSONRPCServer {
 
     var onRPCRequest: ((String, [String: JSONValue]?, @escaping ([String: JSONValue]?, JSONRPCError?) -> Void) -> Void)?
     var onStateChange: ((Bool) -> Void)?
-    /// Pairing approval: (clientName, fingerprint, completion(approved)). The host
-    /// shows a confirm notification displaying the fingerprint (like ADB), then
-    /// calls completion with the user's decision.
-    var onPairRequest: ((String, String, @escaping (Bool) -> Void) -> Void)?
     /// Returns redacted log text for the (auth-required) GET /logs endpoint.
     var onLogsRequest: (() -> String)?
 
@@ -256,14 +252,8 @@ class JSONRPCServer {
         case ("POST", "/auth"):
             handleAuth(body: body, connection: connection)
 
-        case ("POST", "/pair"):
-            handlePair(body: body, connection: connection)
-
         case ("POST", "/rpc"):
             handleRPC(headers: headers, body: body, connection: connection)
-
-        case ("POST", "/rpc/secure"):
-            handleSecureRPC(headers: headers, body: body, connection: connection)
 
         case ("OPTIONS", _):
             sendHTTPResponse(connection: connection, status: 200, headers: corsHeaders(), body: "")
@@ -407,104 +397,6 @@ class JSONRPCServer {
                 self?.sendHTTPResponse(connection: connection, status: 200, contentType: "application/json", body: jsonString)
             }
         }
-    }
-
-    // MARK: - Secure (encrypted) pairing + RPC
-
-    private struct PairRequest: Decodable { let client_name: String; let client_pubkey: String }
-
-    /// POST /pair {client_name, client_pubkey(base64 Curve25519)} → user confirms
-    /// the fingerprint → {server_pubkey, pairing_id, fingerprint}.
-    private func handlePair(body: Data?, connection: NWConnection) {
-        guard let body = body,
-              let req = try? JSONDecoder().decode(PairRequest.self, from: body),
-              let pub = Data(base64Encoded: req.client_pubkey), pub.count == 32 else {
-            sendHTTPResponse(connection: connection, status: 400, contentType: "application/json",
-                             body: "{\"error\":\"invalid pair request: need client_name + 32-byte base64 client_pubkey\"}")
-            return
-        }
-        let fp = SecureChannel.fingerprint(of: pub)
-        let approve = onPairRequest ?? { _, _, done in done(true) }
-        approve(req.client_name, fp) { [weak self] ok in
-            guard let self = self else { return }
-            guard ok else {
-                self.sendHTTPResponse(connection: connection, status: 403, contentType: "application/json",
-                                      body: "{\"error\":\"pairing denied\"}")
-                return
-            }
-            let pairing = SecureChannel.shared.createPairing(clientName: req.client_name, clientPublicKey: pub)
-            let resp: [String: Any] = [
-                "server_pubkey": SecureChannel.shared.serverPublicKeyBase64,
-                "pairing_id": pairing.pairingId,
-                "fingerprint": fp,
-            ]
-            if let d = try? JSONSerialization.data(withJSONObject: resp),
-               let s = String(data: d, encoding: .utf8) {
-                self.sendHTTPResponse(connection: connection, status: 200, contentType: "application/json", body: s)
-            }
-        }
-    }
-
-    /// POST /rpc/secure  (header X-ICTRL-Pairing: <id>) with an encrypted envelope
-    /// body → decrypt → dispatch JSON-RPC → encrypt the response.
-    private func handleSecureRPC(headers: [String: String], body: Data?, connection: NWConnection) {
-        guard let pairingId = headers["x-ictrl-pairing"], !pairingId.isEmpty else {
-            sendHTTPResponse(connection: connection, status: 401, contentType: "application/json",
-                             body: "{\"error\":\"missing X-ICTRL-Pairing header — call /pair first\"}")
-            return
-        }
-        guard let body = body,
-              let env = try? JSONDecoder().decode(SecureChannel.Envelope.self, from: body) else {
-            sendHTTPResponse(connection: connection, status: 400, contentType: "application/json",
-                             body: "{\"error\":\"invalid encrypted envelope\"}")
-            return
-        }
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        let plaintext: Data
-        do {
-            plaintext = try SecureChannel.shared.open(envelope: env, pairingId: pairingId, nowMs: nowMs)
-        } catch {
-            let reason: String
-            switch error {
-            case SecureChannel.SecureError.unknownPairing: reason = "unknown pairing_id — re-pair via /pair"
-            case SecureChannel.SecureError.staleTimestamp: reason = "stale timestamp (clock skew or replay) — resend"
-            case SecureChannel.SecureError.replayed: reason = "replayed nonce rejected"
-            default: reason = "decryption failed"
-            }
-            sendHTTPResponse(connection: connection, status: 401, contentType: "application/json",
-                             body: "{\"error\":\"\(reason)\"}")
-            return
-        }
-
-        // Parse the decrypted JSON-RPC request and dispatch through the same path.
-        guard let rpcRequest = try? JSONDecoder().decode(JSONRPCRequest.self, from: plaintext),
-              rpcRequest.jsonrpc == "2.0", let handler = onRPCRequest else {
-            sendSecureError(connection: connection, pairingId: pairingId, nowMs: nowMs, id: nil, error: .invalidRequest)
-            return
-        }
-        handler(rpcRequest.method, rpcRequest.params) { [weak self] result, error in
-            guard let self = self else { return }
-            let response = JSONRPCResponse(result: error == nil ? (result ?? [:]) : nil, error: error, id: rpcRequest.id)
-            guard let respData = try? JSONEncoder().encode(response) else { return }
-            self.sendSealed(connection: connection, pairingId: pairingId, nowMs: nowMs, plaintext: respData)
-        }
-    }
-
-    private func sendSecureError(connection: NWConnection, pairingId: String, nowMs: Int64,
-                                 id: JSONValue?, error: JSONRPCError) {
-        let response = JSONRPCResponse(result: nil, error: error, id: id)
-        guard let data = try? JSONEncoder().encode(response) else { return }
-        sendSealed(connection: connection, pairingId: pairingId, nowMs: nowMs, plaintext: data)
-    }
-
-    private func sendSealed(connection: NWConnection, pairingId: String, nowMs: Int64, plaintext: Data) {
-        guard let env = try? SecureChannel.shared.seal(plaintext: plaintext, pairingId: pairingId, nowMs: nowMs),
-              let out = try? JSONEncoder().encode(env),
-              let str = String(data: out, encoding: .utf8) else {
-            sendHTTPResponse(connection: connection, status: 500, body: "seal failed")
-            return
-        }
-        sendHTTPResponse(connection: connection, status: 200, contentType: "application/json", body: str)
     }
 
     /// True if the request carries a valid bearer token.

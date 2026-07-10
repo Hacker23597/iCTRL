@@ -486,13 +486,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             return
         }
 
-        // Handle auth AND pairing request responses (same Allow/Deny actions,
-        // same pending-completions map).
-        guard requestID.hasPrefix("auth-") || requestID.hasPrefix("pair-") else {
+        // Handle auth request responses.
+        guard requestID.hasPrefix("auth-") else {
             completionHandler()
             return
         }
-        let kind = requestID.hasPrefix("pair-") ? "Pair" : "Auth"
+        let kind = "Auth"
 
         authLock.lock()
         let authCompletion = pendingAuthCompletions.removeValue(forKey: requestID)
@@ -683,17 +682,6 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Persisted-log endpoints (crash recovery — survive process restarts).
         srv.onLogFilesRequest = { Self.logBuffer.listLogFiles() }
         srv.onLogHistoryRequest = { Self.logBuffer.readLogFile(date: $0) }
-        // Encrypted-channel pairing approval (like ADB "Allow USB debugging"):
-        // show a confirm notification with the client's key fingerprint.
-        srv.onPairRequest = { [weak self] clientName, fingerprint, completion in
-            guard let self = self else { completion(false); return }
-            let requestID = "pair-\(UUID().uuidString)"
-            self.authLock.lock()
-            self.pendingAuthCompletions[requestID] = completion
-            self.authLock.unlock()
-            Self.logBuffer.append("🔑 Pair request from \"\(clientName)\" fingerprint \(fingerprint)")
-            self.sendPairNotification(clientName: clientName, fingerprint: fingerprint, requestID: requestID)
-        }
     }
 
     // MARK: - Config RPC
@@ -1006,20 +994,6 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             content: content,
             trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.1, repeats: false)
         )
-        UNUserNotificationCenter.current().add(request)
-    }
-
-    /// Pairing confirmation — shows the client's key FINGERPRINT so the user can
-    /// verify it out-of-band (defends against MITM at first contact, like ADB).
-    private func sendPairNotification(clientName: String, fingerprint: String, requestID: String) {
-        let content = UNMutableNotificationContent()
-        content.title = L10n.t(.pairRequestTitle)
-        content.body = String(format: L10n.t(.pairRequestBody), clientName, fingerprint)
-        content.sound = .default
-        content.categoryIdentifier = Self.authCategoryID   // reuse Allow/Deny actions
-        let request = UNNotificationRequest(
-            identifier: requestID, content: content,
-            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.1, repeats: false))
         UNUserNotificationCenter.current().add(request)
     }
 
