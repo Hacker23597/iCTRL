@@ -457,6 +457,24 @@ class JSONRPCServer {
     }
 
     /// True if the request carries a valid token via EITHER `Authorization:
+    /// True when the remote peer of a listener-side NWConnection is the local
+    /// host (127.0.0.1 / ::1). Used to skip Bearer auth for local IPC — e.g.
+    /// MinisApp's Debug Server forwarding taps to iCTRL running on the same
+    /// device. iOS's sandbox already restricts which processes can dial
+    /// loopback, so this is a reasonable trust boundary for a dev tool.
+    static func isLoopback(_ connection: NWConnection) -> Bool {
+        switch connection.endpoint {
+        case .hostPort(let host, _):
+            switch host {
+            case .ipv4(let addr): return addr == .loopback   // 127.0.0.1
+            case .ipv6(let addr): return addr == .loopback   // ::1
+            case .name(let name, _): return name == "localhost"
+            @unknown default: return false
+            }
+        default: return false
+        }
+    }
+
     /// Bearer <token>` OR HTTP Basic auth (so a browser/player can pass the token
     /// in the URL, e.g. http://<token>@host:8200/stream — username or password may
     /// be the token; also accepts ?token=<token> as a last resort for players that
@@ -495,17 +513,23 @@ class JSONRPCServer {
     }
 
     private func handleRPC(headers: [String: String], body: Data?, connection: NWConnection) {
-        // Auth check
-        guard let authHeader = headers["authorization"],
-              authHeader.lowercased().hasPrefix("bearer ") else {
-            sendJSONRPCError(nil, error: .unauthorized, connection: connection)
-            return
-        }
-
-        let token = String(authHeader.dropFirst(7)).trimmingCharacters(in: .whitespaces)
-        guard AuthManager.shared.validateToken(token) else {
-            sendJSONRPCError(nil, error: .unauthorized, connection: connection)
-            return
+        // Auth check. Loopback (127.0.0.1 / ::1) is trusted — it lets a
+        // co-installed app on the same device (e.g. MinisApp's Debug Server)
+        // forward tap requests to us without needing our bearer token. iOS
+        // sandbox means only apps installed on this device can reach
+        // loopback — the same trust boundary the user relies on when
+        // running iCTRL locally.
+        if !Self.isLoopback(connection) {
+            guard let authHeader = headers["authorization"],
+                  authHeader.lowercased().hasPrefix("bearer ") else {
+                sendJSONRPCError(nil, error: .unauthorized, connection: connection)
+                return
+            }
+            let token = String(authHeader.dropFirst(7)).trimmingCharacters(in: .whitespaces)
+            guard AuthManager.shared.validateToken(token) else {
+                sendJSONRPCError(nil, error: .unauthorized, connection: connection)
+                return
+            }
         }
 
         // Parse JSON-RPC request
