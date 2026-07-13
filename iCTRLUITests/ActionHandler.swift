@@ -1595,23 +1595,29 @@ class ActionHandler {
 
         var s = nowMonotonic
         if let (el, idx) = firstHittable(q.matching(NSPredicate(format: "label == %@", query))) {
-            lap("exact", from: s); done("→exact")
-            return (el, .exactLabel(query), idx)
+            lap("exact", from: s)
+            let (best, bestIdx) = elevateToButton(match: el, matchIdx: idx, in: target, phases: &phases)
+            done("→exact\(bestIdx == idx ? "" : "→button")")
+            return (best, .exactLabel(query), bestIdx)
         }
         lap("exact", from: s)
 
         s = nowMonotonic
         if let (el, idx) = firstHittable(q.matching(identifier: query)) {
-            lap("id", from: s); done("→id")
-            return (el, .identifier(query), idx)
+            lap("id", from: s)
+            let (best, bestIdx) = elevateToButton(match: el, matchIdx: idx, in: target, phases: &phases)
+            done("→id\(bestIdx == idx ? "" : "→button")")
+            return (best, .identifier(query), bestIdx)
         }
         lap("id", from: s)
 
         if matchMode == "contains" {
             s = nowMonotonic
             if let (el, idx) = firstHittable(q.matching(NSPredicate(format: "label CONTAINS[c] %@", query))) {
-                lap("contains", from: s); done("→contains")
-                return (el, .containsLabel(query), idx)
+                lap("contains", from: s)
+                let (best, bestIdx) = elevateToButton(match: el, matchIdx: idx, in: target, phases: &phases)
+                done("→contains\(bestIdx == idx ? "" : "→button")")
+                return (best, .containsLabel(query), bestIdx)
             }
             lap("contains", from: s)
         }
@@ -1666,6 +1672,55 @@ class ActionHandler {
         lap("resolve", from: s)
         done("✗not-found")
         return nil
+    }
+
+    /// When a label/identifier match landed on a non-interactive element
+    /// (staticText, image, other), SwiftUI content often wraps it in a
+    /// Button ancestor whose frame contains the leaf's frame. XCUIElement.tap
+    /// on the leaf hits its pixel position but doesn't fire the Button's
+    /// handler — same failure mode we've been chasing. Search the app's
+    /// Button elements for the TIGHTEST-fitting ancestor (smallest frame
+    /// area that still contains the match's centre point). If we find one
+    /// AND it's not the match itself, prefer it.
+    ///
+    /// This is best-effort: if there are no covering buttons, or the match
+    /// IS a button, return the input unchanged.
+    private func elevateToButton(match: XCUIElement, matchIdx: Int,
+                                 in target: XCUIApplication,
+                                 phases: inout [String]) -> (XCUIElement, Int) {
+        let t0 = nowMonotonic
+        // Skip elevation when the match itself is intrinsically tappable —
+        // buttons, cells, switches, keys, and menu items already dispatch
+        // their own handlers on tap.
+        switch match.elementType {
+        case .button, .cell, .switch, .toggle, .radioButton, .checkBox,
+             .menuButton, .menuItem, .key, .link, .searchField, .textField, .textView:
+            return (match, matchIdx)
+        default: break
+        }
+        let matchFrame = match.frame
+        // Empty-frame elements can't be usefully compared for containment.
+        if matchFrame.width < 1 || matchFrame.height < 1 { return (match, matchIdx) }
+        let centre = CGPoint(x: matchFrame.midX, y: matchFrame.midY)
+
+        // Query all buttons; snapshot each frame in one pass. This is cheap
+        // for typical screens (<100 buttons) and avoids repeated round-trips.
+        let buttons = target.buttons.allElementsBoundByAccessibilityElement
+        var best: (XCUIElement, CGRect)?
+        for b in buttons {
+            let f = b.frame
+            if f.width < 1 || f.height < 1 { continue }
+            if !f.contains(centre) { continue }
+            // Prefer the tightest fit: smallest area that still contains the match.
+            let area = f.width * f.height
+            if let (_, current) = best, area >= current.width * current.height { continue }
+            best = (b, f)
+        }
+        phases.append("elevate=\(Int((nowMonotonic - t0) * 1000))ms/\(buttons.count)btns")
+        if let (btn, _) = best, btn.isHittable {
+            return (btn, matchIdx)
+        }
+        return (match, matchIdx)
     }
 
     /// Strip invisible formatting/bidi control characters so labels compare cleanly.
