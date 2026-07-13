@@ -1705,22 +1705,26 @@ class ActionHandler {
         if matchFrame.width < 1 || matchFrame.height < 1 { return (match, matchIdx) }
         let centre = CGPoint(x: matchFrame.midX, y: matchFrame.midY)
 
-        // Query all buttons; snapshot each frame in one pass. This is cheap
-        // for typical screens (<100 buttons) and avoids repeated round-trips.
-        let buttons = target.buttons.allElementsBoundByAccessibilityElement
+        // Consider both buttons AND cells as elevation targets. SwiftUI
+        // `List(selection:)` rows are exposed as .cell, not .button; a
+        // staticText leaf inside such a row needs to be elevated to the
+        // enclosing cell for XCUIElement.tap to hit the selection region.
+        var candidates: [XCUIElement] = []
+        candidates.append(contentsOf: target.buttons.allElementsBoundByAccessibilityElement)
+        candidates.append(contentsOf: target.cells.allElementsBoundByAccessibilityElement)
         var best: (XCUIElement, CGRect)?
-        for b in buttons {
-            let f = b.frame
+        for c in candidates {
+            let f = c.frame
             if f.width < 1 || f.height < 1 { continue }
             if !f.contains(centre) { continue }
             // Prefer the tightest fit: smallest area that still contains the match.
             let area = f.width * f.height
             if let (_, current) = best, area >= current.width * current.height { continue }
-            best = (b, f)
+            best = (c, f)
         }
-        phases.append("elevate=\(Int((nowMonotonic - t0) * 1000))ms/\(buttons.count)btns")
-        if let (btn, _) = best, btn.isHittable {
-            return (btn, matchIdx)
+        phases.append("elevate=\(Int((nowMonotonic - t0) * 1000))ms/\(candidates.count)cands")
+        if let (bestEl, _) = best, bestEl.isHittable {
+            return (bestEl, matchIdx)
         }
         return (match, matchIdx)
     }
