@@ -245,6 +245,17 @@ struct RPCMethodRegistry {
             returns: "{message}"
         ),
         RPCMethodDef(
+            name: "find_and_tap",
+            description: "Like tap_element, but always uses the native XCUIElement.tap() (no synthesized-event shortcut). Slower — the OS's real touch pipeline may take a few hundred ms and blocks until the tap settles — but works on SwiftUI List/ForEach rows that ignore the synthesized fastTap path. Use when tap_element silently no-ops (the target visually doesn't change). Same match semantics: element_id may be a label OR identifier; pair with match:'contains' for partial substring matching.",
+            params: [
+                RPCParamDef(name: "element_id", type: "string", required: true, description: "Accessibility label or identifier (see page_source)"),
+                RPCParamDef(name: "match", type: "string", required: false, description: "'exact' (default) or 'contains' (substring)"),
+                RPCParamDef(name: "element_type", type: "string", required: false, description: "Restrict to type: button/textfield/label/image/cell/switch/icon"),
+                RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Target this app; omit for the bound/foreground app"),
+            ],
+            returns: "{message, matched, frame:{x,y,w,h}}"
+        ),
+        RPCMethodDef(
             name: "drag",
             description: "Drag between two points. Endpoints may be coordinates (from_x/from_y/to_x/to_y in POINTS) OR element refs (from_ref/to_ref, which resolve to the element center). Use for reordering/sliders; for a simple scroll flick use swipe.",
             params: [
@@ -293,7 +304,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.3.6"
+    static let serverVersion = "1.3.7"
 
     /// Server capability/protocol version. v1 = Bearer-token auth over /auth +
     /// /rpc. Bump when the wire capabilities change so clients can auto-detect.

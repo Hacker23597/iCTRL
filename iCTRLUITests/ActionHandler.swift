@@ -334,6 +334,8 @@ class ActionHandler {
             return findElementInfo(cmd)
         case "tap_element":
             return tapElement(cmd)
+        case "find_and_tap":
+            return findAndTap(cmd)
         case "drag":
             return drag(cmd)
         case "wait":
@@ -1728,6 +1730,50 @@ class ActionHandler {
             )
         }
         return (result, nil)
+    }
+
+    /// find_and_tap — like tap_element, but always uses the native
+    /// `XCUIElement.tap()` (no synthesized-event shortcut). Slower but
+    /// works on SwiftUI List/ForEach rows that ignore synthesized taps —
+    /// exactly the case Minis's Debug Server forwards to us. Same match
+    /// semantics as tap_element (element_id may be a label OR identifier,
+    /// optional match:'contains' for partial substring).
+    private func findAndTap(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+        guard let elementId = cmd.elementId else {
+            return (nil, JSONRPCError(code: -32602, message: "find_and_tap requires an 'element_id' (accessibility label or identifier); pair with match:'contains' for partial text.", data: nil))
+        }
+        let matchMode = (cmd.matchMode ?? "exact").lowercased()
+        guard let (element, match, _) = locateElement(query: elementId, type: cmd.elementType,
+                                                     bundleId: cmd.bundleId, matchMode: matchMode) else {
+            return (nil, JSONRPCError(
+                code: -32602,
+                message: "find_and_tap: no element matching '\(elementId)'\(cmd.elementType.map { " of type '\($0)'" } ?? ""). Try match:'contains', or a different label from page_source.",
+                data: nil
+            ))
+        }
+        guard element.isHittable else {
+            let f = element.frame
+            return (nil, JSONRPCError(
+                code: -32602,
+                message: "find_and_tap: element '\(elementId)' exists but is not hittable (off-screen, covered, or zero-size). Scroll it into view (scroll_to_element).",
+                data: ["x": .double(f.midX), "y": .double(f.midY)]
+            ))
+        }
+        // Native tap — drives the OS's real touch pipeline via XCTest. This
+        // is why we exist: it works on SwiftUI Lists where the synthesized
+        // fastTap path doesn't. Slower (may take a few hundred ms to a couple
+        // of seconds if the tap navigates), but reliable.
+        let f = element.frame
+        let label = element.label
+        element.tap()
+        return ([
+            "message": .string("find_and_tap '\(label.isEmpty ? elementId : label)' via native XCUIElement.tap()"),
+            "matched": .string(String(describing: match)),
+            "frame": .object([
+                "x": .double(f.origin.x), "y": .double(f.origin.y),
+                "w": .double(f.width),    "h": .double(f.height),
+            ]),
+        ], nil)
     }
 
     private func tapElement(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
