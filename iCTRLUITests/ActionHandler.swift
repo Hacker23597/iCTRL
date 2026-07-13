@@ -1692,9 +1692,11 @@ class ActionHandler {
         // Skip elevation when the match itself is intrinsically tappable —
         // buttons, cells, switches, keys, and menu items already dispatch
         // their own handlers on tap.
-        switch match.elementType {
+        let matchType = match.elementType
+        switch matchType {
         case .button, .cell, .switch, .toggle, .radioButton, .checkBox,
              .menuButton, .menuItem, .key, .link, .searchField, .textField, .textView:
+            phases.append("elevate=skip(\(matchType.rawValue))")
             return (match, matchIdx)
         default: break
         }
