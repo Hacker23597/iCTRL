@@ -55,10 +55,8 @@ static int    sReKickAttempts    = 0;      // diagnostics: how many re-kicks fir
 static BOOL   sReKickInFlight     = NO;     // don't overlap re-kicks
 static BOOL   sPollArmed          = NO;     // ensure the poll loop is armed once
 
-// Total window to keep trying, in seconds (5 min — covers a slow passcode entry).
+// Diagnostic observation window (5 min — covers a slow passcode entry).
 static const double kBootstrapMaxWindow = 300.0;
-// How often to re-check + re-kick while waiting.
-static const double kBootstrapPollInterval = 3.0;
 
 @interface EarlyURLHook : NSObject
 + (NSArray<NSURL *> *)drainURLs;
@@ -230,97 +228,67 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
 
     earlyLog(@"🟩 +load reached — early hooks + bootstrap fallback arming");
 
-    // Continuous bootstrap-retry loop, armed HERE at +load (runs the instant the
-    // process starts, before any delegate callback). Keeps re-kicking
-    // runTestsInBackground: on a timer AND on every didBecomeActive (the passcode
-    // alert dismissing brings the runner back active) until setUp finally runs or
-    // the 5-minute window elapses. Replaces the old once-only 8s/14s watchdog,
-    // which couldn't bridge a multi-minute passcode.
-    [self armBootstrapRetryLoop];
+    // DIAGNOSTIC-ONLY bootstrap observer. We do NOT re-kick runTestsInBackground:
+    // any more.
+    //
+    // Why re-kick was removed (crash 2026-07-17-220237, SIGABRT):
+    // The crash backtrace showed the ORIGINAL bootstrap was alive and blocked
+    // inside `-[XCUIDevice enableAutomationMode:]` (an XCTWaiter waiting on the
+    // "Enable UI Automation" authorization) — it hadn't reached setUp, so our
+    // `!sSetUpEntered` guard let the re-kick through. Re-invoking
+    // runTestsInBackground: then ran a SECOND `_XCTestMain` →
+    // `registerSharedServiceWithConfiguration:` → "shared symbolication service
+    // already set" → abort(). This is exactly the double-bootstrap crash a9c60da
+    // removed the watchdog for.
+    //
+    // From inside the process there is NO reliable way to tell "bootstrap is
+    // BLOCKED on the passcode (alive)" from "bootstrap DIED" — didBecomeActive
+    // fires in BOTH cases (the alert appearing/dismissing toggles active). So any
+    // in-process re-kick risks re-entering a live bootstrap → crash. We therefore
+    // only OBSERVE and log; recovery of a truly-dead bootstrap needs an external
+    // relaunch (see notes in the repo).
+    [self armBootstrapObserver];
 }
 
-/// Arm the retry loop: set the deadline, register a didBecomeActive observer
-/// (fires when the passcode alert is dismissed → prime moment to re-kick), and
-/// kick off the periodic poll. Idempotent.
-+ (void)armBootstrapRetryLoop {
+/// Diagnostic observer: logs the bootstrap-relevant lifecycle events (retry
+/// window + didBecomeActive) so a passcode repro is fully traceable, but never
+/// calls runTestsInBackground:. Idempotent.
++ (void)armBootstrapObserver {
     if (sPollArmed) { return; }
     sPollArmed = YES;
     sBootstrapDeadline = CACurrentMediaTime() + kBootstrapMaxWindow;
-    earlyLog([NSString stringWithFormat:
-        @"⏳ bootstrap retry loop armed — will retry every %.0fs for up to %.0fs",
-        kBootstrapPollInterval, kBootstrapMaxWindow]);
+    earlyLog(@"👀 bootstrap observer armed (diagnostic-only, no re-kick)");
 
-    // didBecomeActive: the runner returns active when the passcode alert is
-    // dismissed. That's the most precise "safe to re-kick" signal we get.
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidBecomeActiveNotification
                     object:nil queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification * _Nonnull note) {
-        if (sTestStarted) { return; }
-        earlyLog(@"🟢 didBecomeActive — checking bootstrap (passcode may have just cleared)");
-        [EarlyURLHook pollBootstrapOnce];
+        if (sTestStarted || sSetUpEntered) { return; }
+        earlyLog(@"🟢 didBecomeActive — bootstrap not yet at setUp (observing, NOT re-kicking)");
     }];
-
-    // First poll on a short delay, then the poll re-arms itself.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBootstrapPollInterval * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [EarlyURLHook pollBootstrapOnce]; });
 }
 
-/// One poll tick: if the test still hasn't started and we're within the window,
-/// re-kick once and re-arm the next tick. Stops permanently once the test starts
-/// or the deadline passes.
-+ (void)pollBootstrapOnce {
-    if (sTestStarted) {
-        return;   // success — stop the loop for good
-    }
-    double now = CACurrentMediaTime();
-    if (now > sBootstrapDeadline) {
-        earlyLog([NSString stringWithFormat:
-            @"⌛ bootstrap retry window elapsed after %.0fs (%d re-kicks) — giving up",
-            kBootstrapMaxWindow, sReKickAttempts]);
-        return;
-    }
-    id delegate = [UIApplication sharedApplication].delegate;
-    [EarlyURLHook reKickIfNeeded:delegate];
-    // Re-arm the next tick.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBootstrapPollInterval * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [EarlyURLHook pollBootstrapOnce]; });
-}
-
-/// Kept for compatibility with the delegate-callback watchdog (didFinishLaunching
-/// / scene:willConnect still call scheduleBootstrapWatchdogForDelegate:). Now it
-/// just ensures the retry loop is armed.
+/// Kept for source compatibility — the delegate callbacks still call this. Now a
+/// no-op-ish arming of the diagnostic observer.
 + (void)armAbsoluteBootstrapFallback {
-    [self armBootstrapRetryLoop];
+    [self armBootstrapObserver];
 }
++ (void)armBootstrapRetryLoop {
+    [self armBootstrapObserver];
+}
++ (void)pollBootstrapOnce { /* removed — no in-process re-kick */ }
 
-/// Re-kick runTestsInBackground: on the delegate. Guarded so it's SAFE to call
-/// repeatedly: never fires while a bootstrap reached setUp (avoids re-entering a
-/// running XCTest → symbolication crash), and never overlaps itself. NOT
-/// once-only — the retry loop calls this many times until the test starts.
+/// Retained as a guarded no-op so any caller that still references it can't
+/// accidentally re-introduce the double-bootstrap crash. Intentionally does
+/// NOT call runTestsInBackground:.
 + (void)reKickIfNeeded:(id)delegate {
-    if (sTestStarted || sSetUpEntered) { return; }   // a bootstrap is progressing → never re-enter
-    if (sReKickInFlight) { return; }                  // don't stack concurrent runTestsInBackground:
-    if (!delegate) { earlyLog(@"🔁 re-kick skipped: no app delegate yet"); return; }
-    SEL kick = NSSelectorFromString(@"runTestsInBackground:");
-    if (![delegate respondsToSelector:kick]) { earlyLog(@"🔁 re-kick skipped: delegate has no runTestsInBackground:"); return; }
-
-    sReKickInFlight = YES;
-    sReKickAttempts += 1;
-    earlyLog([NSString stringWithFormat:
-        @"🔁 re-kick #%d: no setUp/test yet — re-invoking runTestsInBackground: (delegate=%@)",
-        sReKickAttempts, NSStringFromClass(object_getClass(delegate))]);
-    @try {
-        void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
-        imp(delegate, kick, nil);
-    } @catch (NSException *e) {
-        earlyLog([NSString stringWithFormat:@"🔁 re-kick #%d threw: %@", sReKickAttempts, e.reason]);
-    }
-    // Release the in-flight lock shortly after so the next tick can retry if this
-    // attempt also died on the passcode. Long enough that a genuinely-succeeding
-    // bootstrap marks setUp/test before we'd consider re-kicking again.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ sReKickInFlight = NO; });
+    (void)delegate;
+    // Deliberately does nothing. In-process re-kick of runTestsInBackground: was
+    // removed after it re-entered a live (passcode-blocked) bootstrap and
+    // abort()ed on "shared symbolication service already set". Kept as a symbol
+    // so existing call sites compile.
+    (void)sReKickInFlight; (void)sReKickAttempts;   // silence unused-static warnings
+    earlyLog(@"🔁 re-kick suppressed — in-process re-kick removed (double-bootstrap crash risk)");
 }
 
 /// Hook a concrete delegate INSTANCE's class (covers cases where the runner's
