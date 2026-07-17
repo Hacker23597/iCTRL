@@ -10,6 +10,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>   // CACurrentMediaTime
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <fcntl.h>
@@ -36,8 +37,28 @@ static BOOL sTestStarted = NO;
 //     crash. So we must NOT re-kick in this case.
 static BOOL sSetUpEntered = NO;
 
-// Ensures the watchdog re-kicks at most once, ever.
-static BOOL sReKicked = NO;
+// Bootstrap recovery: KEEP retrying runTestsInBackground: until the test starts
+// or a total deadline elapses. The passcode ("Enable UI Automation") prompt can
+// stay up for MINUTES, and each interrupted launch dies before setUp — so a
+// once-only or short-window re-kick misses it entirely (confirmed on-device:
+// 6+ minutes of passcode, +load fired repeatedly, but no re-kick could bridge
+// it and the user had to tap the icon manually).
+//
+// Two things make continuous retry safe (avoiding the "symbolication service
+// already set" double-bootstrap crash that killed the old aggressive watchdog):
+//   1. The guard: only re-kick when NEITHER setUp NOR the test has begun. If a
+//      bootstrap actually reached setUp, we never re-kick.
+//   2. Serialization: at most one re-kick in flight at a time (sReKickInFlight),
+//      cleared on a short delay, so we never stack concurrent runTestsInBackground:.
+static double sBootstrapDeadline = 0.0;    // CACurrentMediaTime() past which we give up
+static int    sReKickAttempts    = 0;      // diagnostics: how many re-kicks fired
+static BOOL   sReKickInFlight     = NO;     // don't overlap re-kicks
+static BOOL   sPollArmed          = NO;     // ensure the poll loop is armed once
+
+// Total window to keep trying, in seconds (5 min — covers a slow passcode entry).
+static const double kBootstrapMaxWindow = 300.0;
+// How often to re-check + re-kick while waiting.
+static const double kBootstrapPollInterval = 3.0;
 
 @interface EarlyURLHook : NSObject
 + (NSArray<NSURL *> *)drainURLs;
@@ -50,6 +71,8 @@ static BOOL sReKicked = NO;
 + (void)scheduleBootstrapWatchdogForDelegate:(id)delegate;
 + (void)armAbsoluteBootstrapFallback;
 + (void)reKickIfNeeded:(id)delegate;
++ (void)armBootstrapRetryLoop;
++ (void)pollBootstrapOnce;
 @end
 
 /// Append one +load-era line DIRECTLY to today's persisted log file. These lines
@@ -207,52 +230,97 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
 
     earlyLog(@"🟩 +load reached — early hooks + bootstrap fallback arming");
 
-    // Absolute-fallback bootstrap watchdog, armed HERE at +load (runs the instant
-    // the process starts, before any delegate callback). The delegate-callback
-    // watchdogs (didFinishLaunching / scene:willConnect) can miss the case where
-    // the first-launch passcode prompt interrupts the process so early those
-    // callbacks are delayed/never fire — then nothing re-kicks the test and the
-    // server never starts (silent, no setUp, no crash). This one doesn't depend on
-    // any callback: it wakes at 8s and 14s and, if setUp still hasn't run, finds
-    // the app delegate itself and re-kicks runTestsInBackground: once.
-    [self armAbsoluteBootstrapFallback];
+    // Continuous bootstrap-retry loop, armed HERE at +load (runs the instant the
+    // process starts, before any delegate callback). Keeps re-kicking
+    // runTestsInBackground: on a timer AND on every didBecomeActive (the passcode
+    // alert dismissing brings the runner back active) until setUp finally runs or
+    // the 5-minute window elapses. Replaces the old once-only 8s/14s watchdog,
+    // which couldn't bridge a multi-minute passcode.
+    [self armBootstrapRetryLoop];
 }
 
-/// Schedule delegate-independent re-kick attempts. Only re-kicks when neither
-/// setUp nor the test has begun (same safety condition as the other watchdog),
-/// so it can never re-enter a running XCTest.
-+ (void)armAbsoluteBootstrapFallback {
-    const double delays[] = { 8.0, 14.0 };
-    for (int i = 0; i < 2; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (sTestStarted || sSetUpEntered) { return; }
-            id delegate = [UIApplication sharedApplication].delegate;
-            earlyLog([NSString stringWithFormat:
-                @"⏰ absolute bootstrap fallback fired: no setUp/test yet, delegate=%@",
-                delegate ? NSStringFromClass(object_getClass(delegate)) : @"(nil)"]);
-            [EarlyURLHook reKickIfNeeded:delegate];
-        });
+/// Arm the retry loop: set the deadline, register a didBecomeActive observer
+/// (fires when the passcode alert is dismissed → prime moment to re-kick), and
+/// kick off the periodic poll. Idempotent.
++ (void)armBootstrapRetryLoop {
+    if (sPollArmed) { return; }
+    sPollArmed = YES;
+    sBootstrapDeadline = CACurrentMediaTime() + kBootstrapMaxWindow;
+    earlyLog([NSString stringWithFormat:
+        @"⏳ bootstrap retry loop armed — will retry every %.0fs for up to %.0fs",
+        kBootstrapPollInterval, kBootstrapMaxWindow]);
+
+    // didBecomeActive: the runner returns active when the passcode alert is
+    // dismissed. That's the most precise "safe to re-kick" signal we get.
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification * _Nonnull note) {
+        if (sTestStarted) { return; }
+        earlyLog(@"🟢 didBecomeActive — checking bootstrap (passcode may have just cleared)");
+        [EarlyURLHook pollBootstrapOnce];
+    }];
+
+    // First poll on a short delay, then the poll re-arms itself.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBootstrapPollInterval * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [EarlyURLHook pollBootstrapOnce]; });
+}
+
+/// One poll tick: if the test still hasn't started and we're within the window,
+/// re-kick once and re-arm the next tick. Stops permanently once the test starts
+/// or the deadline passes.
++ (void)pollBootstrapOnce {
+    if (sTestStarted) {
+        return;   // success — stop the loop for good
     }
+    double now = CACurrentMediaTime();
+    if (now > sBootstrapDeadline) {
+        earlyLog([NSString stringWithFormat:
+            @"⌛ bootstrap retry window elapsed after %.0fs (%d re-kicks) — giving up",
+            kBootstrapMaxWindow, sReKickAttempts]);
+        return;
+    }
+    id delegate = [UIApplication sharedApplication].delegate;
+    [EarlyURLHook reKickIfNeeded:delegate];
+    // Re-arm the next tick.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBootstrapPollInterval * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [EarlyURLHook pollBootstrapOnce]; });
 }
 
-/// Re-kick runTestsInBackground: on the delegate, guarded so it's safe and
-/// happens at most once. Shared by both watchdogs.
+/// Kept for compatibility with the delegate-callback watchdog (didFinishLaunching
+/// / scene:willConnect still call scheduleBootstrapWatchdogForDelegate:). Now it
+/// just ensures the retry loop is armed.
++ (void)armAbsoluteBootstrapFallback {
+    [self armBootstrapRetryLoop];
+}
+
+/// Re-kick runTestsInBackground: on the delegate. Guarded so it's SAFE to call
+/// repeatedly: never fires while a bootstrap reached setUp (avoids re-entering a
+/// running XCTest → symbolication crash), and never overlaps itself. NOT
+/// once-only — the retry loop calls this many times until the test starts.
 + (void)reKickIfNeeded:(id)delegate {
-    if (sTestStarted || sSetUpEntered) { return; }   // progress made → don't re-enter
-    if (sReKicked) { return; }                         // once only, ever
+    if (sTestStarted || sSetUpEntered) { return; }   // a bootstrap is progressing → never re-enter
+    if (sReKickInFlight) { return; }                  // don't stack concurrent runTestsInBackground:
     if (!delegate) { earlyLog(@"🔁 re-kick skipped: no app delegate yet"); return; }
     SEL kick = NSSelectorFromString(@"runTestsInBackground:");
     if (![delegate respondsToSelector:kick]) { earlyLog(@"🔁 re-kick skipped: delegate has no runTestsInBackground:"); return; }
-    sReKicked = YES;
-    earlyLog(@"🔁 bootstrap watchdog: no setUp/test — passcode likely interrupted "
-             @"bootstrap; re-kicking runTestsInBackground: once");
+
+    sReKickInFlight = YES;
+    sReKickAttempts += 1;
+    earlyLog([NSString stringWithFormat:
+        @"🔁 re-kick #%d: no setUp/test yet — re-invoking runTestsInBackground: (delegate=%@)",
+        sReKickAttempts, NSStringFromClass(object_getClass(delegate))]);
     @try {
         void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
         imp(delegate, kick, nil);
     } @catch (NSException *e) {
-        earlyLog([NSString stringWithFormat:@"🔁 watchdog re-kick threw: %@", e.reason]);
+        earlyLog([NSString stringWithFormat:@"🔁 re-kick #%d threw: %@", sReKickAttempts, e.reason]);
     }
+    // Release the in-flight lock shortly after so the next tick can retry if this
+    // attempt also died on the passcode. Long enough that a genuinely-succeeding
+    // bootstrap marks setUp/test before we'd consider re-kicking again.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ sReKickInFlight = NO; });
 }
 
 /// Hook a concrete delegate INSTANCE's class (covers cases where the runner's
@@ -348,10 +416,9 @@ static BOOL sInstalled = NO;
 + (void)scheduleBootstrapWatchdogForDelegate:(id)delegate {
     if (!delegate) { return; }
     if (![delegate respondsToSelector:NSSelectorFromString(@"runTestsInBackground:")]) { return; }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [EarlyURLHook reKickIfNeeded:delegate];
-    });
+    // The delegate callbacks (didFinishLaunching / scene:willConnect) just make
+    // sure the continuous retry loop is armed — the loop itself owns re-kicking.
+    [EarlyURLHook armBootstrapRetryLoop];
 }
 
 + (NSArray<NSURL *> *)drainURLs {
