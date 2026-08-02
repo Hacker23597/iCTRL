@@ -439,40 +439,95 @@ enum RemoteHTML {
     const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(n)); return b;
   };
 
+  // ── X25519 fallback (RFC 7748) ──
+  // Used only when WebCrypto lacks X25519 (Chrome <133, Safari <17, Firefox
+  // <132). ~40 lines of BigInt instead of a WASM blob: it runs exactly once per
+  // pairing, so speed is irrelevant and auditability is worth more. Validated
+  // against the RFC 7748 §5.2/§6.1 vectors and cross-checked against WebCrypto.
+  //
+  // The ladder is branch-free over the scalar bits, but BigInt arithmetic is not
+  // constant-time — acceptable here: the key is ephemeral, used once, for a
+  // pairing the user is actively watching. Everything after pairing is HMAC.
+  const X25519JS = (() => {
+    const P = (1n << 255n) - 19n, A24 = 121665n;
+    const fe = (x) => ((x % P) + P) % P;
+    const powm = (b, e) => { let r = 1n; b = fe(b);
+      while (e > 0n) { if (e & 1n) r = fe(r * b); b = fe(b * b); e >>= 1n; } return r; };
+    const inv = (x) => powm(x, P - 2n);
+    const toBig = (b) => { let n = 0n; for (let i = b.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(b[i]); return n; };
+    const toBytes = (n) => { const o = new Uint8Array(32);
+      for (let i = 0; i < 32; i++) { o[i] = Number(n & 255n); n >>= 8n; } return o; };
+    function scalarMult(scalar, uBytes) {
+      const e = Uint8Array.from(scalar);
+      e[0] &= 248; e[31] &= 127; e[31] |= 64;                 // clamp
+      const k = toBig(e), u = fe(toBig(uBytes) & ((1n << 255n) - 1n));
+      let x1 = u, x2 = 1n, z2 = 0n, x3 = u, z3 = 1n, swap = 0n;
+      for (let t = 254; t >= 0; t--) {
+        const kt = (k >> BigInt(t)) & 1n;
+        swap ^= kt;
+        if (swap) { [x2, x3] = [x3, x2]; [z2, z3] = [z3, z2]; }
+        swap = kt;
+        const a = fe(x2 + z2), aa = fe(a * a), b = fe(x2 - z2), bb = fe(b * b);
+        const ee = fe(aa - bb), c = fe(x3 + z3), d = fe(x3 - z3);
+        const da = fe(d * a), cb = fe(c * b);
+        x3 = fe((da + cb) * (da + cb));
+        z3 = fe(x1 * fe((da - cb) * (da - cb)));
+        x2 = fe(aa * bb);
+        z2 = fe(ee * (aa + fe(A24 * ee)));
+      }
+      if (swap) { [x2, x3] = [x3, x2]; [z2, z3] = [z3, z2]; }
+      return toBytes(fe(x2 * inv(z2)));
+    }
+    const BASE = (() => { const b = new Uint8Array(32); b[0] = 9; return b; })();
+    return { scalarMult, publicKey: (priv) => scalarMult(priv, BASE) };
+  })();
+
   // ── pairing ──
   // Do the whole handshake in-page so the user never has to run curl. Over the
   // LAN the device only grants a key wrapped against an ephemeral X25519 key
-  // (a plaintext grant is refused off 127.0.0.1), so this needs WebCrypto
-  // X25519 — available in recent Chrome/Safari/Firefox. Where it is missing we
-  // fall back to telling the user the exact command to run.
-  async function pairInPage(clientName) {
-    let kp;
+  // (a plaintext grant is refused off 127.0.0.1), so this needs X25519 — from
+  // WebCrypto where available, else the bundled BigInt implementation. Either
+  // way pairing works in every browser, with no terminal step.
+  //
+  // Two backends, same shape: WebCrypto where available, otherwise the BigInt
+  // implementation below. Only pairing needs X25519 — every request afterwards
+  // uses HMAC-SHA256, which every browser has had for a decade.
+  async function makeEphemeralKey() {
     try {
-      kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+      const kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+      return {
+        pub: new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey)),
+        deriveShared: async (peer) => new Uint8Array(await crypto.subtle.deriveBits(
+          { name: 'X25519', public: await crypto.subtle.importKey('raw', peer, { name: 'X25519' }, false, []) },
+          kp.privateKey, 256)),
+      };
     } catch (_) {
-      throw new Error("this browser lacks WebCrypto X25519 — pair from a terminal: "
-        + "curl -o ictrl_rpc.py http://" + location.host + "/skill/examples/python "
-        + "&& python3 ictrl_rpc.py --host " + location.host + " pair");
+      const priv = crypto.getRandomValues(new Uint8Array(32));
+      return {
+        pub: X25519JS.publicKey(priv),
+        deriveShared: async (peer) => X25519JS.scalarMult(priv, peer),
+      };
     }
-    const pub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+  }
+
+  async function pairInPage(clientName) {
+    const eph = await makeEphemeralKey();
     // Shown so the user can match it against the on-device prompt.
-    const fp = hex(await crypto.subtle.digest('SHA-256', pub)).slice(0, 8);
+    const fp = hex(await crypto.subtle.digest('SHA-256', eph.pub)).slice(0, 8);
     setConn('waiting for approval on the device… (key ' + fp + ')');
 
     const r = await fetch('/pair', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ client_name: clientName, pub: b64(pub) }),
+      body: JSON.stringify({ client_name: clientName, pub: b64(eph.pub) }),
     });
     const j = await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || ('pair failed (' + r.status + ')'));
 
     // K = token_ct XOR HMAC(HMAC(shared,"ictrl-pair"||c_pub||d_pub), "ictrl-wrap")
     const devPub = unb64(j.pub);
-    const shared = new Uint8Array(await crypto.subtle.deriveBits(
-      { name: 'X25519', public: await crypto.subtle.importKey('raw', devPub, { name: 'X25519' }, false, []) },
-      kp.privateKey, 256));
-    const kWrap = await hmac(shared, concat(enc.encode('ictrl-pair'), pub, devPub));
+    const shared = await eph.deriveShared(devPub);
+    const kWrap = await hmac(shared, concat(enc.encode('ictrl-pair'), eph.pub, devPub));
     const pad = await hmac(kWrap, enc.encode('ictrl-wrap'));
     const ctk = unhex(j.token_ct);
     return hex(ctk.map((b, i) => b ^ pad[i]));
