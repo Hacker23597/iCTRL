@@ -251,14 +251,15 @@ enum RemoteHTML {
   <aside>
     <div class="panel section">
       <h3>Connection</h3>
-      <label class="label">Pairing key</label>
-      <input class="input" id="tokenInput" type="password" placeholder="64-hex key from /pair" autocomplete="off">
+      <label class="label">Pairing key <span style="opacity:.6">(optional)</span></label>
+      <input class="input" id="tokenInput" type="password" placeholder="leave empty to pair now" autocomplete="off">
       <div class="row" style="margin-top: 8px">
         <button class="btn primary" id="connectBtn">Connect</button>
         <button class="btn ghost" id="stopBtn" disabled>Stop</button>
       </div>
-      <div class="hint">Get one with <span class="kbd">POST /pair</span>, then approve on the device.
-      The key stays in this browser — every request is encrypted locally.</div>
+      <div class="hint">Leave it empty and hit Connect — the device will ask you to approve,
+      then the key is saved in this browser. Paste an existing key only to reuse one.
+      The key never leaves this browser; every request is encrypted locally.</div>
     </div>
 
     <div class="panel section">
@@ -437,6 +438,45 @@ enum RemoteHTML {
   const be64 = (n) => {
     const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(n)); return b;
   };
+
+  // ── pairing ──
+  // Do the whole handshake in-page so the user never has to run curl. Over the
+  // LAN the device only grants a key wrapped against an ephemeral X25519 key
+  // (a plaintext grant is refused off 127.0.0.1), so this needs WebCrypto
+  // X25519 — available in recent Chrome/Safari/Firefox. Where it is missing we
+  // fall back to telling the user the exact command to run.
+  async function pairInPage(clientName) {
+    let kp;
+    try {
+      kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+    } catch (_) {
+      throw new Error("this browser lacks WebCrypto X25519 — pair from a terminal: "
+        + "curl -o ictrl_rpc.py http://" + location.host + "/skill/examples/python "
+        + "&& python3 ictrl_rpc.py --host " + location.host + " pair");
+    }
+    const pub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+    // Shown so the user can match it against the on-device prompt.
+    const fp = hex(await crypto.subtle.digest('SHA-256', pub)).slice(0, 8);
+    setConn('waiting for approval on the device… (key ' + fp + ')');
+
+    const r = await fetch('/pair', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_name: clientName, pub: b64(pub) }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || ('pair failed (' + r.status + ')'));
+
+    // K = token_ct XOR HMAC(HMAC(shared,"ictrl-pair"||c_pub||d_pub), "ictrl-wrap")
+    const devPub = unb64(j.pub);
+    const shared = new Uint8Array(await crypto.subtle.deriveBits(
+      { name: 'X25519', public: await crypto.subtle.importKey('raw', devPub, { name: 'X25519' }, false, []) },
+      kp.privateKey, 256));
+    const kWrap = await hmac(shared, concat(enc.encode('ictrl-pair'), pub, devPub));
+    const pad = await hmac(kWrap, enc.encode('ictrl-wrap'));
+    const ctk = unhex(j.token_ct);
+    return hex(ctk.map((b, i) => b ^ pad[i]));
+  }
 
   // ── RPC ──
   async function rpc(method, params = {}) {
@@ -663,11 +703,17 @@ enum RemoteHTML {
 
   // ── connection lifecycle ──
   async function connect() {
-    const hexKey = tokenInput.value.trim();
-    if (!useKeyHex(hexKey)) {
-      setStatus('need the 64-hex pairing key (POST /pair)', 'err');
-      return;
+    let hexKey = tokenInput.value.trim();
+    // No key yet (or a malformed one) → pair right here rather than telling the
+    // user to go run curl. The device will prompt for approval on its screen.
+    if (!/^[0-9a-f]{64}$/i.test(hexKey)) {
+      if (hexKey) { setStatus('that is not a 64-hex key — pairing instead…', 'warn'); }
+      try {
+        hexKey = await pairInPage('browser @ ' + (navigator.platform || 'web'));
+        tokenInput.value = hexKey;
+      } catch (err) { setConn('pair: ' + err.message, 'err'); return; }
     }
+    if (!useKeyHex(hexKey)) { setStatus('invalid pairing key', 'err'); return; }
     // tok = first 4 bytes of SHA-256(K) — the public lookup id sent on the wire.
     tok = hex(await crypto.subtle.digest('SHA-256', key)).slice(0, 8);
     setStatus('connecting…');
