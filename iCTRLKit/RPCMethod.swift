@@ -26,13 +26,19 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "clear_sessions", type: "boolean", required: false, description: "true = revoke all authorized tokens immediately"),
                 RPCParamDef(name: "stop_server", type: "boolean", required: false, description: "true = stop the service (stops listening ~1s after replying). Re-launch the runner to restart; tokens persist."),
             ],
-            returns: "{allow_remote_access, listen_port, address, restarted, device_name, active_sessions, sessions:[{session_id, client_name, token_prefix, granted_at, last_active_at, expires_at}], cleared_sessions}"
+            returns: "{allow_remote_access, listen_port, address, restarted, device_name, active_sessions, sessions:[{session_id, client_name, tok, granted_at, last_active_at, expires_at}], cleared_sessions}"
+        ),
+        RPCMethodDef(
+            name: "stream_ticket",
+            description: "Mint a single-use, ~60s ticket authorizing ONE plain GET to /stream or /logs*. Those are raw byte responses a browser/player fetches directly, so they can't carry a per-request encrypted envelope; this hands out a short-lived credential instead. Call it over the encrypted channel (like every RPC), then append ?ticket=<ticket> to the URL. The ticket is consumed on first use — mint a new one per stream/log fetch.",
+            params: [],
+            returns: "{ticket, expires_in (seconds), hint}"
         ),
         RPCMethodDef(
             name: "device_info",
             description: "Get device name, model, OS version, the coordinate space (point size for tap/swipe, pixel size for screenshots, scale), AND the server's identity: server_version, protocol_version, and a capabilities array — so ONE device_info call gives you both the device and what this server supports (no separate /schema fetch for feature detection). CALL THIS FIRST before any coordinate-based action.",
             params: [],
-            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, a 'hint' string, plus server_version (semver), protocol_version (int), and capabilities (array of feature tags, e.g. bearer_auth, find_element_ref, clear_text, page, stop_server)."
+            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, a 'hint' string, plus server_version (semver), protocol_version (int), and capabilities (array of feature tags, e.g. envelope_v1, stream_ticket, find_element_ref, clear_text, page, stop_server)."
         ),
         RPCMethodDef(
             name: "page_source",
@@ -304,9 +310,9 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.3.13"
+    static let serverVersion = "1.4.0"
 
-    /// Server capability/protocol version. v1 = Bearer-token auth over /auth +
+    /// Server capability/protocol version. v1 = encrypted-envelope auth over /pair +
     /// /rpc. Bump when the wire capabilities change so clients can auto-detect.
     static let protocolVersion = 1
 
@@ -314,8 +320,8 @@ struct RPCMethodRegistry {
     /// call (no separate /schema fetch needed). Keep in sync with what the server
     /// actually implements.
     static let capabilityTags: [String] = [
-        "bearer_auth",         // /auth + /rpc (Bearer token)
-        "basic_auth",          // Also HTTP Basic + ?token=<token> for player/browser URLs
+        "envelope_v1",         // /pair + encrypted /rpc envelopes (HMAC-SHA256)
+        "stream_ticket",       // stream_ticket RPC → single-use ?ticket= for /stream + /logs
         "video_stream",        // GET /stream (H.264-in-MPEG-TS live screen)
         "remote_ui",           // GET /remote (browser control page)
         "page_source_filter",  // page_source{filter:{...}}
@@ -341,24 +347,33 @@ struct RPCMethodRegistry {
             "capability_tags": capabilityTags,
             "endpoints": [
                 "skill": "GET /skill — START HERE. The operating manual in Skill (Markdown) format; read it ONCE to learn the fast-path workflow and best practices, then treat iCTRL as a Skill.",
-                "auth": "POST /auth  {client_name} → {token}. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. Returns 403 if denied.",
-                "rpc": "POST /rpc   {jsonrpc, method, params, id}  (Authorization: Bearer <token>)",
-                "stream": "GET /stream[.ts]  live H.264-in-MPEG-TS screen video (~2 fps, ?fps=N to change). Auth via Bearer, HTTP Basic, or ?token=<token> so a browser/player can open the URL directly. Play in VLC: `vlc http://<token>@<host>:8200/stream`. One shared encoder fans out to all clients; encoding stops when the last client disconnects.",
-                "remote": "GET /remote  browser control page (shadcn-styled): plays /stream in <video> (via mpegts.js) and drives the device with tap/swipe/scroll/keyboard + a side panel of buttons. Open `http://<host>:8200/remote?token=<token>` to auto-connect.",
-                "logs": "GET /logs   plain-text recent logs (current process, in-memory). REQUIRES Authorization: Bearer <token>. Sensitive values are redacted",
-                "logs_files": "GET /logs/files   list persisted daily log files (survive crashes/restarts)",
-                "logs_history": "GET /logs/history?date=YYYY-MM-DD   dump a persisted day's log (redacted). Use this to recover logs from BEFORE a crash — /logs only holds the current process's memory",
+                "pair": "POST /pair  {client_name, plain:true | pub:<b64 raw 32B X25519>} → the 32-byte key K. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. `plain:true` returns K in the clear and is accepted ONLY from 127.0.0.1 (USB/iproxy); over the LAN send `pub` and unwrap: K = token_ct XOR HMAC(HMAC(X25519(c_priv,d_pub), \"ictrl-pair\"||c_pub||d_pub), \"ictrl-wrap\"). Returns 403 if denied.",
+                "rpc": "POST /rpc   an ENCRYPTED v1 envelope (no plaintext path, no Bearer header): {v:1, tok, ts, nonce:<32 hex>, ct:<b64>, tag:<64 hex>} wrapping the JSON-RPC body. See guidance.authorization for the construction.",
+                "stream": "GET /stream[.ts]?ticket=<t>  live H.264 screen video (~2 fps, ?fps=N to change). A byte pipe can't carry a per-request envelope, so it takes a SINGLE-USE ~60s ticket minted over the encrypted channel by the `stream_ticket` RPC. One shared encoder fans out to all clients; encoding stops when the last client disconnects.",
+                "remote": "GET /remote  browser control page (shadcn-styled): plays the stream via MSE and drives the device with tap/swipe/scroll/keyboard + a side panel of buttons. Paste the 64-hex pairing key once; the page does the v1 crypto in-browser (WebCrypto) and keeps K in localStorage — it is never sent.",
+                "logs": "GET /logs?ticket=<t>   plain-text recent logs (current process, in-memory). Browser-issued GET, so it uses the same single-use ticket as /stream. Sensitive values are redacted",
+                "logs_files": "GET /logs/files?ticket=<t>   list persisted daily log files (survive crashes/restarts)",
+                "logs_history": "GET /logs/history?date=YYYY-MM-DD&ticket=<t>   dump a persisted day's log (redacted). Use this to recover logs from BEFORE a crash — /logs only holds the current process's memory",
                 "schema": "GET /schema  this document",
             ],
             "guidance": [
                 "authorization":
-                    "Before any /rpc call you need a token from POST /auth {client_name}. " +
-                    "Authorization REQUIRES the device user to manually approve your request on an on-screen prompt, " +
-                    "so the /auth request can take a while to return — set a client-side timeout of AT LEAST 60 seconds " +
-                    "and wait patiently; do not retry early (each retry pops another prompt). " +
-                    "On approval you get a token (valid 30 days, survives app restarts); on denial you get HTTP 403. " +
-                    "Send the token as 'Authorization: Bearer <token>' on every /rpc call. " +
-                    "If the service restarts (see 'connection_reliability'), re-run /auth to get a fresh token before continuing.",
+                    "EVERY /rpc body is an encrypted envelope (protocol v1) — there is no plaintext/Bearer path; " +
+                    "an unsealed POST gets 401 auth_required. All request-path crypto is HMAC-SHA256 only. " +
+                    "STEP 1, pair once: POST /pair {client_name, plain:true} (127.0.0.1 only) or {client_name, pub} " +
+                    "over the LAN, to obtain the 32-byte key K. This BLOCKS on an on-screen Allow/Deny prompt — " +
+                    "use a timeout of AT LEAST 60s and do NOT retry early (each retry pops another prompt); 403 = denied. " +
+                    "STEP 2, seal each call:  tok = first 4 bytes of SHA256(K) as 8 hex (a lookup id, NOT a secret); " +
+                    "nonce = 16 random bytes per request; ts = unix seconds (server allows ±120s). " +
+                    "K_enc_req = HMAC(K, \"ictrl-v1|enc-req\"||nonce); K_mac = HMAC(K, \"ictrl-v1|mac\"||nonce); " +
+                    "keystream(Kx) = HMAC(Kx, nonce||be32(0)) || HMAC(Kx, nonce||be32(1)) || … truncated; " +
+                    "ct = body XOR keystream(K_enc_req); tag = HMAC(K_mac, \"v1\"||tok_4B||be64(ts)||nonce||ct). " +
+                    "POST {v:1, tok, ts, nonce:<hex>, ct:<base64>, tag:<hex>}. " +
+                    "STEP 3, open the reply: it is sealed under the SAME nonce — verify " +
+                    "tag == HMAC(K_mac, \"resp\"||nonce||ct), then decrypt with K_enc_resp = HMAC(K, \"ictrl-v1|enc-resp\"||nonce). " +
+                    "Expiry is IDLE-BASED: a key dies only after 30 days of no use, and every call slides that forward, " +
+                    "so a key in regular use never expires and survives app restarts. Cache K and re-pair ONLY on " +
+                    "401 token_unknown/token_expired. Nonces must never repeat (replay is rejected).",
                 "client_timeouts":
                     "Set generous client timeouts for /rpc: at least 30s, ideally 60-120s. " +
                     "/schema and /logs are static and reply instantly, but /rpc drives the real device — a cold app " +
@@ -375,9 +390,9 @@ struct RPCMethodRegistry {
                     "(it only means the URL was handed to the system, NOT that the server is up) — always confirm by polling " +
                     "GET /schema for a few seconds. " +
                     "(3) If /rpc starts failing AND /logs is also unreachable, the service died — re-wake via ictrl:// and " +
-                    "poll /schema until it returns 200, then re-/auth for a fresh token. " +
+                    "poll /schema until it returns 200. Your cached key still works — do NOT re-pair unless a call returns 401. " +
                     "(4) Space out ictrl:// re-wakes by a couple seconds; rapid repeats may be throttled. " +
-                    "(5) CHEAP RECOVERY: don't restart the task from scratch. The resolved bundle_id is stable — REUSE it, do NOT call resolve_app again. The token lasts 30 days and persists across restarts, so re-/auth only if a call actually returns 401. If you know a deep link back to where you were (open_url), use it instead of re-navigating from the app's home screen.",
+                    "(5) CHEAP RECOVERY: don't restart the task from scratch. The resolved bundle_id is stable — REUSE it, do NOT call resolve_app again. The key is idle-expiry (30 days unused) and persists across restarts, so re-pair only if a call actually returns 401. If you know a deep link back to where you were (open_url), use it instead of re-navigating from the app's home screen.",
                 "searching_and_typing": [
                     "Searching inside an app is the #1 place automation goes wrong. Follow this sequence:",
                     "DON'T BLIND-WAIT between steps. tap/type/swipe/page already block on UI quiescence before returning, so after them you can page_source/find_element DIRECTLY — no wait call. The ONLY routine wait is after a COLD launch_app (2-3s, the app is still rendering). If a read comes back mid-transition (splash/placeholder/empty), THEN wait ~1s and re-read — reactively, not by default. Blind 2-3s sleeps after every tap just add latency.",
@@ -500,15 +515,15 @@ struct RPCMethodRegistry {
 
         <div class="info">
         <p><strong>RPC Endpoint:</strong> <code>POST /rpc</code></p>
-        <p style="margin-top:4px"><strong>Auth Endpoint:</strong> <code>POST /auth</code> — <code>{client_name}</code> → <code>{token}</code></p>
-        <p style="margin-top:8px">All <code>/rpc</code> calls require the <code>Authorization: Bearer &lt;token&gt;</code> header.</p>
+        <p style="margin-top:4px"><strong>Pairing:</strong> <code>POST /pair</code> — <code>{client_name, plain:true|pub}</code> → 32-byte key <code>K</code>. Every <code>/rpc</code> body is then an encrypted v1 envelope.</p>
+        <p style="margin-top:8px">All <code>/rpc</code> calls are encrypted v1 envelopes — no headers, no plaintext. Pair once, then seal every body with the key.</p>
         <pre>{"jsonrpc": "2.0", "method": "tap", "params": {"x": 100, "y": 200}, "id": 1}</pre>
         </div>
 
         <div class="info" style="border-left:4px solid #ff9500">
         <p><strong>⏳ First, get a token — the user must approve it.</strong></p>
         <p style="margin-top:6px;color:#6e6e73;font-size:14px">
-        <code>POST /auth {client_name}</code> shows an <em>Allow / Deny</em> prompt on the device and BLOCKS until the user responds.
+        <code>POST /pair {client_name}</code> shows an <em>Allow / Deny</em> prompt on the device and BLOCKS until the user responds.
         Use a client timeout of <strong>at least 60 seconds</strong> and wait — do not retry early (each retry pops another prompt).
         On approval you receive a token (valid 30 days); on denial, HTTP 403.
         </p>
@@ -529,7 +544,7 @@ struct RPCMethodRegistry {
         <li><strong>Use long <code>/rpc</code> timeouts (≥30s, ideally 60–120s).</strong> <code>/schema</code> and <code>/logs</code> reply instantly, but <code>/rpc</code> drives the real device and a call can take seconds.</li>
         <li><strong>A client timeout ≠ failure.</strong> The device keeps executing. Before retrying, <code>GET /logs</code> and look for <code>⏱ ✓ &lt;method&gt;</code> — if present, it already succeeded and retrying would double the action.</li>
         <li><strong>Probe readiness with <code>GET /schema</code> (short timeout).</strong> If you woke the service via the <code>ictrl://</code> URL scheme, the <code>opened</code> flag is NOT proof the server is up — the runner cold-starts and needs a few seconds to bind :8200. Poll <code>/schema</code> until it returns 200.</li>
-        <li><strong>If <code>/rpc</code> and <code>/logs</code> both go unreachable</strong>, the runner process died — re-wake via <code>ictrl://</code>, poll <code>/schema</code> until ready, then re-run <code>/auth</code> for a fresh token.</li>
+        <li><strong>If <code>/rpc</code> and <code>/logs</code> both go unreachable</strong>, the runner process died — re-wake via <code>ictrl://</code> and poll <code>/schema</code> until ready. Your cached key survives; only re-pair on a 401.</li>
         </ul>
         </div>
 
@@ -562,7 +577,7 @@ struct RPCMethodRegistry {
         </div>
 
         <div class="info">
-        <p><strong>Diagnostics &amp; logs (Bearer token required, redacted):</strong></p>
+        <p><strong>Diagnostics &amp; logs (single-use <code>?ticket=</code> required, redacted):</strong></p>
         <ul style="margin:6px 0 0 18px;color:#6e6e73;font-size:14px;line-height:1.6">
         <li><code>GET /logs</code> — recent in-memory logs for the current process (includes <code>⏱ ✓ &lt;method&gt; &lt;ms&gt;</code> timings).</li>
         <li><code>GET /logs/files</code> — list persisted daily log files (survive crashes/restarts).</li>

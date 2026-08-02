@@ -10,8 +10,9 @@ import Foundation
 /// The page has NO external network dependency: CSS is inline, mpegts.js is
 /// vendored into MpegtsJS.swift and inlined at build time. Works fully offline.
 ///
-/// The page uses the SAME token as /rpc (it's the query token passed by the
-/// user when they open /remote?token=…) and re-uses it on every RPC call.
+/// The page holds the 32-byte pairing key and does the protocol-v1 crypto in
+/// the browser (WebCrypto HMAC-SHA256): every /rpc body is sealed locally and
+/// the key itself is never transmitted.
 enum RemoteHTML {
     /// Full HTML for GET /remote. The stream is fragmented MP4 (`Content-Type:
     /// video/mp4`) via MSE — every major browser decodes it natively, so this
@@ -250,13 +251,14 @@ enum RemoteHTML {
   <aside>
     <div class="panel section">
       <h3>Connection</h3>
-      <label class="label">Token</label>
-      <input class="input" id="tokenInput" type="password" placeholder="Bearer token" autocomplete="off">
+      <label class="label">Pairing key</label>
+      <input class="input" id="tokenInput" type="password" placeholder="64-hex key from /pair" autocomplete="off">
       <div class="row" style="margin-top: 8px">
         <button class="btn primary" id="connectBtn">Connect</button>
         <button class="btn ghost" id="stopBtn" disabled>Stop</button>
       </div>
-      <div class="hint">Also opens with <span class="kbd">/remote?token=…</span></div>
+      <div class="hint">Get one with <span class="kbd">POST /pair</span>, then approve on the device.
+      The key stays in this browser — every request is encrypted locally.</div>
     </div>
 
     <div class="panel section">
@@ -355,13 +357,20 @@ enum RemoteHTML {
 
   // ── state ──
   let player = null;
-  // Token precedence: ?token= query wins (explicit) > localStorage (last used).
-  // localStorage is scoped per (host, port) — safe for switching between
-  // multiple iCTRL devices — and we only persist on a successful connect.
-  const STORE_KEY = 'ictrl.token';
-  const qToken = new URLSearchParams(location.search).get('token') || '';
-  let token = qToken || localStorage.getItem(STORE_KEY) || '';
-  if (token) tokenInput.value = token;
+  // The page holds the 32-byte pairing key K (hex) and its derived id `tok`.
+  // localStorage is scoped per (host, port), so switching between devices is
+  // safe; we only persist after a successful connect. There is no plaintext
+  // bearer token anywhere — K signs and encrypts every request locally and is
+  // never transmitted.
+  const STORE_KEY = 'ictrl.key';
+  let key = null, tok = '';
+  function useKeyHex(hexKey) {
+    if (!/^[0-9a-f]{64}$/i.test(hexKey || '')) return false;
+    key = unhex(hexKey.toLowerCase());
+    return true;   // `tok` is derived in connect(), where we can await SHA-256
+  }
+  const savedKey = localStorage.getItem(STORE_KEY) || '';
+  if (savedKey) tokenInput.value = savedKey;
   let deviceInfo = null;   // {point_width, point_height}
   let dragStart = null;
 
@@ -394,20 +403,72 @@ enum RemoteHTML {
     else setToast(msg, kind === 'err' ? 'err' : kind === 'ok' ? 'ok' : 'warn');
   }
 
+  // ── crypto (protocol v1) ──
+  // Every /rpc body is sealed: HMAC-CTR stream cipher + encrypt-then-MAC, a
+  // fresh 16-byte nonce per request, and a timestamp the server bounds to
+  // ±120s. Identical construction to the Python/Swift clients, so all three
+  // interoperate. WebCrypto gives us HMAC-SHA256; that is the only primitive
+  // the request path needs.
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  const hex = (buf) => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  const unhex = (s) => new Uint8Array(s.match(/../g).map(h => parseInt(h, 16)));
+  const b64 = (u8) => btoa(String.fromCharCode(...u8));
+  const unb64 = (s) => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+  async function hmac(keyBytes, msg) {
+    const k = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    return new Uint8Array(await crypto.subtle.sign('HMAC', k, msg));
+  }
+  const concat = (...arrs) => {
+    const out = new Uint8Array(arrs.reduce((n, a) => n + a.length, 0));
+    let off = 0; for (const a of arrs) { out.set(a, off); off += a.length; }
+    return out;
+  };
+  /// keystream_i = HMAC(key, nonce || be32(i)), truncated to len.
+  async function keystreamXor(key, nonce, data) {
+    const out = new Uint8Array(data.length);
+    for (let off = 0, ctr = 0; off < data.length; off += 32, ctr++) {
+      const be = new Uint8Array(4); new DataView(be.buffer).setUint32(0, ctr);
+      const block = await hmac(key, concat(nonce, be));
+      for (let i = 0; i < 32 && off + i < data.length; i++) out[off + i] = data[off + i] ^ block[i];
+    }
+    return out;
+  }
+  const be64 = (n) => {
+    const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(n)); return b;
+  };
+
   // ── RPC ──
   async function rpc(method, params = {}) {
-    if (!token) throw new Error('no token');
+    if (!key) throw new Error('not paired');
+    const body = enc.encode(JSON.stringify({ jsonrpc: '2.0', method, params, id: Date.now() }));
+    const nonce = crypto.getRandomValues(new Uint8Array(16));
+    const ts = Math.floor(Date.now() / 1000);
+
+    const kEnc = await hmac(key, concat(enc.encode('ictrl-v1|enc-req'), nonce));
+    const kMac = await hmac(key, concat(enc.encode('ictrl-v1|mac'), nonce));
+    const ct = await keystreamXor(kEnc, nonce, body);
+    const tag = await hmac(kMac, concat(enc.encode('v1'), unhex(tok), be64(ts), nonce, ct));
+
     const r = await fetch('/rpc', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-      body: JSON.stringify({ jsonrpc: '2.0', method, params, id: Date.now() }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ v: 1, tok, ts, nonce: hex(nonce), ct: b64(ct), tag: hex(tag) }),
     });
     if (r.status === 401 || r.status === 403) {
-      // Server rejected the token — forget it so the next visit doesn't loop.
+      // Key rejected/expired — drop it so the next visit prompts to re-pair.
       try { localStorage.removeItem(STORE_KEY); } catch (_) {}
-      throw new Error('token rejected (' + r.status + ')');
+      key = null;
+      throw new Error('key rejected (' + r.status + ') — re-pair');
     }
-    const j = await r.json();
+
+    // Reply is sealed under the same nonce with the response-direction key.
+    const env = await r.json();
+    const respCt = unb64(env.ct);
+    const expect = await hmac(kMac, concat(enc.encode('resp'), nonce, respCt));
+    if (hex(expect) !== env.tag) throw new Error('response MAC mismatch');
+    const kEncResp = await hmac(key, concat(enc.encode('ictrl-v1|enc-resp'), nonce));
+    const j = JSON.parse(dec.decode(await keystreamXor(kEncResp, nonce, respCt)));
     if (j.error) throw new Error(j.error.message || 'rpc failed');
     return j.result || {};
   }
@@ -602,15 +663,20 @@ enum RemoteHTML {
 
   // ── connection lifecycle ──
   async function connect() {
-    token = tokenInput.value.trim();
-    if (!token) { setStatus('token required', 'err'); return; }
+    const hexKey = tokenInput.value.trim();
+    if (!useKeyHex(hexKey)) {
+      setStatus('need the 64-hex pairing key (POST /pair)', 'err');
+      return;
+    }
+    // tok = first 4 bytes of SHA-256(K) — the public lookup id sent on the wire.
+    tok = hex(await crypto.subtle.digest('SHA-256', key)).slice(0, 8);
     setStatus('connecting…');
     // Prime device_info for coord conversion + title.
     try {
       deviceInfo = await rpc('device_info');
       updateHudDevice(deviceInfo);
-      // Auth confirmed by a successful RPC — remember the token for next visit.
-      try { localStorage.setItem(STORE_KEY, token); } catch (_) {}
+      // Auth confirmed by a successful RPC — remember the key for next visit.
+      try { localStorage.setItem(STORE_KEY, hexKey.toLowerCase()); } catch (_) {}
     } catch (err) { setStatus('rpc: ' + err.message, 'err'); return; }
 
     // Native MSE — Chrome / Firefox / Edge / Safari all support fMP4 via
@@ -623,7 +689,14 @@ enum RemoteHTML {
     const fps = fpsSel.value;
     const quality = qSel?.value || 'auto';
     const verbose = verboseChk?.checked ? '&verbose=1' : '';
-    const src = `/stream?token=${encodeURIComponent(token)}&fps=${fps}&quality=${quality}${verbose}`;
+    // The stream is a long-lived byte pipe, so it can't carry a per-request
+    // envelope. Mint a single-use, ~60s ticket over the encrypted channel and
+    // spend it on the URL: nothing long-lived is ever exposed there.
+    let ticket;
+    try {
+      ticket = (await rpc('stream_ticket')).ticket;
+    } catch (err) { setStatus('ticket: ' + err.message, 'err'); return; }
+    const src = `/stream?ticket=${encodeURIComponent(ticket)}&fps=${fps}&quality=${quality}${verbose}`;
 
     // Tear any previous MSE + fetch down before starting a new one.
     if (player) { try { player.stop(); } catch(_){} player = null; }
@@ -826,8 +899,8 @@ enum RemoteHTML {
   // Prevent the video overlay from stealing swipes over the drawer.
   document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
 
-  // Auto-connect if a token was passed via ?token=
-  if (token) queueMicrotask(connect);
+  // Auto-connect when a key from a previous visit is already in the box.
+  if (savedKey) queueMicrotask(connect);
 })();
 </script>
 </body>

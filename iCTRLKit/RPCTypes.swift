@@ -147,21 +147,34 @@ struct AuthResponse: Encodable {
     }
 }
 
+/// One paired client. `id` is the token id (first 4 bytes of SHA256(K), hex) —
+/// it is what the wire sends as `tok` and is a lookup handle only, never a
+/// secret. `keyHex` is the actual 32-byte key K used to derive the per-request
+/// MAC/encryption keys; it never leaves the device after pairing.
+///
+/// Expiry is idle-based: a session dies only after `inactivityWindow` of no use.
+/// Every authenticated request slides `lastActiveAt` forward, so a token in
+/// regular use never expires.
 struct AuthSession: Identifiable, Codable {
     let id: String
-    let token: String
+    let keyHex: String
     let clientName: String
     let grantedAt: Date
     var lastActiveAt: Date
-    let expiresAt: Date
+
+    /// The 32-byte key, or nil if the stored record is corrupt.
+    var key: Data? { Data(hexString: keyHex) }
+
+    /// "Expiry if never used again" — informational, recomputed from last use.
+    var expiresAt: Date { lastActiveAt.addingTimeInterval(AuthManager.inactivityWindow) }
 
     var isExpired: Bool { Date() >= expiresAt }
 
     enum CodingKeys: String, CodingKey {
-        case id, token
+        case id
+        case keyHex = "key"
         case clientName = "client_name"
         case grantedAt = "granted_at"
         case lastActiveAt = "last_active_at"
-        case expiresAt = "expires_at"
     }
 }

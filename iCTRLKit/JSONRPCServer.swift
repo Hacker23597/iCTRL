@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 
@@ -260,22 +261,24 @@ class JSONRPCServer {
             sendHTTPResponse(connection: connection, status: 200,
                              contentType: "text/html; charset=utf-8", body: RemoteHTML.page)
 
-        // Logs can contain sensitive context even when redacted, so they now
-        // require a valid bearer token — same as /rpc.
+        // Logs can carry sensitive context even redacted. They are GETs that a
+        // browser issues directly, so they can't carry an envelope body — they
+        // use the same single-use ticket as /stream, minted over the encrypted
+        // channel via the `stream_ticket` RPC.
         case ("GET", "/logs/files"):
-            guard isAuthorized(headers) else { return sendUnauthorizedHTTP(connection) }
+            guard hasValidTicket(query) else { return sendUnauthorizedHTTP(connection) }
             handleLogFiles(connection: connection)
 
         case ("GET", "/logs/history"):
-            guard isAuthorized(headers) else { return sendUnauthorizedHTTP(connection) }
+            guard hasValidTicket(query) else { return sendUnauthorizedHTTP(connection) }
             handleLogHistory(connection: connection, query: query)
 
         case ("GET", "/logs"):
-            guard isAuthorized(headers) else { return sendUnauthorizedHTTP(connection) }
+            guard hasValidTicket(query) else { return sendUnauthorizedHTTP(connection) }
             handleLogs(connection: connection)
 
-        case ("POST", "/auth"):
-            handleAuth(body: body, connection: connection)
+        case ("POST", "/pair"):
+            handlePair(body: body, connection: connection, isLoopback: isLoopback(connection))
 
         case ("POST", "/rpc"):
             handleRPC(headers: headers, body: body, connection: connection)
@@ -385,54 +388,112 @@ class JSONRPCServer {
         sendHTTPResponse(connection: connection, status: 200, contentType: "text/plain; charset=utf-8", body: header + content)
     }
 
-    private func handleAuth(body: Data?, connection: NWConnection) {
-        guard let body = body else {
-            sendJSONRPCError(nil, error: .invalidRequest, connection: connection)
+    /// POST /pair — grant a 32-byte token key K after on-device approval.
+    ///
+    /// Two modes, mirroring MinisApp's debug server:
+    ///   - `{"client_name":"…","plain":true}` returns K in the clear. Accepted
+    ///     ONLY from 127.0.0.1 (USB/iproxy), since anyone who sees the response
+    ///     owns the device.
+    ///   - `{"client_name":"…","pub":"<base64 raw 32B X25519>"}` wraps K against
+    ///     an ephemeral device key, so it is safe over the LAN.
+    ///
+    /// Blocks until the user taps Allow (or the alert times out).
+    private func handlePair(body: Data?, connection: NWConnection, isLoopback: Bool) {
+        guard let body = body,
+              let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+              let clientName = obj["client_name"] as? String, !clientName.isEmpty else {
+            sendPairError(connection, status: 400, code: "bad_request",
+                          message: "client_name is required")
             return
         }
 
-        let decoder = JSONDecoder()
-        guard let authReq = try? decoder.decode(AuthRequest.self, from: body) else {
-            sendJSONRPCError(nil, error: JSONRPCError(code: -32602, message: "Missing or invalid client_name", data: nil), connection: connection)
+        let isPlain = obj["plain"] as? Bool ?? false
+        var clientPub: Data?
+        if !isPlain {
+            guard let pubB64 = obj["pub"] as? String,
+                  let pub = Data(base64Encoded: pubB64), pub.count == 32 else {
+                sendPairError(connection, status: 400, code: "bad_request",
+                              message: "Provide plain:true (loopback only) or pub (base64 raw 32B X25519)")
+                return
+            }
+            clientPub = pub
+        }
+        if isPlain && !isLoopback {
+            sendPairError(connection, status: 403, code: "plain_forbidden",
+                          message: "Plain grant is localhost/USB only; use X25519 mode")
             return
         }
 
-        AuthManager.shared.requestAuth(clientName: authReq.clientName) { [weak self] session in
-            guard let session = session else {
-                self?.sendHTTPResponse(
-                    connection: connection,
-                    status: 403,
-                    contentType: "application/json",
-                    body: "{\"error\": \"Authorization denied\"}"
-                )
+        AuthManager.shared.requestAuth(clientName: clientName) { [weak self] session in
+            guard let self = self else { return }
+            guard let session = session, let key = session.key else {
+                self.sendPairError(connection, status: 403, code: "pair_denied",
+                                   message: "User rejected or approval timed out")
                 return
             }
 
-            let ttl = Int(session.expiresAt.timeIntervalSince(session.grantedAt))
-            let response: [String: Any] = [
-                "token": session.token,
-                "session_id": session.id,
+            // Informational only: real expiry slides forward on every use.
+            let expires = Int(session.expiresAt.timeIntervalSince1970)
+            var response: [String: Any] = [
+                "tok": session.id,
                 "client_name": session.clientName,
-                "expires_at": ISO8601DateFormatter().string(from: session.expiresAt),
-                "expires_in": ttl,
+                "expires": expires,
             ]
 
-            if let jsonData = try? JSONSerialization.data(withJSONObject: response, options: .prettyPrinted),
-               let jsonString = String(data: jsonData, encoding: .utf8) {
-                self?.sendHTTPResponse(connection: connection, status: 200, contentType: "application/json", body: jsonString)
+            if let clientPub = clientPub {
+                do {
+                    let devicePriv = Curve25519.KeyAgreement.PrivateKey()
+                    let devicePub = devicePriv.publicKey.rawRepresentation
+                    let peer = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: clientPub)
+                    let shared = try devicePriv.sharedSecretFromKeyAgreement(with: peer)
+                    let sharedData = shared.withUnsafeBytes { Data($0) }
+                    let kWrap = SecureEnvelope.hmac(
+                        sharedData,
+                        Data(SecureEnvelope.labelPair.utf8) + clientPub + devicePub)
+                    let pad = SecureEnvelope.hmac(kWrap, Data(SecureEnvelope.labelWrap.utf8))
+                    response["pub"] = devicePub.base64EncodedString()
+                    response["token_ct"] = Data(zip(key, pad).map { $0 ^ $1 }).hexString
+                } catch {
+                    AuthManager.shared.revokeSession(id: session.id)
+                    self.sendPairError(connection, status: 400, code: "bad_request",
+                                       message: "X25519 key agreement failed")
+                    return
+                }
+            } else {
+                response["token"] = key.hexString
+            }
+
+            if let data = try? JSONSerialization.data(withJSONObject: response, options: .prettyPrinted),
+               let json = String(data: data, encoding: .utf8) {
+                self.sendHTTPResponse(connection: connection, status: 200,
+                                      contentType: "application/json", body: json)
             }
         }
     }
 
-    /// GET /stream[.ts] — live H.264-in-MPEG-TS screen video. Auth via Bearer /
-    /// Basic / ?token=. Optional ?fps=N (0.5–10, default 2). Hands the connection
-    /// to the host's video streamer (kept open until the client disconnects).
+    private func sendPairError(_ connection: NWConnection, status: Int, code: String, message: String) {
+        let payload: [String: Any] = [
+            "error": ["code": code, "message": message,
+                      "server_ts": Int(Date().timeIntervalSince1970)],
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
+        sendHTTPResponse(connection: connection, status: status, contentType: "application/json",
+                         body: String(data: data, encoding: .utf8) ?? "{}")
+    }
+
+    /// GET /stream[.ts]?ticket=… — live H.264-in-MPEG-TS screen video.
+    ///
+    /// `<video src>` can't sign its own request, so this is the one endpoint not
+    /// protected by an envelope. Instead it takes a single-use ticket minted over
+    /// the encrypted channel (`stream_ticket` RPC): short-lived, consumed on
+    /// first use, and useless to anyone who scrapes the URL afterwards.
+    /// Optional ?fps=N (0.5–10, default 2). Hands the connection to the host's
+    /// video streamer (kept open until the client disconnects).
     private func handleVideoStream(headers: [String: String], query: String, connection: NWConnection) {
-        guard isAuthorized(headers, query: query) else {
-            // Send a Basic-auth challenge so browsers/players prompt for creds.
+        guard hasValidTicket(query) else {
             sendHTTPResponse(connection: connection, status: 401,
-                             headers: ["WWW-Authenticate": "Basic realm=\"iCTRL\""],
-                             body: "Unauthorized: pass the token via Bearer, Basic auth, or ?token=.")
+                             body: "Unauthorized: GET /stream needs ?ticket=<t>. "
+                                 + "Mint one with the stream_ticket RPC over the encrypted channel.")
             return
         }
         guard let handoff = onVideoStream else {
@@ -456,88 +517,117 @@ class JSONRPCServer {
         handoff(connection, fps, quality, verbose)
     }
 
-    /// True if the request carries a valid token via EITHER `Authorization:
-    /// Bearer <token>` OR HTTP Basic auth (so a browser/player can pass the token
-    /// in the URL, e.g. http://<token>@host:8200/stream — username or password may
-    /// be the token; also accepts ?token=<token> as a last resort for players that
-    /// can't set headers). Also accepts a token in the query for URL-only clients.
-    private func isAuthorized(_ headers: [String: String], query: String = "") -> Bool {
-        if let authHeader = headers["authorization"] {
-            let lower = authHeader.lowercased()
-            if lower.hasPrefix("bearer ") {
-                let token = String(authHeader.dropFirst(7)).trimmingCharacters(in: .whitespaces)
-                if AuthManager.shared.validateToken(token) { return true }
-            }
-            if lower.hasPrefix("basic ") {
-                let b64 = String(authHeader.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-                if let data = Data(base64Encoded: b64),
-                   let creds = String(data: data, encoding: .utf8) {
-                    // "user:pass" — the token may be in either field.
-                    let parts = creds.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
-                    for p in parts where AuthManager.shared.validateToken(String(p)) { return true }
-                }
-            }
-        }
-        // ?token=<token> in the query string (URL-only players).
+    /// True if the query carries a valid single-use `ticket=`.
+    ///
+    /// Browser-issued GETs (`<video src>`, log links) can't carry an encrypted
+    /// envelope, so they present a ticket instead — minted over the encrypted
+    /// channel by the `stream_ticket` RPC, valid ~60s, and consumed on first use.
+    /// No long-lived secret ever appears in a URL.
+    private func hasValidTicket(_ query: String) -> Bool {
         for pair in query.split(separator: "&") {
             let kv = pair.split(separator: "=", maxSplits: 1)
-            if kv.count == 2, kv[0] == "token",
-               let tok = String(kv[1]).removingPercentEncoding,
-               AuthManager.shared.validateToken(tok) { return true }
+            if kv.count == 2, kv[0] == "ticket",
+               let ticket = String(kv[1]).removingPercentEncoding,
+               AuthManager.shared.consumeStreamTicket(ticket) {
+                return true
+            }
         }
         return false
+    }
+
+    /// Whether the peer is 127.0.0.1/::1 — the only source allowed to request a
+    /// plaintext key grant at pairing time.
+    private func isLoopback(_ connection: NWConnection) -> Bool {
+        guard case let .hostPort(host, _)? = connection.currentPath?.remoteEndpoint else {
+            return false
+        }
+        switch host {
+        case .ipv4(let addr): return addr.isLoopback
+        case .ipv6(let addr): return addr.isLoopback
+        @unknown default: return false
+        }
     }
 
     /// Plain-text 401 for non-RPC (e.g. GET /logs) endpoints.
     private func sendUnauthorizedHTTP(_ connection: NWConnection) {
         sendHTTPResponse(connection: connection, status: 401,
-                         body: "Unauthorized: a valid Bearer token is required to read logs.")
+                         body: "Unauthorized: append ?ticket=<t> (mint one with the stream_ticket RPC over the encrypted channel).")
     }
 
     private func handleRPC(headers: [String: String], body: Data?, connection: NWConnection) {
-        // Auth check
-        guard let authHeader = headers["authorization"],
-              authHeader.lowercased().hasPrefix("bearer ") else {
-            sendJSONRPCError(nil, error: .unauthorized, connection: connection)
+        // Every /rpc call must arrive as a sealed v1 envelope. There is no
+        // plaintext path: an unsealed body is rejected before it is even parsed
+        // as JSON-RPC, so an unauthenticated caller learns nothing about the
+        // method surface.
+        guard let body = body,
+              let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
+            sendAuthError(connection, status: 400, code: "bad_envelope",
+                          message: "Body must be a v1 encrypted envelope")
+            return
+        }
+        guard SecureEnvelope.looksLikeEnvelope(obj) else {
+            sendAuthError(connection, status: 401, code: "auth_required",
+                          message: "Encrypted envelope required. POST /pair to obtain a key, "
+                                 + "then wrap each JSON-RPC body per the v1 protocol (see /skill).")
             return
         }
 
-        let token = String(authHeader.dropFirst(7)).trimmingCharacters(in: .whitespaces)
-        guard AuthManager.shared.validateToken(token) else {
-            sendJSONRPCError(nil, error: .unauthorized, connection: connection)
+        let opened: (tokId: String, plaintext: String, seal: (String) -> String)
+        do {
+            opened = try AuthManager.shared.openEnvelope(obj)
+        } catch let failure as SecureEnvelope.Failure {
+            // 401 for anything token/auth related so clients know to re-pair;
+            // 400 only for a structurally broken envelope.
+            let status = failure.code == "bad_envelope" ? 400 : 401
+            sendAuthError(connection, status: status, code: failure.code, message: failure.message)
+            return
+        } catch {
+            sendAuthError(connection, status: 401, code: "auth_failed", message: "Authentication failed")
             return
         }
 
-        // Parse JSON-RPC request
-        guard let body = body else {
-            sendJSONRPCError(nil, error: .parseError, connection: connection)
+        let seal = opened.seal
+        guard let inner = opened.plaintext.data(using: .utf8),
+              let rpcRequest = try? JSONDecoder().decode(JSONRPCRequest.self, from: inner) else {
+            sendSealed(connection, seal: seal, json: Self.errorJSON(nil, .parseError))
             return
         }
-
-        let decoder = JSONDecoder()
-        guard let rpcRequest = try? decoder.decode(JSONRPCRequest.self, from: body) else {
-            sendJSONRPCError(nil, error: .parseError, connection: connection)
-            return
-        }
-
         guard rpcRequest.jsonrpc == "2.0" else {
-            sendJSONRPCError(rpcRequest.id, error: .invalidRequest, connection: connection)
+            sendSealed(connection, seal: seal, json: Self.errorJSON(rpcRequest.id, .invalidRequest))
             return
         }
 
-        // Dispatch to handler
+        // `stream_ticket` is served here rather than in the action handler: it
+        // mints credentials, so it must stay inside the authenticated boundary
+        // and needs the token id this envelope authenticated as.
+        if rpcRequest.method == "stream_ticket" {
+            // Use the identity the envelope actually AUTHENTICATED as — never
+            // re-read obj["tok"], which is unverified input.
+            guard let issued = AuthManager.shared.issueStreamTicket(forTokenId: opened.tokId) else {
+                sendSealed(connection, seal: seal,
+                           json: Self.errorJSON(rpcRequest.id, .internalError))
+                return
+            }
+            let result: [String: JSONValue] = [
+                "ticket": .string(issued.ticket),
+                "expires_in": .int(issued.expiresIn),
+                "hint": .string("Append ?ticket=<ticket> to GET /stream or /logs. "
+                              + "Single use, expires in \(issued.expiresIn)s."),
+            ]
+            sendSealed(connection, seal: seal, json: Self.resultJSON(rpcRequest.id, result))
+            return
+        }
+
         guard let handler = onRPCRequest else {
-            sendJSONRPCError(rpcRequest.id, error: .internalError, connection: connection)
+            sendSealed(connection, seal: seal, json: Self.errorJSON(rpcRequest.id, .internalError))
             return
         }
 
         let method = rpcRequest.method
         handler(method, rpcRequest.params) { [weak self] result, error in
-            if let error = error {
-                self?.sendJSONRPCError(rpcRequest.id, error: error, connection: connection)
-            } else {
-                self?.sendJSONRPCResult(rpcRequest.id, result: result ?? [:], connection: connection)
-            }
+            let json = error.map { Self.errorJSON(rpcRequest.id, $0) }
+                ?? Self.resultJSON(rpcRequest.id, result ?? [:])
+            self?.sendSealed(connection, seal: seal, json: json)
             // Latency shortcut: when a UI-mutating RPC finishes, tell the video
             // pipeline to grab an extra keyframe *now* instead of waiting for
             // the next 1/fps tick. Without this, a 2 fps tap can wait up to
@@ -546,6 +636,42 @@ class JSONRPCServer {
                 self?.onRPCUIChanged?()
             }
         }
+    }
+
+    /// Encrypt a JSON-RPC reply into a response envelope and write it out.
+    /// Always HTTP 200: transport succeeded, and the real status is inside the
+    /// sealed body (an eavesdropper shouldn't learn outcomes from status codes).
+    private func sendSealed(_ connection: NWConnection, seal: (String) -> String, json: String) {
+        sendHTTPResponse(connection: connection, status: 200,
+                         contentType: "application/json", body: seal(json))
+    }
+
+    /// Auth failures are sent in the CLEAR — the client has no usable key yet
+    /// (or the one it used was rejected), so a sealed reply would be unreadable.
+    private func sendAuthError(_ connection: NWConnection, status: Int, code: String, message: String) {
+        let payload: [String: Any] = [
+            "error": ["code": code, "message": message,
+                      "server_ts": Int(Date().timeIntervalSince1970)],
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
+        sendHTTPResponse(connection: connection, status: status, contentType: "application/json",
+                         body: String(data: data, encoding: .utf8) ?? "{}")
+    }
+
+    private static func resultJSON(_ id: JSONValue?, _ result: [String: JSONValue]) -> String {
+        encode(JSONRPCResponse(result: result, error: nil, id: id))
+    }
+
+    private static func errorJSON(_ id: JSONValue?, _ error: JSONRPCError) -> String {
+        encode(JSONRPCResponse(result: nil, error: error, id: id))
+    }
+
+    private static func encode(_ response: JSONRPCResponse) -> String {
+        guard let data = try? JSONEncoder().encode(response),
+              let json = String(data: data, encoding: .utf8) else {
+            return #"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":null}"#
+        }
+        return json
     }
 
     /// RPCs that visibly change what's on screen — used to trigger an out-of-

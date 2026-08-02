@@ -812,13 +812,14 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         let sessions = AuthManager.shared.activeSessions
         let iso = ISO8601DateFormatter()
 
-        // Session list with the token masked (only a short prefix shown).
+        // The session id IS the token id (first 4 bytes of SHA256(K)) — a public
+        // lookup handle, safe to list. The 32-byte key itself never leaves the
+        // device after pairing, so there is nothing here to mask.
         let sessionList: [JSONValue] = sessions.map { s in
-            let masked = String(s.token.prefix(8)) + "…"
-            return .object([
+            .object([
                 "session_id": .string(s.id),
                 "client_name": .string(s.clientName),
-                "token_prefix": .string(masked),
+                "tok": .string(s.id),
                 "granted_at": .string(iso.string(from: s.grantedAt)),
                 "last_active_at": .string(iso.string(from: s.lastActiveAt)),
                 "expires_at": .string(iso.string(from: s.expiresAt)),
