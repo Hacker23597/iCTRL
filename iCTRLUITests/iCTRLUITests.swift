@@ -207,9 +207,24 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // a debug run can re-pair without someone tapping Allow on the device.
         // It is consumed by that one pairing and never rearms — a flag left set
         // costs one free pair per launch, not a standing bypass. Never persisted.
-        if ProcessInfo.processInfo.environment["ICTRL_ALLOW_AUTH_ONCE"] == "1" {
+        //
+        // Always log what was read, including when the variable is absent or set
+        // to something we don't accept: silence would be indistinguishable from
+        // "typo'd the value", which is exactly the case you need to diagnose.
+        let authOnceRaw = ProcessInfo.processInfo.environment["ICTRL_ALLOW_AUTH_ONCE"]
+        if authOnceRaw == "1" {
             AuthManager.shared.armSingleAutoApproval()
-            Self.logBuffer.append("🔓 ICTRL_ALLOW_AUTH_ONCE set — next pairing auto-approves (once)")
+            Self.logBuffer.append(
+                "🔓 ICTRL_ALLOW_AUTH_ONCE=1 — ARMED: the next /pair auto-approves without an "
+                + "on-device tap. Single use: it is consumed by that one pairing and does not rearm.")
+        } else if let raw = authOnceRaw {
+            Self.logBuffer.append(
+                "🔒 ICTRL_ALLOW_AUTH_ONCE=\"\(raw)\" — NOT armed (only the exact value \"1\" is "
+                + "accepted). /pair will require an on-device Allow tap.")
+        } else {
+            Self.logBuffer.append(
+                "🔒 ICTRL_ALLOW_AUTH_ONCE unset — /pair requires an on-device Allow tap. "
+                + "Set it to \"1\" in the Xcode scheme's environment to auto-approve the first pairing.")
         }
 
         if let s = server { configureServerCallbacks(s) }

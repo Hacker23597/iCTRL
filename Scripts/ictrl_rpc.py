@@ -64,22 +64,41 @@ def _post(url: str, obj: dict, timeout: float) -> tuple[int, dict]:
 
 
 # ---------------------------------------------------------------- token store
+#
+# The store is a map of "host:port" -> record, so keys for several devices live
+# side by side and can be used concurrently. Stores written by the pre-v1
+# plaintext-token client had their single record flattened at the top level
+# ("host"/"token"/…); those entries carry no key material and are ignored.
+
+
+def _is_record(value) -> bool:
+    """A usable v1 entry: a dict carrying the 32-byte key and its id."""
+    return isinstance(value, dict) and "key" in value and "tok" in value
+
 
 def load_token(host: str) -> dict | None:
     try:
         with open(STORE) as fh:
-            return json.load(fh).get(host)
-    except (OSError, json.JSONDecodeError):
+            entry = json.load(fh).get(host)
+    except (OSError, json.JSONDecodeError, AttributeError):
         return None
+    return entry if _is_record(entry) else None
+
+
+def list_hosts() -> dict:
+    """Every device with a usable key, keyed by host:port."""
+    try:
+        with open(STORE) as fh:
+            return {h: r for h, r in json.load(fh).items() if _is_record(r)}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
 
 
 def save_token(host: str, record: dict) -> None:
     os.makedirs(os.path.dirname(STORE), exist_ok=True)
-    try:
-        with open(STORE) as fh:
-            all_tokens = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        all_tokens = {}
+    # Drop legacy/plaintext leftovers rather than carrying them forward, so the
+    # file stays a clean host -> record map.
+    all_tokens = list_hosts()
     all_tokens[host] = record
     with open(STORE, "w") as fh:
         json.dump(all_tokens, fh, indent=2)
@@ -188,10 +207,29 @@ def main() -> int:
     c.add_argument("method")
     c.add_argument("params", nargs="?", default="{}")
 
+    sub.add_parser("list", help="list paired devices")
+
     args = ap.parse_args()
-    if args.cmd == "pair":
+    if args.cmd == "list":
+        hosts = list_hosts()
+        if not hosts:
+            print("no paired devices — run `pair` first")
+        for h, r in sorted(hosts.items()):
+            name = r.get("device_name") or r.get("client_name", "")
+            print(f"{h:24s} tok={r['tok']}  {name}")
+    elif args.cmd == "pair":
         rec = pair(args.host, args.name, args.plain)
-        print(f"paired — tok={rec['tok']} (key cached in {STORE})")
+        # Stamp the device's own name alongside the key: hosts move with DHCP,
+        # so the name is what identifies WHICH phone this key belongs to.
+        try:
+            info = call(args.host, "device_info").get("result", {})
+            if info.get("device_name"):
+                rec["device_name"] = info["device_name"]
+                save_token(args.host, rec)
+        except SystemExit:
+            pass   # pairing succeeded; naming is best-effort
+        label = rec.get("device_name", "")
+        print(f"paired — tok={rec['tok']} {label} (key cached in {STORE})")
     else:
         out = call(args.host, args.method, json.loads(args.params))
         print(json.dumps(out, indent=2, ensure_ascii=False))
