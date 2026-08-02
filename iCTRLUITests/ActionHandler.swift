@@ -234,10 +234,18 @@ class ActionHandler {
         let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bound)) ?? .unknown
         switch state {
         case .notRunning:
-            return (JSONRPCError(code: -32001, message:
-                "The bound app '\(bound)' is no longer running (it was closed or the system reclaimed it). " +
-                "Re-open it with launch_app{bundle_id:\"\(bound)\"} before continuing. " +
-                "(Actions stay bound to the app you launched; when it exits you must relaunch.)", data: nil), nil)
+            // The bound app exited (closed or reclaimed). Don't dead-end every
+            // later action on "you must relaunch it": clear the binding so we fall
+            // back to the live foreground app (global mode), and let THIS action
+            // proceed against whatever is now frontmost. We deliberately do NOT
+            // auto-relaunch — that would be a fresh cold start with lost context,
+            // silently doing the wrong thing. Re-bind explicitly with launch_app
+            // if/when the caller wants that app again.
+            boundBundleId = nil
+            lastBoundActivateAt = 0
+            return (nil, "The previously bound app '\(bound)' had exited, so it was unbound; " +
+                "actions now target the live foreground app. Re-open it with " +
+                "launch_app{bundle_id:\"\(bound)\"} to bind to it again.")
         case .background, .backgroundSuspended, .unknown:
             // Bring it forward — exception-safe, bounded.
             _ = runWithTimeout(seconds: 3) {
