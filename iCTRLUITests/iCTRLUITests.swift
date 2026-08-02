@@ -202,6 +202,16 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         AuthManager.shared.setAutoApprove(false)
         AuthManager.shared.delegate = self
 
+        // Dev convenience: ICTRL_ALLOW_AUTH_ONCE=1 (set in the Xcode scheme's
+        // environment) auto-approves the FIRST pairing after this cold start, so
+        // a debug run can re-pair without someone tapping Allow on the device.
+        // It is consumed by that one pairing and never rearms — a flag left set
+        // costs one free pair per launch, not a standing bypass. Never persisted.
+        if ProcessInfo.processInfo.environment["ICTRL_ALLOW_AUTH_ONCE"] == "1" {
+            AuthManager.shared.armSingleAutoApproval()
+            Self.logBuffer.append("🔓 ICTRL_ALLOW_AUTH_ONCE set — next pairing auto-approves (once)")
+        }
+
         if let s = server { configureServerCallbacks(s) }
 
         do {

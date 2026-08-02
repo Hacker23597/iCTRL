@@ -39,6 +39,8 @@ class AuthManager {
     private var sessions: [String: AuthSession] = [:]
     private let lock = NSLock()
     private var autoApprove = false
+    /// One-shot pairing bypass (see `armSingleAutoApproval`). Never persisted.
+    private var autoApproveOnce = false
 
     /// Replay cache, per session: nonce -> the request timestamp it arrived with.
     ///
@@ -72,6 +74,31 @@ class AuthManager {
         autoApprove = enabled
     }
 
+    /// Arm a ONE-SHOT auto-approval for the next pairing request.
+    ///
+    /// Enabled by launching the runner with `ICTRL_ALLOW_AUTH_ONCE=1` (e.g. from
+    /// an Xcode scheme's environment variables). It exists so a dev run can
+    /// re-pair headlessly after the key store is wiped, without someone having
+    /// to tap Allow on the device.
+    ///
+    /// Deliberately single-use and process-scoped: it is consumed by the first
+    /// pairing and never rearms, so a forgotten flag degrades to "one free pair
+    /// per cold start" rather than a standing bypass. It is NOT persisted.
+    func armSingleAutoApproval() {
+        lock.lock()
+        autoApproveOnce = true
+        lock.unlock()
+    }
+
+    /// Consume the one-shot grant, if armed. Returns whether it applied.
+    private func takeSingleAutoApproval() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard autoApproveOnce else { return false }
+        autoApproveOnce = false
+        return true
+    }
+
     // MARK: - Pairing
 
     /// Ask the user to approve a new client, then mint a 32-byte key.
@@ -81,7 +108,7 @@ class AuthManager {
         let trusted = trustWindow[clientName].map { Date().timeIntervalSince($0) < Self.trustTTL } ?? false
         lock.unlock()
 
-        if autoApprove || trusted {
+        if autoApprove || trusted || takeSingleAutoApproval() {
             completion(createSession(clientName: clientName))
             return
         }

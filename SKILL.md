@@ -11,9 +11,18 @@ iCTRL runs on an iPhone and exposes iOS UI automation as a **JSON-RPC 2.0 API ov
 
 Every `/rpc` body is an **encrypted envelope (protocol v1)**. There is no plaintext or Bearer path — an unsealed POST gets `401 auth_required`. All request-path crypto is HMAC-SHA256 only, so this is a few lines in any language.
 
-**A ready-made client ships with the repo: `Scripts/ictrl_rpc.py`** (`pair` once, then `call <method> '<json params>'`). Use it and skip the crypto below unless you're writing your own.
+**Don't hand-write the crypto — download a working client from the device itself:**
+```bash
+curl -o ictrl_rpc.py http://<host>:8200/skill/examples/python   # unauthenticated
+python3 ictrl_rpc.py --host <host>:8200 pair                    # tap Allow on the device
+python3 ictrl_rpc.py --host <host>:8200 call device_info
+python3 ictrl_rpc.py --host <host>:8200 call tap '{"x":100,"y":200}'
+```
+It is **Python stdlib only** (X25519 LAN pairing additionally wants `pip install cryptography`; `--plain` over USB/localhost needs nothing), caches keys per device, and is served straight off the runner so it always matches the running build. The same file is in the repo at `Scripts/ictrl_rpc.py`.
 
-1. **Probe readiness** (short timeout): `GET http://<host>:8200/schema` → HTTP 200 means the service is up. If it's not reachable, the runner isn't running — it must be launched on the device (tapping the iCTRL app, or an `ictrl://` URL scheme if you have one). `/schema` and `/skill` are the only unauthenticated routes.
+Read the rest of this section only if you're implementing the protocol yourself.
+
+1. **Probe readiness** (short timeout): `GET http://<host>:8200/schema` → HTTP 200 means the service is up. If it's not reachable, the runner isn't running — it must be launched on the device (tapping the iCTRL app, or an `ictrl://` URL scheme if you have one). Unauthenticated routes are only `/schema`, `/skill`, and `/skill/examples/python` (capability discovery, this manual, and the reference client — never session data).
 2. **Pair once** to get the 32-byte key `K`: `POST /pair` with `{"client_name":"<you>","plain":true}` (accepted **only from 127.0.0.1** — USB via `iproxy 8200 8200`), or over the LAN `{"client_name":"<you>","pub":"<base64 raw 32B X25519 pubkey>"}` and unwrap:
    ```
    shared  = X25519(client_priv, device_pub)
@@ -40,11 +49,31 @@ Every `/rpc` body is an **encrypted envelope (protocol v1)**. There is no plaint
 
 **Detect capabilities from `device_info`.** The first `device_info` call returns `server_version` (semver), `protocol_version` (int), and a `capabilities` array (`envelope_v1`, `stream_ticket`, `page_source_filter`, `max_depth`, `find_element_ref`, `scroll_to_element`, `clear_text`, `open_url`, `resolve_app`, `page`, `stop_server`, `logs_history`). Feature-detect against these — no separate `/schema` fetch — and don't assume a method exists on an older `server_version`.
 
-**Cache the key so you don't re-prompt the user every run.** After a successful pair, persist to **`~/.ictrl/token.json`** keyed by host:
+### Key cache — one key PER DEVICE
+
+**Each device has its own key.** A key is minted by, and only valid on, the device that issued it — there is no shared secret. So the cache is **keyed by `host:port`**, and you can hold keys for many devices at once and drive them **concurrently**.
+
+Persist to **`~/.ictrl/token.json`** as a map, never a bare object:
 ```json
-{"<host>:8200": {"tok": "<8 hex>", "key": "<64 hex K>", "client_name": "<you>", "expires": 1755820800}}
+{
+  "10.1.10.3:8200": {"tok": "a1b2c3d4", "key": "<64 hex K>", "client_name": "<you>",
+                     "device_name": "Colour's iPhone", "expires": 1755820800},
+  "10.1.1.253:8200": {"tok": "9f8e7d6c", "key": "<64 hex K>", "client_name": "<you>",
+                      "device_name": "Ethan's iPhone", "expires": 1755906300}
+}
 ```
-On later runs, **use the cached key directly** — don't call `/pair`. Expiry is **idle-based**: a key dies only after 30 days of *no use*, and every call slides that window forward, so a key in regular use never expires and survives app restarts. The `expires` returned at pair time is merely "expiry if never used" — do **not** discard a cached key because that timestamp passed. Re-pair only when a call actually returns **401** `token_unknown`/`token_expired`. If you cache resolved `bundle_id`s too (e.g. `~/.ictrl/apps.json`), you can also skip `resolve_app` on repeat tasks.
+
+Rules that matter when more than one device is in play:
+- **Look up by the exact `host:port` you are calling.** Never reuse another device's key — it authenticates as an unknown `tok` and fails `401 auth_failed`.
+- **Pair per device**, once each. Pairing device B does not affect device A's key.
+- **Keep each device's `nonce` stream separate** — nonces are random per request anyway, so just never reuse an envelope across devices.
+- Record `device_name` (from `device_info`) alongside the key. Hosts move (DHCP); the name is what lets you tell the user *which phone* you're driving, and lets you notice a host now answers as a different device.
+- Driving several devices at once is fine and fully parallel — separate keys, separate sessions, no shared state on either side.
+- `Scripts/ictrl_rpc.py` already does all of this: `--host` selects the device and the store is a host-keyed map.
+
+On later runs, **use the cached key directly** — don't call `/pair`. Expiry is **idle-based**: a key dies only after 30 days of *no use*, and every call slides that window forward, so a key in regular use never expires and survives app restarts. The `expires` returned at pair time is merely "expiry if never used" — do **not** discard a cached key because that timestamp passed. Re-pair only when a call actually returns **401**. If you cache resolved `bundle_id`s too (e.g. `~/.ictrl/apps.json`, also keyed per host), you can skip `resolve_app` on repeat tasks.
+
+**Dev shortcut:** if the runner was launched from Xcode with `ICTRL_ALLOW_AUTH_ONCE=1` in the scheme's environment, the **first** pairing after that cold start is auto-approved (no on-device tap). It is consumed by that one pairing and never rearms.
 
 **Byte streams use a ticket, not an envelope.** `GET /stream` and `GET /logs*` return raw bytes a browser/player fetches directly, so they can't carry an envelope. Call the `stream_ticket` RPC (over the encrypted channel) to mint a **single-use, ~60s** ticket, then append `?ticket=<t>` to the URL. Mint a fresh one per fetch.
 

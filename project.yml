@@ -40,6 +40,11 @@ targets:
       # The operating manual, bundled so GET /skill can serve it at runtime.
       - path: SKILL.md
         buildPhase: resources
+      # The reference client, served at GET /skill/examples/python so a caller
+      # can download a working v1-envelope implementation straight off the
+      # device instead of writing the crypto itself.
+      - path: Scripts/ictrl_rpc.py
+        buildPhase: resources
     dependencies:
       - target: iCTRL
     settings:

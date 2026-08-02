@@ -354,6 +354,7 @@ struct RPCMethodRegistry {
                 "logs": "GET /logs?ticket=<t>   plain-text recent logs (current process, in-memory). Browser-issued GET, so it uses the same single-use ticket as /stream. Sensitive values are redacted",
                 "logs_files": "GET /logs/files?ticket=<t>   list persisted daily log files (survive crashes/restarts)",
                 "logs_history": "GET /logs/history?date=YYYY-MM-DD&ticket=<t>   dump a persisted day's log (redacted). Use this to recover logs from BEFORE a crash — /logs only holds the current process's memory",
+                "client": "GET /skill/examples/python  → a ready-to-run reference client (stdlib only; X25519 LAN pairing additionally wants `pip install cryptography`). Downloads straight off the device so it always matches this build: `curl -O http://<host>:8200/skill/examples/python`, then `python3 ictrl_rpc.py --host <host>:8200 pair` and `… call device_info`. Use this instead of hand-writing the crypto.",
                 "schema": "GET /schema  this document",
             ],
             "guidance": [
@@ -373,7 +374,9 @@ struct RPCMethodRegistry {
                     "tag == HMAC(K_mac, \"resp\"||nonce||ct), then decrypt with K_enc_resp = HMAC(K, \"ictrl-v1|enc-resp\"||nonce). " +
                     "Expiry is IDLE-BASED: a key dies only after 30 days of no use, and every call slides that forward, " +
                     "so a key in regular use never expires and survives app restarts. Cache K and re-pair ONLY on " +
-                    "401 token_unknown/token_expired. Nonces must never repeat (replay is rejected).",
+                    "401 auth_failed. Nonces must never repeat (replay is rejected within the ±120s window). "
+                    + "Keys are PER DEVICE: cache them keyed by host:port so you can drive several devices "
+                    + "concurrently, and never send one device's key to another.",
                 "client_timeouts":
                     "Set generous client timeouts for /rpc: at least 30s, ideally 60-120s. " +
                     "/schema and /logs are static and reply instantly, but /rpc drives the real device — a cold app " +

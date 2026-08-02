@@ -249,6 +249,14 @@ class JSONRPCServer {
         case ("GET", "/skill"), ("GET", "/skill.md"), ("GET", "/SKILL.md"):
             handleSkill(connection: connection)
 
+        // Bootstrap: a working client, downloadable off the device itself, so a
+        // caller that doesn't yet speak the v1 envelope can fetch one and start
+        // immediately. Unauthenticated on purpose — it serves example code only,
+        // never session data, and the protocol it implements is public anyway.
+        case ("GET", "/skill/examples/python"), ("GET", "/skill/examples/ictrl_rpc.py"),
+             ("GET", "/client.py"):
+            handleClientSource(connection: connection)
+
         case ("GET", "/docs"):
             handleDocsPage(connection: connection)
 
@@ -336,6 +344,21 @@ class JSONRPCServer {
     /// so an agent can read it once and treat iCTRL as a Skill. Served from the
     /// bundled SKILL.md resource; falls back to a pointer if the resource is
     /// missing. The dynamic method list stays at /schema.
+    /// GET /skill/examples/python — the reference client's source.
+    ///
+    /// Serving it from the device guarantees the client always matches the
+    /// running build's protocol. Plain text so `curl … > ictrl_rpc.py` just works.
+    private func handleClientSource(connection: NWConnection) {
+        guard let src = Self.bundledResource(named: "ictrl_rpc", ext: "py") else {
+            sendHTTPResponse(connection: connection, status: 404,
+                             body: "Reference client not bundled in this build. "
+                                 + "The protocol is fully specified in GET /skill.")
+            return
+        }
+        sendHTTPResponse(connection: connection, status: 200,
+                         contentType: "text/x-python; charset=utf-8", body: src)
+    }
+
     private func handleSkill(connection: NWConnection) {
         let md = Self.bundledSkillMarkdown()
             ?? "# iCTRL\n\nOperating manual resource missing. Fetch GET /schema for the machine-readable method list and guidance.\n"
@@ -347,9 +370,16 @@ class JSONRPCServer {
     /// the UITests .xctest bundle (this class's bundle), not runner.app's root, so
     /// try Bundle(for:) first, then main + all loaded bundles as a fallback.
     static func bundledSkillMarkdown() -> String? {
+        bundledResource(named: "SKILL", ext: "md")
+    }
+
+    /// Read a file bundled with the runner. Used to serve the operating manual
+    /// and the reference clients straight off the device, so a caller can
+    /// bootstrap the encrypted protocol with one unauthenticated GET.
+    static func bundledResource(named name: String, ext: String) -> String? {
         let candidates = [Bundle(for: JSONRPCServer.self), Bundle.main] + Bundle.allBundles
         for b in candidates {
-            if let url = b.url(forResource: "SKILL", withExtension: "md"),
+            if let url = b.url(forResource: name, withExtension: ext),
                let s = try? String(contentsOf: url, encoding: .utf8) {
                 return s
             }
