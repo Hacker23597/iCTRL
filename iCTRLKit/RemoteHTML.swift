@@ -67,6 +67,12 @@ enum RemoteHTML {
     border-radius: var(--radius);
     overflow: hidden;
   }
+  /* A sidebar panel must keep its natural height. As flex items they default to
+     flex-shrink:1, so an overfull sidebar squashed each panel instead of
+     scrolling — and `overflow:hidden` then clipped the contents away with no
+     scrollbar anywhere. Pinning the basis to the content height makes the
+     overflow real, which is what lets aside's own scrollbar appear. */
+  aside > .panel { flex: 0 0 auto; }
   .stage {
     position: relative; display: flex; align-items: center; justify-content: center;
     background: #000; user-select: none;
