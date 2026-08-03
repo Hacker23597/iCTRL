@@ -441,7 +441,11 @@ enum RemoteHTML {
       let p = 0; for (const x of a) { o.set(x,p); p += x.length; } return o; };
     function sha256(msg) {
       const len = msg.length, bitLen = len * 8;
-      const padded = new Uint8Array((((len + 9) >> 6) + 1) << 6);
+      // Message + 0x80 + 8-byte length, rounded UP to a whole 64-byte block.
+      // Getting this wrong by one block silently corrupts every digest whose
+      // length lands in [56,63] mod 64, which is exactly the case that broke
+      // the response MAC on longer replies.
+      const padded = new Uint8Array(Math.ceil((len + 9) / 64) * 64);
       padded.set(msg); padded[len] = 0x80;
       const dv = new DataView(padded.buffer);
       dv.setUint32(padded.length - 4, bitLen >>> 0);
