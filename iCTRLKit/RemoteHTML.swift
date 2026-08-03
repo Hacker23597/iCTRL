@@ -273,13 +273,16 @@ enum RemoteHTML {
       <div class="grid-2">
         <div>
           <label class="label">FPS</label>
-          <select class="input" id="fpsSel">
+          <select class="input" id="fpsSel"
+                  title="Requested rate. Screen capture is the limit — devices typically sustain ~5-10 fps, so 12/15 mostly won't be reached.">
             <option value="1">1</option>
-            <option value="2" selected>2</option>
+            <option value="2">2</option>
             <option value="3">3</option>
             <option value="5">5</option>
             <option value="8">8</option>
-            <option value="10">10</option>
+            <option value="10" selected>10</option>
+            <option value="12">12</option>
+            <option value="15">15</option>
           </select>
         </div>
         <div>
