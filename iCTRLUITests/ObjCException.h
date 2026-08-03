@@ -8,6 +8,16 @@ NS_ASSUME_NONNULL_BEGIN
 /// Returns the caught exception's reason, or nil if the block completed cleanly.
 @interface ObjCException : NSObject
 + (nullable NSString *)catching:(void (^)(void))block;
+
+/// Instantiate XCTest's private XCTImageEncoding by class + selector.
+///
+/// Lives here because the class ships in a private framework we do not link:
+/// naming its type in Swift would leave the linker hunting for a symbol that
+/// isn't there, so it has to be built through the runtime. Returns nil if the
+/// class or initializer is missing on this OS.
++ (nullable id)makeImageEncoding:(Class)encodingClass
+                             uti:(NSString *)uti
+                         quality:(double)quality;
 @end
 
 NS_ASSUME_NONNULL_END

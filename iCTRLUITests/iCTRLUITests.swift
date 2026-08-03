@@ -84,6 +84,59 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         Self.logBuffer.append("🧩 setUpWithError done (no app.activate)")
     }
 
+    /// JPEG quality asked of the capture side. Appium/WDA ship 0.25 by default
+    /// and it is visually fine for a control stream, so the bandwidth and the
+    /// decode both stay small.
+    private static let captureJPEGQuality = 0.25
+    /// nil = not probed yet, false = unavailable on this OS, true = usable.
+    private static var jpegCaptureAvailable: Bool?
+
+    /// Capture a frame that the system compressed for us, or nil if this OS
+    /// doesn't expose the private encoding-aware capture path.
+    ///
+    /// Every step is probed: the selectors are private, and a wrong assumption
+    /// here is a launch-time crash rather than a slow stream.
+    private static func grabJPEGFrame() -> UIImage? {
+        if jpegCaptureAvailable == false { return nil }
+
+        let screen = XCUIScreen.main
+        let initSel = Selector(("initWithUniformTypeIdentifier:compressionQuality:"))
+        // The encoding class lives in a private framework we don't link, so it
+        // is built entirely through the runtime.
+        guard screen.responds(to: Selector(("screenshotWithPreferredEncoding:rect:options:error:"))),
+              let encodingClass = NSClassFromString("XCTImageEncoding") as? NSObject.Type,
+              encodingClass.instancesRespond(to: initSel),
+              let encoding = ObjCException.makeImageEncoding(encodingClass,
+                                                             uti: "public.jpeg",
+                                                             quality: captureJPEGQuality)
+                                as? XCTImageEncoding else {
+            if jpegCaptureAvailable == nil {
+                jpegCaptureAvailable = false
+                logBuffer.append("📷 JPEG capture unavailable — using bitmap path")
+            }
+            return nil
+        }
+
+        guard let shot = try? screen.screenshot(withPreferredEncoding: encoding,
+                                                rect: .null, options: nil),
+              let xctImage = shot.internalImage(),
+              xctImage.responds(to: Selector(("data"))),
+              let data = xctImage.data(),
+              let img = UIImage(data: data),
+              img.cgImage != nil else {
+            if jpegCaptureAvailable == nil {
+                jpegCaptureAvailable = false
+                logBuffer.append("📷 JPEG capture returned nothing usable — using bitmap path")
+            }
+            return nil
+        }
+        if jpegCaptureAvailable == nil {
+            jpegCaptureAvailable = true
+            logBuffer.append("📷 JPEG capture active (q=\(captureJPEGQuality), \(data.count / 1024) KB/frame)")
+        }
+        return img
+    }
+
     private static var lifecycleObserved = false
 
     /// Log foreground/background transitions — a silent exit often correlates with
@@ -734,11 +787,29 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             // on the main thread — hop over there synchronously from whatever
             // queue the broadcaster ticks on.
             VideoBroadcaster.shared.configure(fps: fps, quality: quality) {
-                if Thread.isMainThread {
-                    return XCUIScreen.main.screenshot().image
+                let grab: () -> UIImage? = {
+                    // Fast path: ask the capture side to hand back a JPEG. The
+                    // default `screenshot()` produces a full-resolution bitmap
+                    // (~6 MB at 828x1792) that we then copy again; capture and
+                    // that copy are what degrade 15-20x under thermal pressure,
+                    // while encoding barely moves. Compressing at the source
+                    // keeps the big buffer out of this process entirely.
+                    if let img = Self.grabJPEGFrame() { return img }
+                    // Otherwise take the bitmap directly, still skipping the
+                    // PNG round-trip that `.image` would do.
+                    let shot = XCUIScreen.main.screenshot()
+                    if shot.responds(to: Selector(("internalImage"))),
+                       let xctImage = shot.internalImage(),
+                       xctImage.responds(to: Selector(("platformImage"))),
+                       let img = xctImage.platformImage(),
+                       img.cgImage != nil {   // encoder needs a CGImage-backed frame
+                        return img
+                    }
+                    return shot.image
                 }
+                if Thread.isMainThread { return grab() }
                 var img: UIImage?
-                DispatchQueue.main.sync { img = XCUIScreen.main.screenshot().image }
+                DispatchQueue.main.sync { img = grab() }
                 return img
             }
             let streamer = VideoStreamer(connection: connection)

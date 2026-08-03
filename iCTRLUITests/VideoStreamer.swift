@@ -103,6 +103,13 @@ final class VideoBroadcaster {
     private var initSegment: Data?
     private var width = 0, height = 0
     private var frameIndex: Int64 = 0
+    /// Recycles the ~6 MB BGRA frame buffers instead of allocating one per
+    /// frame. At 10 fps a fresh CVPixelBufferCreate every tick was churning
+    /// ~60 MB/s through the allocator; the pool also keeps the backing pages
+    /// warm, which is most of the win.
+    private var pixelBufferPool: CVPixelBufferPool?
+    /// Immutable and reused — building one per frame is pure overhead.
+    private let deviceRGB = CGColorSpaceCreateDeviceRGB()
     /// Cached SPS/PPS captured from the first keyframe's format description.
     private var sps: Data = Data()
     private var pps: Data = Data()
@@ -201,11 +208,15 @@ final class VideoBroadcaster {
         let s = quality.scale
         width  = max(2, Int(Double(cg.width)  * s) & ~1)
         height = max(2, Int(Double(cg.height) * s) & ~1)
+        makePixelBufferPool()
         guard setupEncoder(width: width, height: height) else { return }
         // muxer is built lazily on the first keyframe (that's when we know
         // SPS/PPS). initSegment is filled in the same place.
         muxer = nil
         initSegment = nil
+        // Drop the pool: a restart may pick new dimensions, and pooled buffers
+        // are fixed-size.
+        pixelBufferPool = nil
         sps = Data(); pps = Data()
         frameIndex = 0
         let t = DispatchSource.makeTimerSource(queue: queue)
@@ -464,20 +475,52 @@ final class VideoBroadcaster {
         return out
     }
 
+    /// Build (once) the pool that vends BGRA frame buffers at the current size.
+    /// Called from startEncoding, after width/height are known.
+    private func makePixelBufferPool() {
+        pixelBufferPool = nil
+        let bufAttrs: [CFString: Any] = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            // Let CoreVideo pick the row stride it likes; an unaligned one
+            // forces a slow copy on the encoder's side.
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        ]
+        // A few buffers in flight is plenty: capture → encode is serial.
+        let poolAttrs: [CFString: Any] = [kCVPixelBufferPoolMinimumBufferCountKey: 3]
+        var pool: CVPixelBufferPool?
+        if CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs as CFDictionary,
+                                   bufAttrs as CFDictionary, &pool) == kCVReturnSuccess {
+            pixelBufferPool = pool
+        } else {
+            log("pixel buffer pool creation failed — falling back to per-frame allocation")
+        }
+    }
+
     private func pixelBuffer(from image: UIImage) -> CVPixelBuffer? {
         guard let cg = image.cgImage else { return nil }
         var pb: CVPixelBuffer?
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
-        ]
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
-                                  attrs as CFDictionary, &pb) == kCVReturnSuccess, let buffer = pb else { return nil }
+        if let pool = pixelBufferPool {
+            CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb)
+        }
+        if pb == nil {
+            // No pool (or it was exhausted) — allocate one off, same as before.
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferCGImageCompatibilityKey: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            ]
+            guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+                                      attrs as CFDictionary, &pb) == kCVReturnSuccess else { return nil }
+        }
+        guard let buffer = pb else { return nil }
         CVPixelBufferLockBaseAddress(buffer, [])
         defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
         let ctx = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: width, height: height,
                             bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
-                            space: CGColorSpaceCreateDeviceRGB(),
+                            space: deviceRGB,
                             bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue |
                                         CGBitmapInfo.byteOrder32Little.rawValue)
         ctx?.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))

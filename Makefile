@@ -9,6 +9,7 @@ MAIN_APP      = iCTRL.app
 MAIN_IPA      = iCTRL.ipa
 
 RUNNER_APP    = iCTRLUITests-Runner.app
+RUNNER_BIN    = iCTRLUITests-Runner
 XCTEST_BUNDLE = iCTRLUITests.xctest
 RUNNER_IPA    = iCTRLUITests-Runner.ipa
 
@@ -71,6 +72,29 @@ ipa: build
 	rm -rf "$(BUILD_DIR)/$(RUNNER_APP)/Frameworks/Testing.framework"
 	rm -f  "$(BUILD_DIR)/$(RUNNER_APP)/Frameworks/libXCTestSwiftSupport.dylib"
 	@rmdir "$(BUILD_DIR)/$(RUNNER_APP)/Frameworks" 2>/dev/null || true
+	@# ── Back-compat shim for older iOS (see iCTRLCompat/XCTCompatShim.m) ──
+	@# Xcode's prebuilt XCTRunner stub hard-binds classes that don't exist in the
+	@# XCTest shipped by older Developer disk images, so the runner dies at launch
+	@# with "Symbol not found: _OBJC_CLASS_$$_XCTCommandLineToolHelper" on e.g.
+	@# iOS 16. We ship a dylib defining the missing class and re-point just that
+	@# one bind record at it — the symbol is only touched on the --run-as-tool
+	@# path, which testmanagerd-launched runs never take.
+	@echo "🩹 Building + inserting the older-iOS compat shim..."
+	@set -e; \
+	APP="$(BUILD_DIR)/$(RUNNER_APP)"; \
+	SDK="$$(xcrun --sdk iphoneos --show-sdk-path)"; \
+	mkdir -p "$$APP/Frameworks"; \
+	xcrun -sdk iphoneos clang -dynamiclib -arch arm64 -isysroot "$$SDK" \
+		-mios-version-min=16.0 -install_name "@rpath/libXCTCompatShim.dylib" \
+		-framework Foundation -o "$$APP/Frameworks/libXCTCompatShim.dylib" \
+		iCTRLCompat/XCTCompatShim.m; \
+	optool install -c load -p "@rpath/libXCTCompatShim.dylib" \
+		-t "$$APP/$(RUNNER_BIN)" >/dev/null; \
+	ORD="$$(python3 Scripts/dylib-ordinal.py "$$APP/$(RUNNER_BIN)" libXCTCompatShim)"; \
+	python3 Scripts/retarget-bind-ordinal.py "$$APP/$(RUNNER_BIN)" \
+		'_OBJC_CLASS_$$_XCTCommandLineToolHelper' "$$ORD"; \
+	python3 Scripts/retarget-undef-symbol.py "$$APP/$(RUNNER_BIN)" \
+		'_OBJC_CLASS_$$_XCTCommandLineToolHelper' libXCTCompatShim
 	@echo "🧹 Removing dSYM debug symbols from the app..."
 	@# build-for-testing embeds a .dSYM inside the app; it is debug-symbol data,
 	@# not needed at runtime, and bloats the IPA (~3MB). Strip it before packaging.
