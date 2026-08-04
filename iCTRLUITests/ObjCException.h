@@ -17,7 +17,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// class or initializer is missing on this OS.
 + (nullable id)makeImageEncoding:(Class)encodingClass
                              uti:(NSString *)uti
-                         quality:(double)quality;
+                         quality:(double)quality
+                        diagnosis:(NSString * _Nullable * _Nullable)diagnosis;
 @end
 
 NS_ASSUME_NONNULL_END

@@ -517,7 +517,9 @@ class JSONRPCServer {
     /// protected by an envelope. Instead it takes a single-use ticket minted over
     /// the encrypted channel (`stream_ticket` RPC): short-lived, consumed on
     /// first use, and useless to anyone who scrapes the URL afterwards.
-    /// Optional ?fps=N (0.5–15, default 10; capture usually sustains ~5-10).
+    /// Optional ?fps=N (0.5–15, default 5 — see the note on the default in
+    /// VideoBroadcaster: asking for more than capture sustains just heats the
+    /// device and ends up SLOWER).
     /// Hands the connection to the host's
     /// video streamer (kept open until the client disconnects).
     private func handleVideoStream(headers: [String: String], query: String, connection: NWConnection) {
@@ -531,7 +533,7 @@ class JSONRPCServer {
             sendHTTPResponse(connection: connection, status: 503, body: "Video streaming unavailable")
             return
         }
-        var fps = 10.0
+        var fps = 5.0
         var quality = "auto"
         var verbose = false
         for pair in query.split(separator: "&") {

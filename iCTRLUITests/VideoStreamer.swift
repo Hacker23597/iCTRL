@@ -63,7 +63,7 @@ final class VideoBroadcaster {
     }
     private var subscribers: [ObjectIdentifier: Subscriber] = [:]
     private var grabFrame: (() -> UIImage?)?
-    private var fps: Double = 10
+    private var fps: Double = 5
 
     /// Encoder quality preset. Controls both the target bitrate (via
     /// AverageBitRate + DataRateLimits) and the encoding resolution (source
@@ -134,11 +134,13 @@ final class VideoBroadcaster {
                    quality: Quality = .auto,
                    grabFrame: @escaping () -> UIImage?) {
         queue.async {
-            // Ceiling is 15, but screen capture — not encoding — is the real
-            // limit: measured cap is 76-190ms/frame (~5-13 fps) versus ~13ms
-            // to encode, and it degrades as the stream runs. Asking for more
-            // than the device can grab just spins the timer; the achieved rate
-            // is whatever capture sustains.
+            // Ceiling is 15, but the default is 5 for a reason: screen capture,
+            // not encoding, sets the rate, and it gets WORSE the harder you push
+            // it. Measured at a constant 10 fps request: capture started at
+            // ~70ms/frame and degraded to 1000ms+ over three minutes as the
+            // device heated, dragging the achieved rate from 10.2 fps down to
+            // 0.9. Encoding moved 13ms -> 22ms over the same run. So a higher
+            // setting buys a brief burst and then runs slower than a steady 5.
             let newFps = max(0.5, min(fps, 15))
             let restart = (self.timer != nil) && (self.fps != newFps || self.quality != quality)
             self.fps = newFps

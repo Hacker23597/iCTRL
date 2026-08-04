@@ -107,24 +107,46 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // @try, and any failure disables this path permanently.
         var result: UIImage?
         var sizeKB = 0
+        var failStep = "unknown"
         let raised = ObjCException.catching {
+            // Stepwise so the log names the exact link that failed — a single
+            // guard chain only ever reports "not supported", which is useless
+            // when the point is to find out which private API is missing.
             let screen = XCUIScreen.main
             let initSel = Selector(("initWithUniformTypeIdentifier:compressionQuality:"))
-            guard screen.responds(to: Selector(("screenshotWithPreferredEncoding:rect:options:error:"))),
-                  let encodingClass = NSClassFromString("XCTImageEncoding") as? NSObject.Type,
-                  encodingClass.instancesRespond(to: initSel),
-                  let encoding = ObjCException.makeImageEncoding(encodingClass,
+            guard screen.responds(to: Selector(("screenshotWithPreferredEncoding:rect:options:error:"))) else {
+                failStep = "XCUIScreen lacks screenshotWithPreferredEncoding:rect:options:error:"; return
+            }
+            guard let encodingClass = NSClassFromString("XCTImageEncoding") as? NSObject.Type else {
+                failStep = "XCTImageEncoding class not found"; return
+            }
+            guard encodingClass.instancesRespond(to: initSel) else {
+                failStep = "XCTImageEncoding lacks initWithUniformTypeIdentifier:compressionQuality:"; return
+            }
+            var diag: NSString?
+            guard let encoding = ObjCException.makeImageEncoding(encodingClass,
                                                                  uti: "public.jpeg",
-                                                                 quality: captureJPEGQuality)
-                                    as? XCTImageEncoding,
-                  let shot = try? screen.screenshot(withPreferredEncoding: encoding,
-                                                    rect: .null, options: nil),
-                  shot.responds(to: Selector(("internalImage"))),
-                  let xctImage = shot.internalImage(),
-                  xctImage.responds(to: Selector(("data"))),
-                  let data = xctImage.data(),
-                  let img = UIImage(data: data),
-                  img.cgImage != nil else { return }
+                                                                 quality: captureJPEGQuality,
+                                                                 diagnosis: &diag)
+                                    as? XCTImageEncoding else {
+                failStep = "makeImageEncoding returned nil [\(diag ?? "no diagnosis")]"; return
+            }
+            guard let shot = try? screen.screenshot(withPreferredEncoding: encoding,
+                                                    rect: .null, options: nil) else {
+                failStep = "screenshotWithPreferredEncoding threw/returned nil"; return
+            }
+            guard shot.responds(to: Selector(("internalImage"))), let xctImage = shot.internalImage() else {
+                failStep = "screenshot has no internalImage"; return
+            }
+            guard xctImage.responds(to: Selector(("data"))) else {
+                failStep = "XCTImage lacks data"; return
+            }
+            guard let data = xctImage.data() else {
+                failStep = "XCTImage.data was nil (frame kept as a bitmap, not encoded)"; return
+            }
+            guard let img = UIImage(data: data), img.cgImage != nil else {
+                failStep = "UIImage(data:) failed on \(data.count) bytes"; return
+            }
             result = img
             sizeKB = data.count / 1024
         }
@@ -138,7 +160,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
         if jpegCaptureAvailable == nil {
             jpegCaptureAvailable = false
-            logBuffer.append("📷 JPEG capture unavailable (\(raised ?? "not supported")) — using bitmap path")
+            logBuffer.append("📷 JPEG capture unavailable — using bitmap path. "
+                             + "Stopped at: \(raised ?? failStep)")
         }
         return nil
     }

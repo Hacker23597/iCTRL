@@ -17,27 +17,49 @@
 
 + (nullable id)makeImageEncoding:(Class)encodingClass
                              uti:(NSString *)uti
-                         quality:(double)quality {
+                         quality:(double)quality
+                        diagnosis:(NSString * _Nullable * _Nullable)diagnosis {
     SEL sel = NSSelectorFromString(@"initWithUniformTypeIdentifier:compressionQuality:");
-    if (![encodingClass instancesRespondToSelector:sel]) { return nil; }
+    if (![encodingClass instancesRespondToSelector:sel]) {
+        if (diagnosis) { *diagnosis = @"selector missing"; }
+        return nil;
+    }
 
-    // Send alloc/init through objc_msgSend directly rather than NSInvocation.
-    // NSInvocation retains its target and ARC also owns the `id` holding the
-    // alloc'd object, so combining them with a __bridge_transfer of the init
-    // result over-releases the same object — an EXC_BAD_ACCESS on the next use.
-    // Casting objc_msgSend to the exact signature keeps ARC out of it entirely;
-    // the +1 from alloc/init is handed back via a __bridge_transfer of a
-    // deliberately un-owned pointer.
+    // Read the real signature instead of assuming one. The quality argument is
+    // NOT double on every OS — guessing wrong means the value arrives as
+    // garbage and the initializer quietly returns nil, which is exactly how
+    // this failed before. objc_msgSend is called through a cast matching what
+    // the runtime reports, and stays outside ARC so the +1 from alloc/init can
+    // be handed back with a single __bridge_transfer.
+    NSMethodSignature *sig = [encodingClass instanceMethodSignatureForSelector:sel];
+    if (!sig) { return nil; }
+    const char *qType = [sig getArgumentTypeAtIndex:3];
+
     void *(*msgAlloc)(Class, SEL) = (void *(*)(Class, SEL))objc_msgSend;
     void *allocated = msgAlloc(encodingClass, @selector(alloc));
     if (!allocated) { return nil; }
 
-    void *(*msgInit)(void *, SEL, void *, double) =
-        (void *(*)(void *, SEL, void *, double))objc_msgSend;
-    void *created = msgInit(allocated, sel, (__bridge void *)uti, quality);
+    if (diagnosis) {
+        *diagnosis = [NSString stringWithFormat:@"sig='%s' argc=%lu qType='%s'",
+                      sig.methodReturnType ?: "?", (unsigned long)sig.numberOfArguments,
+                      qType ?: "(null)"];
+    }
+    void *created = NULL;
+    if (qType && strcmp(qType, @encode(float)) == 0) {
+        void *(*msgInitF)(void *, SEL, void *, float) =
+            (void *(*)(void *, SEL, void *, float))objc_msgSend;
+        created = msgInitF(allocated, sel, (__bridge void *)uti, (float)quality);
+    } else if (qType && strcmp(qType, @encode(double)) == 0) {
+        void *(*msgInitD)(void *, SEL, void *, double) =
+            (void *(*)(void *, SEL, void *, double))objc_msgSend;
+        created = msgInitD(allocated, sel, (__bridge void *)uti, quality);
+    } else {
+        return nil;
+    }
     if (!created) { return nil; }
     return (__bridge_transfer id)created;
 }
+
 
 
 @end
