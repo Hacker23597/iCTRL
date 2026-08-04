@@ -131,8 +131,24 @@ ipa: build
 	SHA="$$(security find-identity -v -p codesigning 2>/dev/null | grep -F "$$AUTH" | head -1 | awk '{print $$2}')"; \
 	IDENT="$${SHA:-$$AUTH}"; \
 	echo "   using: $$AUTH ($$IDENT)"; \
+	for dylib in "$$APP/Frameworks/"*.dylib; do \
+		[ -f "$$dylib" ] || continue; \
+		echo "   signing $$(basename "$$dylib")"; \
+		codesign --force --sign "$$IDENT" "$$dylib"; \
+	done; \
 	codesign --force --sign "$$IDENT" "$$APP/PlugIns/$(XCTEST_BUNDLE)"; \
 	codesign --force --sign "$$IDENT" --preserve-metadata=entitlements "$$APP"
+	@# Everything dyld loads must carry a signature — an unsigned dylib in
+	@# Frameworks/ makes the runner die at launch with "mapped file has no
+	@# cdhash", which looks nothing like a signing problem from the device side.
+	@echo "🔍 Verifying every embedded binary is signed..."
+	@set -e; \
+	APP="$(BUILD_DIR)/$(RUNNER_APP)"; \
+	for f in "$$APP/Frameworks/"*.dylib "$$APP/PlugIns/$(XCTEST_BUNDLE)" "$$APP"; do \
+		[ -e "$$f" ] || continue; \
+		codesign -v "$$f" 2>/dev/null || { echo "🔴 unsigned: $$f"; exit 1; }; \
+	done; \
+	echo "   ✅ all embedded binaries signed"
 	@echo "📦 Packaging $(RUNNER_IPA)..."
 	rm -rf "$(BUILD_DIR)/Payload"
 	mkdir -p "$(BUILD_DIR)/Payload"

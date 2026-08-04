@@ -8,7 +8,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    DEVELOPMENT_TEAM: 7P798DM2MY
+    DEVELOPMENT_TEAM: K8Q74NT2BG
 
 targets:
   iCTRL:

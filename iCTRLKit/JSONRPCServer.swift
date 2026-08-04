@@ -568,14 +568,30 @@ class JSONRPCServer {
 
     /// Whether the peer is 127.0.0.1/::1 — the only source allowed to request a
     /// plaintext key grant at pairing time.
+    /// Deliberately built only from `NWConnection.endpoint` and raw address
+    /// bytes — all iOS 12-era API.
+    ///
+    /// The obvious spelling (`connection.currentPath?.remoteEndpoint`, then
+    /// `IPv4Address.isLoopback`) reads better but is a trap: those are
+    /// Swift-only properties added later, and on an OS that lacks them the
+    /// symbol is missing at LOAD time. The runner then dies before a single
+    /// line of our code runs, with no crash report pointing anywhere near
+    /// here — which is exactly how this cost days to find. Prefer the older,
+    /// duller API in code that must load on the oldest supported OS.
     private func isLoopback(_ connection: NWConnection) -> Bool {
-        guard case let .hostPort(host, _)? = connection.currentPath?.remoteEndpoint else {
-            return false
-        }
+        guard case let .hostPort(host, _) = connection.endpoint else { return false }
         switch host {
-        case .ipv4(let addr): return addr.isLoopback
-        case .ipv6(let addr): return addr.isLoopback
-        @unknown default: return false
+        case .ipv4(let addr):
+            return addr.rawValue.first == 127          // 127.0.0.0/8
+        case .ipv6(let addr):
+            let b = [UInt8](addr.rawValue)
+            guard b.count == 16 else { return false }
+            if b[0..<15].allSatisfy({ $0 == 0 }) && b[15] == 1 { return true }   // ::1
+            // ::ffff:127.x.x.x (IPv4-mapped)
+            let v4Mapped = b[0..<10].allSatisfy { $0 == 0 } && b[10] == 0xff && b[11] == 0xff
+            return v4Mapped && b[12] == 127
+        @unknown default:
+            return false
         }
     }
 

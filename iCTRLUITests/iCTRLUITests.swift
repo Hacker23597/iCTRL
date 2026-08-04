@@ -99,42 +99,48 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private static func grabJPEGFrame() -> UIImage? {
         if jpegCaptureAvailable == false { return nil }
 
-        let screen = XCUIScreen.main
-        let initSel = Selector(("initWithUniformTypeIdentifier:compressionQuality:"))
-        // The encoding class lives in a private framework we don't link, so it
-        // is built entirely through the runtime.
-        guard screen.responds(to: Selector(("screenshotWithPreferredEncoding:rect:options:error:"))),
-              let encodingClass = NSClassFromString("XCTImageEncoding") as? NSObject.Type,
-              encodingClass.instancesRespond(to: initSel),
-              let encoding = ObjCException.makeImageEncoding(encodingClass,
-                                                             uti: "public.jpeg",
-                                                             quality: captureJPEGQuality)
-                                as? XCTImageEncoding else {
-            if jpegCaptureAvailable == nil {
-                jpegCaptureAvailable = false
-                logBuffer.append("📷 JPEG capture unavailable — using bitmap path")
-            }
-            return nil
+        // These selectors were read out of a current Xcode SDK; an older OS
+        // (iOS 16 shipped in 2022) may not have them, or may have them with a
+        // different shape. `responds(to:)` covers "missing", but a mismatched
+        // implementation raises an NSException, which `try?` does NOT catch —
+        // it would abort the runner. So the whole probe runs inside an ObjC
+        // @try, and any failure disables this path permanently.
+        var result: UIImage?
+        var sizeKB = 0
+        let raised = ObjCException.catching {
+            let screen = XCUIScreen.main
+            let initSel = Selector(("initWithUniformTypeIdentifier:compressionQuality:"))
+            guard screen.responds(to: Selector(("screenshotWithPreferredEncoding:rect:options:error:"))),
+                  let encodingClass = NSClassFromString("XCTImageEncoding") as? NSObject.Type,
+                  encodingClass.instancesRespond(to: initSel),
+                  let encoding = ObjCException.makeImageEncoding(encodingClass,
+                                                                 uti: "public.jpeg",
+                                                                 quality: captureJPEGQuality)
+                                    as? XCTImageEncoding,
+                  let shot = try? screen.screenshot(withPreferredEncoding: encoding,
+                                                    rect: .null, options: nil),
+                  shot.responds(to: Selector(("internalImage"))),
+                  let xctImage = shot.internalImage(),
+                  xctImage.responds(to: Selector(("data"))),
+                  let data = xctImage.data(),
+                  let img = UIImage(data: data),
+                  img.cgImage != nil else { return }
+            result = img
+            sizeKB = data.count / 1024
         }
 
-        guard let shot = try? screen.screenshot(withPreferredEncoding: encoding,
-                                                rect: .null, options: nil),
-              let xctImage = shot.internalImage(),
-              xctImage.responds(to: Selector(("data"))),
-              let data = xctImage.data(),
-              let img = UIImage(data: data),
-              img.cgImage != nil else {
+        if let img = result {
             if jpegCaptureAvailable == nil {
-                jpegCaptureAvailable = false
-                logBuffer.append("📷 JPEG capture returned nothing usable — using bitmap path")
+                jpegCaptureAvailable = true
+                logBuffer.append("📷 JPEG capture active (q=\(captureJPEGQuality), \(sizeKB) KB/frame)")
             }
-            return nil
+            return img
         }
         if jpegCaptureAvailable == nil {
-            jpegCaptureAvailable = true
-            logBuffer.append("📷 JPEG capture active (q=\(captureJPEGQuality), \(data.count / 1024) KB/frame)")
+            jpegCaptureAvailable = false
+            logBuffer.append("📷 JPEG capture unavailable (\(raised ?? "not supported")) — using bitmap path")
         }
-        return img
+        return nil
     }
 
     private static var lifecycleObserved = false
@@ -796,15 +802,21 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                     // keeps the big buffer out of this process entirely.
                     if let img = Self.grabJPEGFrame() { return img }
                     // Otherwise take the bitmap directly, still skipping the
-                    // PNG round-trip that `.image` would do.
+                    // PNG round-trip that `.image` would do. Also private, and
+                    // also behind an ObjC @try: on an OS where the selector
+                    // exists but behaves differently, an NSException here would
+                    // abort the runner rather than fall through.
                     let shot = XCUIScreen.main.screenshot()
-                    if shot.responds(to: Selector(("internalImage"))),
-                       let xctImage = shot.internalImage(),
-                       xctImage.responds(to: Selector(("platformImage"))),
-                       let img = xctImage.platformImage(),
-                       img.cgImage != nil {   // encoder needs a CGImage-backed frame
-                        return img
+                    var fast: UIImage?
+                    _ = ObjCException.catching {
+                        guard shot.responds(to: Selector(("internalImage"))),
+                              let xctImage = shot.internalImage(),
+                              xctImage.responds(to: Selector(("platformImage"))),
+                              let img = xctImage.platformImage(),
+                              img.cgImage != nil else { return }  // encoder needs CGImage
+                        fast = img
                     }
+                    if let img = fast { return img }
                     return shot.image
                 }
                 if Thread.isMainThread { return grab() }
