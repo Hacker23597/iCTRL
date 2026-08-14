@@ -370,7 +370,32 @@ class JSONRPCServer {
     /// the UITests .xctest bundle (this class's bundle), not runner.app's root, so
     /// try Bundle(for:) first, then main + all loaded bundles as a fallback.
     static func bundledSkillMarkdown() -> String? {
-        bundledResource(named: "SKILL", ext: "md")
+        guard let raw = bundledResource(named: "SKILL", ext: "md") else { return nil }
+        return stampSkillVersion(raw)
+    }
+
+    /// Rewrite the frontmatter's `skill_version` to the running build's version.
+    ///
+    /// The whole point of the version is to let an installed copy notice it has
+    /// gone stale, which fails the moment the number in the file disagrees with
+    /// what device_info reports. Stamping it at serve time makes drift
+    /// impossible: there is one source of truth (`RPCMethod.serverVersion`) and
+    /// the checked-in literal is only a placeholder.
+    static func stampSkillVersion(_ markdown: String) -> String {
+        let version = RPCMethodRegistry.serverVersion
+        var lines = markdown.components(separatedBy: "\n")
+        // Only touch the frontmatter block: a `skill_version:` line in prose (an
+        // example, say) must not be rewritten.
+        guard lines.first == "---",
+              let end = lines.dropFirst().firstIndex(of: "---") else { return markdown }
+        for i in 1..<end where lines[i].hasPrefix("skill_version:") {
+            lines[i] = "skill_version: \"\(version)\""
+            return lines.joined(separator: "\n")
+        }
+        // No declaration yet — insert one so older checked-in copies still serve
+        // a version rather than silently omitting it.
+        lines.insert("skill_version: \"\(version)\"", at: end)
+        return lines.joined(separator: "\n")
     }
 
     /// Read a file bundled with the runner. Used to serve the operating manual

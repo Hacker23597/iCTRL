@@ -1,6 +1,7 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200.
+skill_version: "1.6.2"
 ---
 
 # iCTRL — Control an iPhone over HTTP
@@ -18,6 +19,32 @@ python3 ictrl_rpc.py --host <host>:8200 pair                    # tap Allow on t
 python3 ictrl_rpc.py --host <host>:8200 call device_info
 python3 ictrl_rpc.py --host <host>:8200 call tap '{"x":100,"y":200}'
 ```
+
+## Version check — glance at this on your first `device_info`
+
+This document is **skill_version 1.6.2** (see the frontmatter). Every `device_info` response carries the device's own `skill_version` (same value as `server_version`) plus a `skill_update_hint`.
+
+**This is advisory — a version gap is not an error, and most gaps need no action.** Your installed copy is a snapshot from whenever it was fetched; the device's copy always matches the running build. Use semver to decide whether the difference could actually affect you:
+
+| Gap | What it means | Do |
+|---|---|---|
+| Equal, or **patch** (`1.6.1` → `1.6.2`) | Bug fixes. No method, parameter or return shape changed. | Nothing — carry on. |
+| **Minor** (`1.5.x` → `1.6.x`) | New methods/fields added; existing ones still work. | Refresh only if something you need seems missing, or you want the new features. |
+| **Major** (`1.x` → `2.x`) | Breaking changes are possible. | Refresh before relying on the details below. |
+| `protocol_version` differs from your client's | The envelope format itself moved. | Refresh — nothing will authenticate otherwise. |
+
+To refresh (both endpoints are unauthenticated — no pairing needed):
+
+```bash
+curl -o SKILL.md      http://<host>:8200/skill
+curl -o ictrl_rpc.py  http://<host>:8200/skill/examples/python
+```
+
+Then re-read SKILL.md. Refresh **both** together — a stale client is the more dangerous half, since it hand-rolls the envelope crypto and mis-decrypts silently if the protocol moved.
+
+If the device's version is *older* than this file, the device is behind. Don't downgrade this skill; stick to what its `capabilities` array advertises and mention the old build to the user.
+
+For individual features, prefer feature-detecting against `capabilities` over comparing versions — versions tell you *whether refreshing is worth it*, capabilities tell you *what you can call right now*.
 It is **Python stdlib only** (X25519 LAN pairing additionally wants `pip install cryptography`; `--plain` over USB/localhost needs nothing), caches keys per device, and is served straight off the runner so it always matches the running build. The same file is in the repo at `Scripts/ictrl_rpc.py`.
 
 Read the rest of this section only if you're implementing the protocol yourself.
