@@ -609,7 +609,7 @@ class ActionHandler {
                 + "MINOR difference (1.5.x vs 1.6.x) — new methods or fields exist; refresh if something you need seems missing. "
                 + "MAJOR difference, or protocol_version != the value your client implements — refresh before continuing, "
                 + "since the wire format itself may have moved. To refresh (unauthenticated, no pairing needed): "
-                + "curl -o SKILL.md http://<host>:8200/skill && curl -o ictrl_rpc.py http://<host>:8200/skill/examples/python, "
+                + "curl -o SKILL.md http://<host>:8200/skill && curl -o ictrl_rpc.py http://<host>:8200/skill/clients/python, "
                 + "then re-read SKILL.md. Refresh both together — a stale client hand-rolls the envelope crypto. "
                 + "Prefer feature-detecting against `capabilities` over version comparison for individual features."
             ),

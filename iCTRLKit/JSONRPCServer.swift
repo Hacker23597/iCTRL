@@ -253,18 +253,23 @@ class JSONRPCServer {
         // caller that doesn't yet speak the v1 envelope can fetch one and start
         // immediately. Unauthenticated on purpose — it serves example code only,
         // never session data, and the protocol it implements is public anyway.
-        case ("GET", "/skill/examples/python"), ("GET", "/skill/examples/ictrl_rpc.py"),
+        // /skill/examples/* are kept as aliases: an installed copy of the manual
+        // may still name them, and a 404 there would look like a broken build.
+        case ("GET", "/skill/clients/python"), ("GET", "/skill/clients/ictrl_rpc.py"),
+             ("GET", "/skill/examples/python"), ("GET", "/skill/examples/ictrl_rpc.py"),
              ("GET", "/client.py"):
             handleClientSource(connection: connection)
 
         // The compiled client, for sandboxes with no Python. Static
         // aarch64-musl, so it runs in the Minis Alpine guest with no install
         // step — which matters there because that rootfs ships no interpreter.
-        case ("GET", "/skill/examples/cli"), ("GET", "/skill/examples/ictrl"),
+        case ("GET", "/skill/clients/cli"), ("GET", "/skill/clients/ictrl"),
+             ("GET", "/skill/examples/cli"), ("GET", "/skill/examples/ictrl"),
              ("GET", "/ictrl"):
             handleClientBinary(connection: connection)
 
-        case ("GET", "/skill/examples/cli.sh"), ("GET", "/skill/examples/ictrl.sh"):
+        case ("GET", "/skill/clients/cli.sh"), ("GET", "/skill/clients/ictrl.sh"),
+             ("GET", "/skill/examples/cli.sh"), ("GET", "/skill/examples/ictrl.sh"):
             handleClientWrapper(connection: connection)
 
         case ("GET", "/docs"):
@@ -354,7 +359,7 @@ class JSONRPCServer {
     /// so an agent can read it once and treat iCTRL as a Skill. Served from the
     /// bundled SKILL.md resource; falls back to a pointer if the resource is
     /// missing. The dynamic method list stays at /schema.
-    /// GET /skill/examples/python — the reference client's source.
+    /// GET /skill/clients/python — the reference client's source.
     ///
     /// Serving it from the device guarantees the client always matches the
     /// running build's protocol. Plain text so `curl … > ictrl_rpc.py` just works.
@@ -376,7 +381,7 @@ class JSONRPCServer {
                          contentType: "text/markdown; charset=utf-8", body: md)
     }
 
-    /// GET /skill/examples/cli — the static CLI binary.
+    /// GET /skill/clients/cli — the static CLI binary.
     ///
     /// Served as an octet-stream off the device so a caller can fetch a working
     /// client without a toolchain or a package manager. Same rationale as the
@@ -385,7 +390,7 @@ class JSONRPCServer {
         guard let data = Self.bundledResourceData(named: "ictrl", ext: nil) else {
             sendHTTPResponse(connection: connection, status: 404,
                              body: "CLI binary not bundled in this build. "
-                                 + "Use GET /skill/examples/python, or build it from cli/ in the repo.")
+                                 + "Use GET /skill/clients/python, or build it from cli/ in the repo.")
             return
         }
         sendHTTPData(connection: connection, status: 200,
@@ -393,7 +398,7 @@ class JSONRPCServer {
                      contentType: "application/octet-stream", body: data)
     }
 
-    /// GET /skill/examples/cli.sh — the wrapper that chmods the binary.
+    /// GET /skill/clients/cli.sh — the wrapper that chmods the binary.
     ///
     /// Needed because a skill installer may write files without the exec bit;
     /// the wrapper runs via `sh`, which does not need one, and fixes the mode.

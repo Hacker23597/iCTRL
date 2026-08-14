@@ -318,7 +318,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.7.0"
+    static let serverVersion = "1.7.1"
 
     /// Server capability/protocol version. v1 = encrypted-envelope auth over /pair +
     /// /rpc. Bump when the wire capabilities change so clients can auto-detect.
@@ -346,7 +346,7 @@ struct RPCMethodRegistry {
         "reset",               // reset RPC (recover from a dropped accessibility connection)
         "nonui_lane",          // config/reset/logs answer while UI calls are blocked
         "system_metrics",      // device_info.system — thermal/cpu/memory/disk/battery
-        "cli_binary",          // GET /skill/examples/cli — static aarch64-musl client
+        "cli_binary",          // GET /skill/clients/cli — static aarch64-musl client
     ]
 
     static func generateSchemaDocument() -> [String: Any] {
@@ -367,7 +367,7 @@ struct RPCMethodRegistry {
                 "logs": "GET /logs?ticket=<t>   plain-text recent logs (current process, in-memory). Browser-issued GET, so it uses the same single-use ticket as /stream. Sensitive values are redacted",
                 "logs_files": "GET /logs/files?ticket=<t>   list persisted daily log files (survive crashes/restarts)",
                 "logs_history": "GET /logs/history?date=YYYY-MM-DD&ticket=<t>   dump a persisted day's log (redacted). Use this to recover logs from BEFORE a crash — /logs only holds the current process's memory",
-                "client": "GET /skill/examples/python  → a ready-to-run reference client (stdlib only; X25519 LAN pairing additionally wants `pip install cryptography`). Downloads straight off the device so it always matches this build: `curl -O http://<host>:8200/skill/examples/python`, then `python3 ictrl_rpc.py --host <host>:8200 pair` and `… call device_info`. Use this instead of hand-writing the crypto.",
+                "client": "GET /skill/clients/python  → a ready-to-run reference client (stdlib only; X25519 LAN pairing additionally wants `pip install cryptography`). Downloads straight off the device so it always matches this build: `curl -O http://<host>:8200/skill/clients/python`, then `python3 ictrl_rpc.py --host <host>:8200 pair` and `… call device_info`. Use this instead of hand-writing the crypto.",
                 "schema": "GET /schema  this document",
             ],
             "guidance": [

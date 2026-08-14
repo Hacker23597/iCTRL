@@ -19,8 +19,8 @@ Every `/rpc` body is an **encrypted envelope (protocol v1)**. There is no plaint
 ```bash
 # From inside Minis, the device is simply localhost — the guest shares the
 # phone's network stack, so no forwarding or host address is needed.
-wget -qO ictrl     http://127.0.0.1:8200/skill/examples/cli
-wget -qO ictrl.sh  http://127.0.0.1:8200/skill/examples/cli.sh
+wget -qO ictrl     http://127.0.0.1:8200/skill/clients/cli
+wget -qO ictrl.sh  http://127.0.0.1:8200/skill/clients/cli.sh
 sh ictrl.sh pair                          # tap Allow on the device
 sh ictrl.sh call device_info
 sh ictrl.sh call tap '{"x":100,"y":200}'
@@ -33,7 +33,7 @@ The key is cached in `~/.ictrl/token.json`, the same file and format the Python 
 
 **Everywhere else (a Mac, a Linux host with Python):**
 ```bash
-curl -o ictrl_rpc.py http://<host>:8200/skill/examples/python   # unauthenticated
+curl -o ictrl_rpc.py http://<host>:8200/skill/clients/python   # unauthenticated
 python3 ictrl_rpc.py --host <host>:8200 pair                    # tap Allow on the device
 python3 ictrl_rpc.py --host <host>:8200 call device_info
 python3 ictrl_rpc.py --host <host>:8200 call tap '{"x":100,"y":200}'
@@ -58,9 +58,9 @@ To refresh (both endpoints are unauthenticated — no pairing needed):
 
 ```bash
 curl -o SKILL.md      http://<host>:8200/skill
-curl -o ictrl_rpc.py  http://<host>:8200/skill/examples/python
+curl -o ictrl_rpc.py  http://<host>:8200/skill/clients/python
 # …or, in Minis / an Alpine sandbox, the compiled client instead of the Python one:
-wget -qO ictrl        http://127.0.0.1:8200/skill/examples/cli
+wget -qO ictrl        http://127.0.0.1:8200/skill/clients/cli
 ```
 
 Then re-read SKILL.md. Refresh **both** together — a stale client is the more dangerous half, since it hand-rolls the envelope crypto and mis-decrypts silently if the protocol moved.
@@ -72,7 +72,7 @@ It is **Python stdlib only** (X25519 LAN pairing additionally wants `pip install
 
 Read the rest of this section only if you're implementing the protocol yourself.
 
-1. **Probe readiness** (short timeout): `GET http://<host>:8200/schema` → HTTP 200 means the service is up. If it's not reachable, the runner isn't running — it must be launched on the device (tapping the iCTRL app, or an `ictrl://` URL scheme if you have one). Unauthenticated routes are only `/schema`, `/skill`, `/skill/examples/python` and `/skill/examples/cli[.sh]` (capability discovery, this manual, and the two client implementations — never session data).
+1. **Probe readiness** (short timeout): `GET http://<host>:8200/schema` → HTTP 200 means the service is up. If it's not reachable, the runner isn't running — it must be launched on the device (tapping the iCTRL app, or an `ictrl://` URL scheme if you have one). Unauthenticated routes are only `/schema`, `/skill`, `/skill/clients/python` and `/skill/clients/cli[.sh]` (capability discovery, this manual, and the two client implementations — never session data).
 2. **Pair once** to get the 32-byte key `K`: `POST /pair` with `{"client_name":"<you>","plain":true}` (accepted **only from 127.0.0.1** — USB via `iproxy 8200 8200`), or over the LAN `{"client_name":"<you>","pub":"<base64 raw 32B X25519 pubkey>"}` and unwrap:
    ```
    shared  = X25519(client_priv, device_pub)
