@@ -6,8 +6,15 @@ struct iCTRLApp: App {
 
     var body: some Scene {
         WindowGroup {
-            MainView()
-                .environmentObject(appState)
+            NavigationStack {
+                SettingsView()
+                    .environmentObject(appState)
+            }
+            .environmentObject(appState)
+            .sheet(item: $appState.pendingAuthRequest) { request in
+                AuthRequestView(request: request)
+                    .environmentObject(appState)
+            }
         }
     }
 }

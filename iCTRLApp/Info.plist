@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- iOS denies UIApplication.open() for custom schemes that aren't declared
+	     here, silently and with no error, so the Start button and the StikDebug
+	     shortcut both depend on this list. -->
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>ictrl</string>
+		<string>stikdebug</string>
+		<string>stikjit</string>
+	</array>
+</dict>
+</plist>
