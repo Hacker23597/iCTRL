@@ -12,13 +12,34 @@ iCTRL runs on an iPhone and exposes iOS UI automation as a **JSON-RPC 2.0 API ov
 
 Every `/rpc` body is an **encrypted envelope (protocol v1)**. There is no plaintext or Bearer path — an unsealed POST gets `401 auth_required`. All request-path crypto is HMAC-SHA256 only, so this is a few lines in any language.
 
-**Don't hand-write the crypto — download a working client from the device itself:**
+**Don't hand-write the crypto — download a working client from the device itself.**
+
+**Running inside Minis (or any Alpine/musl sandbox)? Use the compiled CLI.** That rootfs has no `python3`, so the Python client costs an `apk add` (network round-trip, ~50MB) before the first call, then pays interpreter startup on every invocation through an emulated syscall layer. The CLI is a single static aarch64-musl binary with no runtime dependencies — measured ~9x faster per invocation (5.4ms vs 47ms just to start).
+
+```bash
+# From inside Minis, the device is simply localhost — the guest shares the
+# phone's network stack, so no forwarding or host address is needed.
+wget -qO ictrl     http://127.0.0.1:8200/skill/examples/cli
+wget -qO ictrl.sh  http://127.0.0.1:8200/skill/examples/cli.sh
+sh ictrl.sh pair                          # tap Allow on the device
+sh ictrl.sh call device_info
+sh ictrl.sh call tap '{"x":100,"y":200}'
+sh ictrl.sh shot screen.jpg               # screenshot straight to a file
+```
+
+Invoke it through `sh ictrl.sh`, not `./ictrl`. Skill files are installed **without the exec bit** (the importer writes 0644 and never chmods), so calling the binary directly fails with `EACCES` on a fresh install. The wrapper runs via `sh` — which needs no exec bit — and fixes the mode on first use. After that `./ictrl` works too.
+
+The key is cached in `~/.ictrl/token.json`, the same file and format the Python client uses, so the two are interchangeable.
+
+**Everywhere else (a Mac, a Linux host with Python):**
 ```bash
 curl -o ictrl_rpc.py http://<host>:8200/skill/examples/python   # unauthenticated
 python3 ictrl_rpc.py --host <host>:8200 pair                    # tap Allow on the device
 python3 ictrl_rpc.py --host <host>:8200 call device_info
 python3 ictrl_rpc.py --host <host>:8200 call tap '{"x":100,"y":200}'
 ```
+
+Both speak the identical protocol against the same token store — pick by what the environment already has, not by preference. The CLI defaults to `127.0.0.1:8200`; pass `--host` or set `ICTRL_HOST` to target another device.
 
 ## Version check — glance at this on your first `device_info`
 
@@ -38,6 +59,8 @@ To refresh (both endpoints are unauthenticated — no pairing needed):
 ```bash
 curl -o SKILL.md      http://<host>:8200/skill
 curl -o ictrl_rpc.py  http://<host>:8200/skill/examples/python
+# …or, in Minis / an Alpine sandbox, the compiled client instead of the Python one:
+wget -qO ictrl        http://127.0.0.1:8200/skill/examples/cli
 ```
 
 Then re-read SKILL.md. Refresh **both** together — a stale client is the more dangerous half, since it hand-rolls the envelope crypto and mis-decrypts silently if the protocol moved.
@@ -49,7 +72,7 @@ It is **Python stdlib only** (X25519 LAN pairing additionally wants `pip install
 
 Read the rest of this section only if you're implementing the protocol yourself.
 
-1. **Probe readiness** (short timeout): `GET http://<host>:8200/schema` → HTTP 200 means the service is up. If it's not reachable, the runner isn't running — it must be launched on the device (tapping the iCTRL app, or an `ictrl://` URL scheme if you have one). Unauthenticated routes are only `/schema`, `/skill`, and `/skill/examples/python` (capability discovery, this manual, and the reference client — never session data).
+1. **Probe readiness** (short timeout): `GET http://<host>:8200/schema` → HTTP 200 means the service is up. If it's not reachable, the runner isn't running — it must be launched on the device (tapping the iCTRL app, or an `ictrl://` URL scheme if you have one). Unauthenticated routes are only `/schema`, `/skill`, `/skill/examples/python` and `/skill/examples/cli[.sh]` (capability discovery, this manual, and the two client implementations — never session data).
 2. **Pair once** to get the 32-byte key `K`: `POST /pair` with `{"client_name":"<you>","plain":true}` (accepted **only from 127.0.0.1** — USB via `iproxy 8200 8200`), or over the LAN `{"client_name":"<you>","pub":"<base64 raw 32B X25519 pubkey>"}` and unwrap:
    ```
    shared  = X25519(client_priv, device_pub)

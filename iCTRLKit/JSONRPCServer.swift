@@ -257,6 +257,16 @@ class JSONRPCServer {
              ("GET", "/client.py"):
             handleClientSource(connection: connection)
 
+        // The compiled client, for sandboxes with no Python. Static
+        // aarch64-musl, so it runs in the Minis Alpine guest with no install
+        // step — which matters there because that rootfs ships no interpreter.
+        case ("GET", "/skill/examples/cli"), ("GET", "/skill/examples/ictrl"),
+             ("GET", "/ictrl"):
+            handleClientBinary(connection: connection)
+
+        case ("GET", "/skill/examples/cli.sh"), ("GET", "/skill/examples/ictrl.sh"):
+            handleClientWrapper(connection: connection)
+
         case ("GET", "/docs"):
             handleDocsPage(connection: connection)
 
@@ -364,6 +374,49 @@ class JSONRPCServer {
             ?? "# iCTRL\n\nOperating manual resource missing. Fetch GET /schema for the machine-readable method list and guidance.\n"
         sendHTTPResponse(connection: connection, status: 200,
                          contentType: "text/markdown; charset=utf-8", body: md)
+    }
+
+    /// GET /skill/examples/cli — the static CLI binary.
+    ///
+    /// Served as an octet-stream off the device so a caller can fetch a working
+    /// client without a toolchain or a package manager. Same rationale as the
+    /// Python endpoint: the binary always matches this build's protocol.
+    private func handleClientBinary(connection: NWConnection) {
+        guard let data = Self.bundledResourceData(named: "ictrl", ext: nil) else {
+            sendHTTPResponse(connection: connection, status: 404,
+                             body: "CLI binary not bundled in this build. "
+                                 + "Use GET /skill/examples/python, or build it from cli/ in the repo.")
+            return
+        }
+        sendHTTPData(connection: connection, status: 200,
+                     headers: ["Content-Disposition": "attachment; filename=\"ictrl\""],
+                     contentType: "application/octet-stream", body: data)
+    }
+
+    /// GET /skill/examples/cli.sh — the wrapper that chmods the binary.
+    ///
+    /// Needed because a skill installer may write files without the exec bit;
+    /// the wrapper runs via `sh`, which does not need one, and fixes the mode.
+    private func handleClientWrapper(connection: NWConnection) {
+        guard let src = Self.bundledResource(named: "ictrl", ext: "sh") else {
+            sendHTTPResponse(connection: connection, status: 404,
+                             body: "CLI wrapper not bundled in this build.")
+            return
+        }
+        sendHTTPResponse(connection: connection, status: 200,
+                         contentType: "text/plain; charset=utf-8", body: src)
+    }
+
+    /// Raw bytes of a bundled resource (the String variant would corrupt a binary).
+    static func bundledResourceData(named name: String, ext: String?) -> Data? {
+        let candidates = [Bundle(for: JSONRPCServer.self), Bundle.main] + Bundle.allBundles
+        for b in candidates {
+            if let url = b.url(forResource: name, withExtension: ext),
+               let d = try? Data(contentsOf: url) {
+                return d
+            }
+        }
+        return nil
     }
 
     /// Load SKILL.md from whichever bundle carries it. The resource ships inside
@@ -785,6 +838,27 @@ class JSONRPCServer {
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, Authorization",
         ]
+    }
+
+    /// Send a response whose body is raw bytes.
+    ///
+    /// The String-based sender round-trips through UTF-8, which silently
+    /// mangles a binary — a downloaded executable would arrive corrupt.
+    private func sendHTTPData(connection: NWConnection, status: Int,
+                              headers: [String: String] = [:],
+                              contentType: String, body: Data) {
+        var allHeaders = corsHeaders()
+        allHeaders["Content-Type"] = contentType
+        allHeaders["Content-Length"] = "\(body.count)"
+        allHeaders["Connection"] = "close"
+        for (k, v) in headers { allHeaders[k] = v }
+
+        let headerString = allHeaders.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n")
+        var responseData = "HTTP/1.1 \(status) OK\r\n\(headerString)\r\n\r\n".data(using: .utf8) ?? Data()
+        responseData.append(body)
+        connection.send(content: responseData, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
     }
 
     private func sendHTTPResponse(connection: NWConnection, status: Int, headers: [String: String] = [:], contentType: String = "text/plain", body: String) {

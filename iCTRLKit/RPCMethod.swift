@@ -318,7 +318,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.6.5"
+    static let serverVersion = "1.7.0"
 
     /// Server capability/protocol version. v1 = encrypted-envelope auth over /pair +
     /// /rpc. Bump when the wire capabilities change so clients can auto-detect.
@@ -346,6 +346,7 @@ struct RPCMethodRegistry {
         "reset",               // reset RPC (recover from a dropped accessibility connection)
         "nonui_lane",          // config/reset/logs answer while UI calls are blocked
         "system_metrics",      // device_info.system — thermal/cpu/memory/disk/battery
+        "cli_binary",          // GET /skill/examples/cli — static aarch64-musl client
     ]
 
     static func generateSchemaDocument() -> [String: Any] {

@@ -51,6 +51,13 @@ targets:
       # device instead of writing the crypto itself.
       - path: Scripts/ictrl_rpc.py
         buildPhase: resources
+      # Static aarch64-musl CLI, served at GET /skill/examples/cli. Built for
+      # the Minis sandbox (Alpine arm64), whose minirootfs has no python3 — the
+      # reference client there would cost an `apk add` before the first call.
+      - path: cli/ictrl
+        buildPhase: resources
+      - path: cli/ictrl.sh
+        buildPhase: resources
     dependencies:
       - target: iCTRL
     settings:
