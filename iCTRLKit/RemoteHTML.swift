@@ -97,6 +97,40 @@ enum RemoteHTML {
     background: rgba(0,0,0,.5); border: 1px solid var(--border);
     padding: 2px 8px; border-radius: 999px;
   }
+  /* ── device health overlay ──
+     Bottom-left of the stage, which is letterbox margin for a portrait phone
+     on a landscape stage — so it sits beside the video, not on it. Semi-opaque
+     with a blur in case a wide device does reach the corner. */
+  .sysmon {
+    position: absolute; left: 12px; bottom: 12px; z-index: 5;
+    background: rgba(9,9,11,.72);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 8px;
+    font-size: 11px; line-height: 1.5;
+    color: var(--muted);
+    backdrop-filter: blur(8px);
+    max-width: 190px;
+    pointer-events: auto;   /* the collapse button needs clicks */
+    transition: opacity .15s;
+  }
+  .sysmon.collapsed .sysmon-body { display: none; }
+  .sysmon.collapsed { padding: 2px 6px; }
+  .sysmon-toggle {
+    position: absolute; top: 2px; right: 4px;
+    background: none; border: none; color: var(--muted-2);
+    font-size: 10px; cursor: pointer; padding: 2px 4px; line-height: 1;
+  }
+  .sysmon-toggle:hover { color: var(--fg); }
+  .sysmon-row { display: flex; justify-content: space-between; gap: 10px; }
+  .sysmon-row .k { color: var(--muted-2); }
+  .sysmon-row .v { color: var(--fg); font-variant-numeric: tabular-nums; }
+  .sysmon .warn { color: var(--warn); }
+  .sysmon .bad  { color: var(--danger); }
+  /* No letterbox margin to hide in on a narrow stage — shrink out of the way. */
+  @media (max-width: 900px) {
+    .sysmon { max-width: 140px; font-size: 10px; }
+  }
   .dot { display:inline-block; width:6px; height:6px; border-radius: 999px; margin-right:6px; vertical-align: middle; }
   .dot.on { background: var(--accent); }
   .dot.off { background: var(--muted-2); }
@@ -248,6 +282,13 @@ enum RemoteHTML {
     <div class="hud">
       <span class="badge" id="hudDevice">—</span>
       <span class="badge"><span id="statusDot" class="dot off"></span><span id="hudState">Disconnected</span></span>
+    </div>
+    <!-- Device health. Sits in the letterbox margin beside the video, so it
+         never covers the picture; collapses to a single chip when the stage is
+         too narrow for a margin to exist. -->
+    <div class="sysmon" id="sysmon" hidden>
+      <button class="sysmon-toggle" id="sysmonToggle" title="Hide">▾</button>
+      <div class="sysmon-body" id="sysmonBody"></div>
     </div>
     <!-- overlay catches pointer + keyboard events -->
     <div class="overlay" id="overlay" tabindex="0"></div>
@@ -654,6 +695,86 @@ enum RemoteHTML {
   }
 
   // ── HUD device badge (short label + full details on hover) ──
+  // ── device health overlay ──
+  // Polls device_info on a slow cadence: it is a real RPC on a device we are
+  // also streaming from, so asking often would itself cost frames.
+  const sysmon = $('#sysmon'), sysmonBody = $('#sysmonBody'), sysmonToggle = $('#sysmonToggle');
+  let sysmonTimer = null;
+  const SYSMON_INTERVAL_MS = 5000;
+
+  try {
+    if (localStorage.getItem('ictrl.sysmon.collapsed') === '1') sysmon.classList.add('collapsed');
+  } catch (_) {}
+  sysmonToggle.addEventListener('click', () => {
+    const collapsed = sysmon.classList.toggle('collapsed');
+    sysmonToggle.textContent = collapsed ? '▸' : '▾';
+    sysmonToggle.title = collapsed ? 'Show' : 'Hide';
+    try { localStorage.setItem('ictrl.sysmon.collapsed', collapsed ? '1' : '0'); } catch (_) {}
+  });
+
+  function renderSysmon(sys) {
+    if (!sys) { sysmon.hidden = true; return; }
+    sysmon.hidden = false;
+    const rows = [];
+    const row = (k, v, cls) => rows.push(
+      `<div class="sysmon-row"><span class="k">${k}</span><span class="v ${cls || ''}">${v}</span></div>`);
+
+    // Thermal first: it is the one that explains a stream slowing down.
+    if (sys.thermal_state) {
+      const t = sys.thermal_state;
+      row('Thermal', t, t === 'critical' ? 'bad' : (t === 'serious' || t === 'fair') ? 'warn' : '');
+    }
+    if (sys.process_cpu_percent != null) {
+      const c = sys.process_cpu_percent;
+      row('CPU', c.toFixed(0) + '%', c > 150 ? 'bad' : c > 80 ? 'warn' : '');
+    }
+    if (sys.process_memory_mb != null) {
+      const total = sys.total_memory_mb;
+      row('Memory', sys.process_memory_mb + ' MB' + (total ? ` / ${total}` : ''));
+    }
+    if (sys.system_free_memory_mb != null) row('Free', sys.system_free_memory_mb + ' MB');
+
+    // Disk: show free space in the unit that stays readable, and colour by how
+    // full the volume is — a nearly-full device fails installs and screenshots
+    // in confusing ways, so it is worth seeing before it bites.
+    if (sys.disk_free_mb != null) {
+      const gb = sys.disk_free_mb / 1024;
+      const free = gb >= 1 ? gb.toFixed(1) + ' GB' : sys.disk_free_mb + ' MB';
+      const pct = sys.disk_used_percent;
+      row('Disk', free + ' free', pct != null && pct > 95 ? 'bad' : pct != null && pct > 85 ? 'warn' : '');
+    }
+
+    if (sys.battery_percent != null) {
+      const b = sys.battery_percent;
+      const charging = sys.battery_state === 'charging' || sys.battery_state === 'full';
+      row('Battery', b + '%' + (charging ? ' ⚡' : ''),
+          !charging && b <= 10 ? 'bad' : !charging && b <= 20 ? 'warn' : '');
+    }
+
+    if (sys.low_power_mode) row('Power', 'low-power', 'warn');
+    sysmonBody.innerHTML = rows.join('');
+  }
+
+  async function pollSysmon() {
+    try {
+      const info = await rpc('device_info');
+      renderSysmon(info.system);
+    } catch (_) {
+      // A failed poll is not worth surfacing — the status bar already reports
+      // connection trouble, and the last-known values stay on screen.
+    }
+  }
+
+  function startSysmon() {
+    stopSysmon();
+    pollSysmon();
+    sysmonTimer = setInterval(pollSysmon, SYSMON_INTERVAL_MS);
+  }
+  function stopSysmon() {
+    if (sysmonTimer) { clearInterval(sysmonTimer); sysmonTimer = null; }
+    sysmon.hidden = true;
+  }
+
   function updateHudDevice(info) {
     if (!info) { hudDevice.textContent = '—'; hudDevice.title = ''; return; }
     const name = info.device_name || info.model || 'iPhone';
@@ -861,6 +982,8 @@ enum RemoteHTML {
     try {
       deviceInfo = await rpc('device_info');
       updateHudDevice(deviceInfo);
+      renderSysmon(deviceInfo.system);
+      startSysmon();
       // Auth confirmed by a successful RPC — remember the key for next visit.
       try { localStorage.setItem(STORE_KEY, hexKey.toLowerCase()); } catch (_) {}
     } catch (err) { setStatus('rpc: ' + err.message, 'err'); return; }
@@ -899,6 +1022,7 @@ enum RemoteHTML {
   }
   function stop() {
     if (player) { try { player.stop(); } catch(_){} player = null; }
+    stopSysmon();
     connectBtn.disabled = false; stopBtn.disabled = true;
     setStatus('stopped');
     hudDot.className = 'dot off';
