@@ -47,7 +47,7 @@ Read the rest of this section only if you're implementing the protocol yourself.
    Body: `{"v":1,"tok":"…","ts":…,"nonce":"<32 hex>","ct":"<base64>","tag":"<64 hex>"}`
 4. **Open the reply** — sealed under the **same nonce**: verify `tag == HMAC(K_mac, "resp" || nonce || ct)`, then decrypt with `K_enc_resp`. The plaintext is the normal JSON-RPC response.
 
-**Detect capabilities from `device_info`.** The first `device_info` call returns `server_version` (semver), `protocol_version` (int), and a `capabilities` array (`envelope_v1`, `stream_ticket`, `page_source_filter`, `max_depth`, `find_element_ref`, `scroll_to_element`, `clear_text`, `open_url`, `resolve_app`, `page`, `stop_server`, `logs_history`). Feature-detect against these — no separate `/schema` fetch — and don't assume a method exists on an older `server_version`.
+**Detect capabilities from `device_info`.** The first `device_info` call returns `server_version` (semver), `protocol_version` (int), and a `capabilities` array (`envelope_v1`, `stream_ticket`, `page_source_filter`, `max_depth`, `find_element_ref`, `scroll_to_element`, `clear_text`, `open_url`, `resolve_app`, `page`, `stop_server`, `logs_history`, `screenshot_jpeg`, `reset`, `nonui_lane`). Feature-detect against these — no separate `/schema` fetch — and don't assume a method exists on an older `server_version`.
 
 ### Key cache — one key PER DEVICE
 
@@ -127,7 +127,7 @@ When a call returns success, it worked. Don't repeat it "to be safe."
 - **Off-screen (needs scrolling)** → `scroll_to_element{element_id:"<label>"}` — scrolls and returns the ref in one call. Don't hand-roll swipe loops.
 - **App exposes accessibility ids** (`identifier:` in page_source) → use that id as `element_id` — the most stable key.
 - **On-screen text ≠ accessibility label** (common) → read the exact label from `page_source`, or use `match:"contains"`.
-- **No usable label** (icon / image / webview) → `screenshot`, find it visually, tap by COORDINATE.
+- **No usable label** (icon / image / webview) → `screenshot`, find it visually, tap by COORDINATE. Screenshots are **JPEG by default** (several times smaller than PNG — and since the whole response is decrypted through the envelope, size is what dominates the round trip). Pass `{"format":"png"}` only for lossless needs; `{"quality":0.4}` shrinks it further.
 - **Duplicate labels** → add `element_type` (button/cell/…) to disambiguate.
 
 ## Searching & typing (the #1 place automation breaks)
@@ -182,4 +182,6 @@ When operating real shopping/payment apps, stop at the cart/checkout — do NOT 
 - `GET /logs` — recent in-memory logs (incl. `⏱ ✓ <method> <ms>` timings).
 - `GET /logs/files` — list persisted daily log files (survive crashes/restarts).
 - `GET /logs/history?date=YYYY-MM-DD` — read a persisted day's log (recover logs from before a crash).
-- `config{stop_server:true}` — stop the service (paired keys persist; relaunch the runner to restart).
+- `reset` — recover when UI calls start timing out and the log shows `kAXErrorServerNotFound` (the accessibility connection to the app dropped). Clears cached refs + the sticky app binding, then `launch_app` the target app to force a reconnect. Runs off the UI queue, so it answers even while UI methods are blocked.
+- `config{stop_server:true}` — stop the service (paired keys persist; relaunch the runner to restart). This is the guaranteed fix if `reset` + `launch_app` doesn't bring UI calls back.
+- **`device_info`, `logs` and `config` never block behind UI work** — they run on a separate lane. If they answer but `tap`/`find_element` time out, the UI channel is wedged, not the server. After 2 consecutive UI timeouts the server starts rejecting UI calls immediately (with a recovery hint) rather than queueing them behind a stuck one.

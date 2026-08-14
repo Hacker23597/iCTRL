@@ -8,9 +8,22 @@ Usage:
     ./ictrl_rpc.py --host 10.0.0.5:8200 pair --name my-laptop
     ./ictrl_rpc.py --host 10.0.0.5:8200 call device_info
     ./ictrl_rpc.py --host 10.0.0.5:8200 call tap '{"x":100,"y":200}'
+    ./ictrl_rpc.py --host 10.0.0.5:8200 shot out.jpg          # JPEG by default
 
 The token is cached at ~/.ictrl/token.json keyed by host, so `pair` is a
 one-time step per device.
+
+Two notes for anything that moves a lot of data (server 1.5.0+):
+
+  screenshot defaults to JPEG. The whole response body is decrypted through the
+  envelope keystream, so response size — not device capture time — is what
+  dominates a screenshot. A JPEG is several times smaller than the equivalent
+  PNG; ask for {"format":"png"} only when you need lossless output.
+
+  If UI calls start timing out and the log shows kAXErrorServerNotFound, the
+  accessibility connection has dropped. Call `reset`, then launch_app the target
+  app. device_info / logs / config keep working throughout — they run off the UI
+  queue — so use them to diagnose while UI methods are blocked.
 """
 from __future__ import annotations
 
@@ -39,13 +52,39 @@ def _hmac(key: bytes, data: bytes) -> bytes:
 
 
 def _keystream_xor(key: bytes, nonce: bytes, data: bytes) -> bytes:
-    """PRF-CTR: keystream_i = HMAC(key, nonce || be32(i))."""
+    """PRF-CTR: keystream_i = HMAC(key, nonce || be32(i)).
+
+    Both halves are written for bulk data, because a screenshot response runs
+    entirely through here and a naive version dominates its end-to-end time:
+
+    1. The HMAC inner/outer pads depend only on the key, so they're computed once
+       and `.copy()`-ed per block. `hmac.new()` in the loop would re-absorb the
+       key for every 32-byte block — tens of thousands of times on one image.
+    2. The XOR goes through Python's big integers, whose C implementation beats a
+       per-byte `zip()` comprehension by an order of magnitude.
+
+    Prefer `format="jpeg"` on screenshot (the default since server 1.5.0): a
+    smaller response is the real fix — this loop is merely no longer the
+    bottleneck.
+    """
+    block = key.ljust(64, b"\0") if len(key) <= 64 else hashlib.sha256(key).digest().ljust(64, b"\0")
+    inner = hashlib.sha256(bytes(b ^ 0x36 for b in block))
+    outer = hashlib.sha256(bytes(b ^ 0x5C for b in block))
+
     out = bytearray()
     counter = 0
     while len(out) < len(data):
-        out += _hmac(key, nonce + counter.to_bytes(4, "big"))
+        i = inner.copy()
+        i.update(nonce + counter.to_bytes(4, "big"))
+        o = outer.copy()
+        o.update(i.digest())
+        out += o.digest()
         counter += 1
-    return bytes(a ^ b for a, b in zip(data, out))
+
+    n = len(data)
+    if n == 0:
+        return b""
+    return (int.from_bytes(data, "big") ^ int.from_bytes(bytes(out[:n]), "big")).to_bytes(n, "big")
 
 
 def _post(url: str, obj: dict, timeout: float) -> tuple[int, dict]:
@@ -209,6 +248,13 @@ def main() -> int:
 
     sub.add_parser("list", help="list paired devices")
 
+    s = sub.add_parser("shot", help="save a screenshot to a file")
+    s.add_argument("path", nargs="?", default="screenshot.jpg")
+    s.add_argument("--format", default="jpeg", choices=["jpeg", "png"])
+    s.add_argument("--quality", type=float, default=0.6,
+                   help="JPEG quality 0.1-1.0 (default 0.6); ignored for PNG")
+    s.add_argument("--scale", type=float, default=2.0)
+
     args = ap.parse_args()
     if args.cmd == "list":
         hosts = list_hosts()
@@ -230,6 +276,21 @@ def main() -> int:
             pass   # pairing succeeded; naming is best-effort
         label = rec.get("device_name", "")
         print(f"paired — tok={rec['tok']} {label} (key cached in {STORE})")
+    elif args.cmd == "shot":
+        params = {"format": args.format, "scale": args.scale}
+        if args.format == "jpeg":
+            params["quality"] = args.quality
+        t0 = time.time()
+        result = call(args.host, "screenshot", params).get("result", {})
+        if "data" not in result:
+            print(f"screenshot failed: {json.dumps(result, ensure_ascii=False)}")
+            return 1
+        blob = base64.b64decode(result["data"])
+        with open(args.path, "wb") as fh:
+            fh.write(blob)
+        print(f"{args.path}  {len(blob):,} B  {result.get('format')}  "
+              f"{int(result.get('pixel_width', 0))}x{int(result.get('pixel_height', 0))}px  "
+              f"{(time.time() - t0) * 1000:.0f}ms end-to-end")
     else:
         out = call(args.host, args.method, json.loads(args.params))
         print(json.dumps(out, indent=2, ensure_ascii=False))
