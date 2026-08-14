@@ -90,23 +90,31 @@ enum RemoteHTML {
   }
   .stage .hud {
     position: absolute; top: 10px; left: 12px; right: 12px;
-    display: flex; justify-content: space-between; align-items: center;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
     color: var(--muted); font-size: 12px; pointer-events: none;
+  }
+  /* Device badge and connection state stay on one line, full stage width. */
+  .hud-row {
+    align-self: stretch;
+    display: flex; justify-content: space-between; align-items: center;
   }
   .badge {
     background: rgba(0,0,0,.5); border: 1px solid var(--border);
     padding: 2px 8px; border-radius: 999px;
   }
   /* ── device health overlay ──
-     Bottom-left of the stage, which is letterbox margin for a portrait phone
-     on a landscape stage — so it sits beside the video, not on it. Semi-opaque
-     with a blur in case a wide device does reach the corner. */
+     Sits in the HUD directly under the device badge, so identity and live state
+     read as one top-left cluster. A portrait phone on a landscape stage leaves
+     letterbox margin here, so it lands beside the video rather than on it; the
+     blur covers the case where a wide device does reach across. */
   .sysmon {
-    position: absolute; left: 12px; bottom: 12px; z-index: 5;
+    position: relative; z-index: 5;
     background: rgba(9,9,11,.72);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 6px 8px;
+    /* Right padding leaves a lane for the collapse button, which is positioned
+       in the corner — without it the value column runs underneath. */
+    padding: 6px 22px 6px 8px;
     font-size: 11px; line-height: 1.5;
     color: var(--muted);
     backdrop-filter: blur(8px);
@@ -280,15 +288,18 @@ enum RemoteHTML {
   <section class="panel stage" id="stage">
     <video id="video" autoplay muted playsinline></video>
     <div class="hud">
-      <span class="badge" id="hudDevice">—</span>
-      <span class="badge"><span id="statusDot" class="dot off"></span><span id="hudState">Disconnected</span></span>
-    </div>
-    <!-- Device health. Sits in the letterbox margin beside the video, so it
-         never covers the picture; collapses to a single chip when the stage is
-         too narrow for a margin to exist. -->
-    <div class="sysmon" id="sysmon" hidden>
-      <button class="sysmon-toggle" id="sysmonToggle" title="Hide">▾</button>
-      <div class="sysmon-body" id="sysmonBody"></div>
+      <div class="hud-row">
+        <span class="badge" id="hudDevice">—</span>
+        <span class="badge"><span id="statusDot" class="dot off"></span><span id="hudState">Disconnected</span></span>
+      </div>
+      <!-- Device health, directly under the device badge: same top-left
+           cluster, so identity and live state read as one block. The stage
+           letterboxes the video, so this sits in the margin rather than over
+           the picture. -->
+      <div class="sysmon" id="sysmon" hidden>
+        <button class="sysmon-toggle" id="sysmonToggle" title="Hide">▾</button>
+        <div class="sysmon-body" id="sysmonBody"></div>
+      </div>
     </div>
     <!-- overlay catches pointer + keyboard events -->
     <div class="overlay" id="overlay" tabindex="0"></div>
