@@ -28,6 +28,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// activation was attempted without throwing. Must be safe to call off-main.
 + (BOOL)safeActivateBundleID:(NSString *)bundleId;
 
+/// Bring an app to the front, launching it if it isn't running.
+///
+/// `activate` alone is a no-op on a process that isn't up yet, which is the case
+/// for SpringBoard after a reboot. WebDriverAgent branches the same way for its
+/// home-screen route; this mirrors that.
++ (BOOL)activateOrLaunchBundleID:(NSString *)bundleId;
+
 /// Terminate an app by bundle id, catching any XCTest NSException. Returns YES if
 /// termination was attempted without throwing.
 + (BOOL)safeTerminateBundleID:(NSString *)bundleId;

@@ -178,6 +178,33 @@
     }
 }
 
++ (BOOL)activateOrLaunchBundleID:(NSString *)bundleId {
+    if (bundleId.length == 0) { return NO; }
+    @try {
+        Class appClass = NSClassFromString(@"XCUIApplication");
+        if (!appClass) { return NO; }
+        id (*initFn)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+        id app = initFn([appClass alloc], @selector(initWithBundleIdentifier:), bundleId);
+        if (!app) { return NO; }
+        // `running` distinguishes the two cases; activate does nothing to a
+        // process that hasn't started, and launch on a running app restarts it.
+        BOOL running = NO;
+        if ([app respondsToSelector:@selector(running)]) {
+            BOOL (*runningFn)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
+            running = runningFn(app, @selector(running));
+        }
+        SEL sel = running ? @selector(activate) : @selector(launch);
+        if ([app respondsToSelector:sel]) {
+            [app performSelector:sel];
+            return YES;
+        }
+        return NO;
+    } @catch (NSException *e) {
+        NSLog(@"iCTRL: activateOrLaunch caught exception for %@: %@", bundleId, e.reason);
+        return NO;
+    }
+}
+
 + (BOOL)safeActivateBundleID:(NSString *)bundleId {
     if (bundleId.length == 0) { return NO; }
     @try {

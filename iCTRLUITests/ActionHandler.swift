@@ -597,6 +597,22 @@ class ActionHandler {
             "server_version": .string(RPCMethodRegistry.serverVersion),
             "protocol_version": .int(RPCMethodRegistry.protocolVersion),
             "capabilities": .array(RPCMethodRegistry.capabilityTags.map { .string($0) }),
+            // Lets a caller holding an older copy of the manual notice it. An
+            // installed skill is a snapshot from whenever it was fetched and has
+            // no other way to learn the device moved on underneath it, so the
+            // device mentions its version on the one call every client makes.
+            // Advisory: the caller decides whether the gap actually matters.
+            "skill_version": .string(RPCMethodRegistry.serverVersion),
+            "skill_update_hint": .string(
+                "Advisory, not required. Compare this skill_version with the one in your SKILL.md frontmatter and "
+                + "judge by semver: equal, or a PATCH difference (1.6.1 vs 1.6.2) — carry on, nothing you call has changed. "
+                + "MINOR difference (1.5.x vs 1.6.x) — new methods or fields exist; refresh if something you need seems missing. "
+                + "MAJOR difference, or protocol_version != the value your client implements — refresh before continuing, "
+                + "since the wire format itself may have moved. To refresh (unauthenticated, no pairing needed): "
+                + "curl -o SKILL.md http://<host>:8200/skill && curl -o ictrl_rpc.py http://<host>:8200/skill/examples/python, "
+                + "then re-read SKILL.md. Refresh both together — a stale client hand-rolls the envelope crypto. "
+                + "Prefer feature-detecting against `capabilities` over version comparison for individual features."
+            ),
             // Coordinate space that tap/swipe/drag/long_press use:
             "point_width": .double(frame.width),
             "point_height": .double(frame.height),
@@ -616,6 +632,11 @@ class ActionHandler {
                 "To tap a screenshot location: point = pixel / \(s). " +
                 "Bottom tab bars sit above the home-indicator safe area (~y \(Int(frame.height) - 60)–\(Int(frame.height) - 20))."
             ),
+            // Live device health. This is the call /remote polls for its status
+            // overlay, and the documented home for these metrics — they were
+            // previously attached only to coordinateHint, which rides along with
+            // tap/swipe responses and so never reached a plain device_info.
+            "system": .object(systemMetrics()),
         ]
         return (result, nil)
     }
@@ -1156,8 +1177,84 @@ class ActionHandler {
     // MARK: - Device Buttons
 
     private func pressHome() -> ([String: JSONValue]?, JSONRPCError?) {
-        XCUIDevice.shared.press(.home)
-        return (["message": .string("Pressed home")], nil)
+        // Which app we are leaving. The live detector is first, but it returns
+        // nil on iOS 26 (activeApplications is empty there), so fall back to the
+        // sticky binding — the app we most recently launched is the one still in
+        // front in practice, and it is the only handle we have to verify against.
+        let before = ForegroundApp.currentBundleID() ?? boundBundleId
+        let springboard = "com.apple.springboard"
+
+        // `press(.home)` normally blocks until SpringBoard is frontmost — but that
+        // wait lives in XCTest's quiescence machinery, which this runner no-ops
+        // globally (see QuiescenceDisabler) to stop taps stalling for seconds. So
+        // the press is delivered and we return before the transition happens,
+        // which reads as "Home did nothing". Verify the result ourselves instead
+        // of reporting success blind.
+        _ = ObjCException.catching { XCUIDevice.shared.press(.home) }
+
+        // Verify via the app we are trying to LEAVE, not via "is SpringBoard
+        // frontmost". The private activeApplications detector returns nil on
+        // iOS 26 whatever is in front, so a check built on it passes instantly
+        // and reports success for a press that did nothing. XCUIApplication.state
+        // is public, works, and answers the question that actually matters: did
+        // the app we were in stop being foreground?
+        func leftForeground() -> Bool {
+            guard let bid = before, bid != springboard else {
+                // Nothing was in front (already home), or SpringBoard itself —
+                // there is nothing to leave, so the press has nothing to prove.
+                return true
+            }
+            let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bid)) ?? .unknown
+            return state != .foreground
+        }
+
+        // Poll rather than sleep a fixed interval: the animation is ~300-500ms but
+        // varies with what's on screen, and a fixed wait either lies or wastes time.
+        var landed = false
+        for _ in 0..<20 {
+            if leftForeground() { landed = true; break }
+            usleep(100_000)
+        }
+
+        // Fallback: activate SpringBoard directly. `press(.home)` is a no-op on
+        // iOS 26 here — the button event goes nowhere on a device that has no
+        // physical Home button — whereas activating SpringBoard as an app is a
+        // normal foreground switch and does not depend on button synthesis.
+        if !landed {
+            // This is what WebDriverAgent actually ships for its home-screen
+            // route (fb_switchToSystemApplicationWithError): activate SpringBoard
+            // as an app, launching it if it isn't running. WDA dropped
+            // pressButton: for this years ago precisely because the press was
+            // async and unreliable — which matches what this device does.
+            iCTRLUITests.logBuffer.append("🏠 press(.home) had no effect — activating SpringBoard instead")
+            _ = ObjCException.catching { _ = ForegroundApp.activateOrLaunchBundleID(springboard) }
+            for _ in 0..<20 {
+                if leftForeground() { landed = true; break }
+                usleep(100_000)
+            }
+        }
+
+        // Home changes what's in front, so the sticky binding is now stale —
+        // leaving it set would silently re-activate the old app on the next
+        // element action, undoing the very thing the caller asked for.
+
+        guard landed else {
+            return (nil, .serverError(
+                "Could not leave '\(before ?? "the foreground app")': both the Home button and "
+                + "activating SpringBoard failed to background it. A modal alert or system sheet can hold "
+                + "focus — check page_source for a dialog and dismiss it — or the device may be locked "
+                + "(call is_locked)."
+            ))
+        }
+        // The caller has explicitly left the app, so the sticky binding must go:
+        // leaving it set would silently re-activate that app on the next element
+        // action, undoing the thing that was just asked for.
+        boundBundleId = nil
+        return ([
+            "message": .string("Returned to the home screen"),
+            "foreground_app": .string(springboard),
+            "previous_app": before.map { JSONValue.string($0) } ?? .null,
+        ], nil)
     }
 
     private func lock() -> ([String: JSONValue]?, JSONRPCError?) {
