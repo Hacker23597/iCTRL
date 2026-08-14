@@ -255,6 +255,14 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // watchdog timer that's about to fire sees the flag and stays a no-op.
         EarlyURLHook.markTestStarted()
 
+        // Bound XCTest's application-state wait now that bootstrap is behind us.
+        // Doing this any earlier also bounds -[XCUIDevice enableAutomationMode:],
+        // which waits for the accessibility server to come up; that wait exceeds
+        // the cap on a cold start, and XCTest responds by exiting the process
+        // ("Timed out while enabling automation mode"). Reaching this line proves
+        // automation mode is already enabled, so the cap is safe here.
+        QuiescenceDisabler.applyInteractionStateTimeout()
+
         // Last-resort exit visibility: register atexit + signal handlers so a
         // silent teardown / kill leaves a trace in the persisted log.
         Self.installExitHandlers()

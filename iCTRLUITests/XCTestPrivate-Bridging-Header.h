@@ -6,6 +6,7 @@
 #import <XCTest/XCTest.h>
 #import "LockStateMonitor.h"
 #import "ForegroundApp.h"
+#import "QuiescenceDisabler.h"
 #import "ObjCException.h"
 
 @interface EarlyURLHook : NSObject
