@@ -118,6 +118,27 @@ Most automation is slow because of three anti-patterns. Avoid them:
 - If a `page_source` comes back mid-transition (splash / placeholder / empty), **then** wait ~1s and re-read — reactively, not by default.
 - Blind 2–3s sleeps after every tap are pure wasted latency.
 
+**How long calls actually take.** Measured on a real device (iPhone 17 Pro, iOS 26), median and p90 in ms:
+
+| Call | median | p90 | Notes |
+|---|---|---|---|
+| `device_info` | 20 | 130 | Cheap — safe to poll |
+| `screenshot` | 155 | 215 | JPEG default; PNG is several times slower to transfer |
+| `tap` | 280 | 650 | Includes the UI settling |
+| `swipe` | 420 | 540 | |
+| `home` | 550 | 600 | |
+| `type` | 640 | 670 | Per call, not per character |
+| `page_source` | 460 | 1250 | Grows with page size — use `filter` |
+| `launch_app` | 860 | 930 | Plus 2–3s of rendering before the UI is readable |
+| `find_element` | 950 | 2200 | A **miss** costs the most — see below |
+
+Use these as your expectation, not as timeouts: keep the client timeout generous (30s+), but if you find yourself *sleeping* longer than the numbers above, you are waiting for nothing. A tap that returns in 280ms has already settled — the next call can go out immediately.
+
+**When something takes much longer than this, it is a signal, not a reason to wait harder:**
+- `find_element` running seconds long usually means the label is **wrong**, not that the element is slow to appear. A miss walks the whole tree before giving up. Confirm the exact text with `page_source{filter:{text:"…"}}` instead of retrying variations.
+- Any UI call exceeding ~6s gets a timeout reply while still running on the device. **Don't blindly retry** — check `GET /logs` for `⏱ ✓ <method>` first; a retried tap fires twice.
+- Repeated timeouts mean the UI channel is wedged (see Diagnostics): `device_info` still answering while `tap` times out confirms it. Call `reset`, don't wait it out.
+
 ### 2. Act by `ref`, not by coordinates
 Don't read `page_source`, find an element's frame, and tap its center. Instead:
 - `find_element{element_id:"<label>"}` → returns a stable **`ref`** → `tap{ref}`.
@@ -188,7 +209,7 @@ After `launch_app`/`activate_app`, that app is the **sticky target**.
 
 ## Timeouts & reliability
 
-- Use generous `/rpc` client timeouts (≥ 30s, ideally 60–120s): `/rpc` drives a real device; a cold launch or heavy page takes seconds.
+- Use generous `/rpc` client timeouts (≥ 30s, ideally 60–120s): `/rpc` drives a real device; a cold launch or heavy page takes seconds. A generous timeout is not a reason to *wait* that long — see the timing table above for what each call normally costs. The server itself gives up on a UI call after 6s and replies, so a request pending far beyond that is a transport problem, not a slow device.
 - **A client timeout ≠ failure.** The device keeps executing. Before retrying, `GET /logs` and look for `⏱ ✓ <method>` — if present, it already succeeded and retrying would DOUBLE the action (e.g. a tap fires twice).
 - **Cheap recovery** if the service drops: reuse the cached key (`~/.ictrl/token.json`) and `bundle_id` (don't `resolve_app` again); re-`/pair` only if a call actually returns 401; if you know a deep link back (`open_url`), use it instead of re-navigating from the app's home screen.
 - **Cellular vs Wi-Fi.** On Wi-Fi the device's LAN address is remotely reachable. On **cellular/mobile data** the address is a public/CGNAT one that's **reachable on-device only** — the server still runs and localhost/on-device clients work, but a LAN peer can't connect, and that's expected (the server won't self-check or raise a "Local Network" prompt on cellular). If you're driving iCTRL from another host, use Wi-Fi; from on-device (e.g. the same phone) it works on any network.
