@@ -318,7 +318,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.7.1"
+    static let serverVersion = "1.7.2"
 
     /// Server capability/protocol version. v1 = encrypted-envelope auth over /pair +
     /// /rpc. Bump when the wire capabilities change so clients can auto-detect.
@@ -367,7 +367,7 @@ struct RPCMethodRegistry {
                 "logs": "GET /logs?ticket=<t>   plain-text recent logs (current process, in-memory). Browser-issued GET, so it uses the same single-use ticket as /stream. Sensitive values are redacted",
                 "logs_files": "GET /logs/files?ticket=<t>   list persisted daily log files (survive crashes/restarts)",
                 "logs_history": "GET /logs/history?date=YYYY-MM-DD&ticket=<t>   dump a persisted day's log (redacted). Use this to recover logs from BEFORE a crash — /logs only holds the current process's memory",
-                "client": "GET /skill/clients/python  → a ready-to-run reference client (stdlib only; X25519 LAN pairing additionally wants `pip install cryptography`). Downloads straight off the device so it always matches this build: `curl -O http://<host>:8200/skill/clients/python`, then `python3 ictrl_rpc.py --host <host>:8200 pair` and `… call device_info`. Use this instead of hand-writing the crypto.",
+                "client": "Download a client instead of hand-writing the crypto — both are served off the device, so they always match this build. GET /skill/clients/cli → a static aarch64-musl binary needing no interpreter (use this in Alpine/musl sandboxes such as Minis, where python3 is absent and installing it costs a network round-trip); fetch /skill/clients/cli.sh too and invoke it as `sh ictrl.sh call device_info`, since skill installers write files without an exec bit. GET /skill/clients/python → a stdlib-only reference client (X25519 LAN pairing additionally wants `pip install cryptography`): `curl -O http://<host>:8200/skill/clients/python`, then `python3 ictrl_rpc.py --host <host>:8200 pair`. Both share ~/.ictrl/token.json and are interchangeable.",
                 "schema": "GET /schema  this document",
             ],
             "guidance": [

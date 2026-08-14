@@ -1,12 +1,14 @@
 ---
 name: ictrl-phone-control
-description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200.
-skill_version: "1.6.2"
+description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
+skill_version: "1.7.2"
 ---
 
 # iCTRL — Control an iPhone over HTTP
 
 iCTRL runs on an iPhone and exposes iOS UI automation as a **JSON-RPC 2.0 API over HTTP (port 8200)**. You drive the phone by POSTing RPC calls: tap, type, swipe, read the accessibility view tree, screenshot, launch apps, and more. This document is the operating manual — read it once and you know how to run the phone the fast way.
+
+Every request is encrypted, so the practical first step is to **download a client from the device** (`/skill/clients/…`) rather than assemble HTTP by hand — there is a static CLI that needs no interpreter and a Python one, both always matching the running build. See *Connect & authorize* below.
 
 ## Connect & authorize
 
@@ -43,7 +45,7 @@ Both speak the identical protocol against the same token store — pick by what 
 
 ## Version check — glance at this on your first `device_info`
 
-This document is **skill_version 1.6.2** (see the frontmatter). Every `device_info` response carries the device's own `skill_version` (same value as `server_version`) plus a `skill_update_hint`.
+This document is **skill_version 1.7.2** (see the frontmatter). Every `device_info` response carries the device's own `skill_version` (same value as `server_version`) plus a `skill_update_hint`.
 
 **This is advisory — a version gap is not an error, and most gaps need no action.** Your installed copy is a snapshot from whenever it was fetched; the device's copy always matches the running build. Use semver to decide whether the difference could actually affect you:
 
@@ -68,9 +70,10 @@ Then re-read SKILL.md. Refresh **both** together — a stale client is the more 
 If the device's version is *older* than this file, the device is behind. Don't downgrade this skill; stick to what its `capabilities` array advertises and mention the old build to the user.
 
 For individual features, prefer feature-detecting against `capabilities` over comparing versions — versions tell you *whether refreshing is worth it*, capabilities tell you *what you can call right now*.
-It is **Python stdlib only** (X25519 LAN pairing additionally wants `pip install cryptography`; `--plain` over USB/localhost needs nothing), caches keys per device, and is served straight off the runner so it always matches the running build. The same file is in the repo at `Scripts/ictrl_rpc.py`.
 
-Read the rest of this section only if you're implementing the protocol yourself.
+## Implementing the protocol yourself
+
+Only read this if you can't use one of the bundled clients. The Python one is stdlib-only (X25519 LAN pairing additionally wants `pip install cryptography`; `--plain` over USB/localhost needs nothing) and lives in the repo at `Scripts/ictrl_rpc.py`; the CLI's C source is under `cli/`.
 
 1. **Probe readiness** (short timeout): `GET http://<host>:8200/schema` → HTTP 200 means the service is up. If it's not reachable, the runner isn't running — it must be launched on the device (tapping the iCTRL app, or an `ictrl://` URL scheme if you have one). Unauthenticated routes are only `/schema`, `/skill`, `/skill/clients/python` and `/skill/clients/cli[.sh]` (capability discovery, this manual, and the two client implementations — never session data).
 2. **Pair once** to get the 32-byte key `K`: `POST /pair` with `{"client_name":"<you>","plain":true}` (accepted **only from 127.0.0.1** — USB via `iproxy 8200 8200`), or over the LAN `{"client_name":"<you>","pub":"<base64 raw 32B X25519 pubkey>"}` and unwrap:
