@@ -1,6 +1,10 @@
 #import "ObjCException.h"
 #import <objc/message.h>
 
+// performSelector on a runtime-resolved selector: ARC cannot see the
+// ownership convention, and these all follow the standard one.
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+
 @implementation ObjCException
 
 + (nullable NSString *)catching:(void (^)(void))block {
@@ -19,46 +23,66 @@
                              uti:(NSString *)uti
                          quality:(double)quality
                         diagnosis:(NSString * _Nullable * _Nullable)diagnosis {
+    // Three ways in, cheapest and most reliable first. Hand-rolling
+    // objc_msgSend against a private initializer is the fragile one, so it is
+    // the last resort rather than the first attempt.
+    NSMutableArray<NSString *> *tried = [NSMutableArray array];
+
+    // 1. Dictionary init — plain object types, no calling-convention guesswork.
+    SEL dictSel = NSSelectorFromString(@"initWithDictionary:");
+    if ([encodingClass instancesRespondToSelector:dictSel]) {
+        NSDictionary *spec = @{
+            @"uniformTypeIdentifier": uti,
+            @"compressionQuality": @(quality),
+        };
+        id obj = [[encodingClass alloc] performSelector:dictSel withObject:spec];
+        if (obj) {
+            if (diagnosis) { *diagnosis = @"via initWithDictionary:"; }
+            return obj;
+        }
+        [tried addObject:@"initWithDictionary:->nil"];
+    }
+
+    // 2. The class's own factory. No arguments, so nothing can be mis-marshalled;
+    //    it fixes the quality rather than taking ours, which is fine — the point
+    //    is a compressed capture, not one specific ratio.
+    SEL maxSel = NSSelectorFromString(@"maximumCompression");
+    if ([encodingClass respondsToSelector:maxSel]) {
+        id obj = [encodingClass performSelector:maxSel];
+        if (obj) {
+            if (diagnosis) { *diagnosis = @"via +maximumCompression"; }
+            return obj;
+        }
+        [tried addObject:@"+maximumCompression->nil"];
+    }
+
+    // 3. Designated initializer through objc_msgSend, typed from the runtime's
+    //    own signature (the quality argument is not double on every OS).
     SEL sel = NSSelectorFromString(@"initWithUniformTypeIdentifier:compressionQuality:");
-    if (![encodingClass instancesRespondToSelector:sel]) {
-        if (diagnosis) { *diagnosis = @"selector missing"; }
-        return nil;
+    if ([encodingClass instancesRespondToSelector:sel]) {
+        NSMethodSignature *sig = [encodingClass instanceMethodSignatureForSelector:sel];
+        const char *qType = sig ? [sig getArgumentTypeAtIndex:3] : NULL;
+        void *(*msgAlloc)(Class, SEL) = (void *(*)(Class, SEL))objc_msgSend;
+        void *allocated = msgAlloc(encodingClass, @selector(alloc));
+        void *created = NULL;
+        if (allocated && qType && strcmp(qType, @encode(float)) == 0) {
+            void *(*f)(void *, SEL, void *, float) = (void *(*)(void *, SEL, void *, float))objc_msgSend;
+            created = f(allocated, sel, (__bridge void *)uti, (float)quality);
+        } else if (allocated && qType && strcmp(qType, @encode(double)) == 0) {
+            void *(*f)(void *, SEL, void *, double) = (void *(*)(void *, SEL, void *, double))objc_msgSend;
+            created = f(allocated, sel, (__bridge void *)uti, quality);
+        }
+        if (created) {
+            if (diagnosis) { *diagnosis = @"via initWithUniformTypeIdentifier:"; }
+            return (__bridge_transfer id)created;
+        }
+        [tried addObject:[NSString stringWithFormat:@"init(uti:quality)->nil qType='%s'", qType ?: "?"]];
     }
 
-    // Read the real signature instead of assuming one. The quality argument is
-    // NOT double on every OS — guessing wrong means the value arrives as
-    // garbage and the initializer quietly returns nil, which is exactly how
-    // this failed before. objc_msgSend is called through a cast matching what
-    // the runtime reports, and stays outside ARC so the +1 from alloc/init can
-    // be handed back with a single __bridge_transfer.
-    NSMethodSignature *sig = [encodingClass instanceMethodSignatureForSelector:sel];
-    if (!sig) { return nil; }
-    const char *qType = [sig getArgumentTypeAtIndex:3];
-
-    void *(*msgAlloc)(Class, SEL) = (void *(*)(Class, SEL))objc_msgSend;
-    void *allocated = msgAlloc(encodingClass, @selector(alloc));
-    if (!allocated) { return nil; }
-
-    if (diagnosis) {
-        *diagnosis = [NSString stringWithFormat:@"sig='%s' argc=%lu qType='%s'",
-                      sig.methodReturnType ?: "?", (unsigned long)sig.numberOfArguments,
-                      qType ?: "(null)"];
-    }
-    void *created = NULL;
-    if (qType && strcmp(qType, @encode(float)) == 0) {
-        void *(*msgInitF)(void *, SEL, void *, float) =
-            (void *(*)(void *, SEL, void *, float))objc_msgSend;
-        created = msgInitF(allocated, sel, (__bridge void *)uti, (float)quality);
-    } else if (qType && strcmp(qType, @encode(double)) == 0) {
-        void *(*msgInitD)(void *, SEL, void *, double) =
-            (void *(*)(void *, SEL, void *, double))objc_msgSend;
-        created = msgInitD(allocated, sel, (__bridge void *)uti, quality);
-    } else {
-        return nil;
-    }
-    if (!created) { return nil; }
-    return (__bridge_transfer id)created;
+    if (diagnosis) { *diagnosis = [tried componentsJoinedByString:@", "] ?: @"no path available"; }
+    return nil;
 }
+
 
 
 
