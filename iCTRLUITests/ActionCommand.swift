@@ -33,6 +33,9 @@ struct ActionCommand {
     var filterLabel: String?
     var filterText: String?
     var includeOverlays: Bool?
+    // screenshot encoding
+    var format: String?
+    var quality: Double?
 
     init(method: String, params: [String: JSONValue]?) {
         self.name = method
@@ -58,6 +61,8 @@ struct ActionCommand {
         self.toRef = params?["to_ref"]?.stringValue
         self.submit = params?["submit"]?.boolValue
         self.clear = params?["clear"]?.boolValue
+        self.format = params?["format"]?.stringValue
+        self.quality = params?["quality"]?.doubleValue
         self.country = params?["country"]?.stringValue
         self.url = params?["url"]?.stringValue
 

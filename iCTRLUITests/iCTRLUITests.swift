@@ -662,12 +662,29 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         "scroll_to_element", "scroll_to", "find_element", "tap_element", "find_and_tap",
         "launch_app", "activate_app", "terminate_app",
         "home", "lock", "unlock",
-        // device_info touches XCUIApplication.frame on the first call (to
-        // cache the point-space size). Every XCTest UI API asserts on
-        // XCTContext.currentContext, which is only valid on the test's main
-        // thread — so it must hop like the interaction methods above. Later
-        // calls are cached and cheap, so the hop cost is one-shot.
+        // device_info reads app.frame to report the coordinate space. That is an
+        // XCUITest call, so it must hop to the main thread — and it cannot use
+        // UIScreen instead: the runner runs in iOS compatibility mode and would
+        // report 320x480 for every device (see compatibilityModeScreenBounds).
+        // Correct geometry outranks staying off the UI queue; every tap the
+        // client sends is computed from these numbers. Cached after the first
+        // call, so the cost is one-shot.
         "device_info",
+    ]
+
+    /// Methods that bypass the UI queue entirely and run on their own concurrent
+    /// queue.
+    ///
+    /// An XCUITest call can wedge for ~16s and cannot be cancelled, and the UI
+    /// queue is serial — so anything sharing that queue is stuck behind it. That
+    /// used to include the very calls you need when things go wrong: `device_info`
+    /// to check liveness, `logs` to see why, `config{stop_server}` to recover.
+    /// Diagnosis and recovery must not queue behind the fault they diagnose, so
+    /// they get their own lane. Every method here must be free of XCUITest APIs.
+    private static let nonUIMethods: Set<String> = [
+        "config", "reset", "is_locked",
+        "resolve_app", "search_app", "search_apps",
+        "list_apps", "installed_apps",
     ]
 
     /// Compact one-line summary of the most useful params for the request log.
@@ -696,6 +713,61 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// XCUITest call can't freeze the network listener (which would drop the whole
     /// service). Serial so actions still run one-at-a-time in order.
     private let rpcQueue = DispatchQueue(label: "com.openminis.ictrl.rpc")
+
+    /// Consecutive UI-method timeouts. Reset by any UI method that completes.
+    private var uiTimeoutStreak = 0
+    /// Set when the breaker trips, so the message can name how long it's been.
+    private var uiBreakerTrippedAt: Date?
+    private let uiHealthLock = NSLock()
+
+    /// Consecutive timeouts before the UI channel is treated as unhealthy. Two
+    /// keeps a single slow-but-recoverable action (a heavy page snapshot) from
+    /// tripping it, while still reacting on the second confirmation.
+    private static let uiBreakerThreshold = 2
+
+    /// Non-nil when the UI channel is unhealthy — the value is the client message.
+    private func uiBreakerMessage() -> String? {
+        uiHealthLock.lock()
+        defer { uiHealthLock.unlock() }
+        guard uiTimeoutStreak >= Self.uiBreakerThreshold, let since = uiBreakerTrippedAt else { return nil }
+        let secs = Int(Date().timeIntervalSince(since))
+        return "UI automation is unresponsive: \(uiTimeoutStreak) consecutive calls timed out "
+             + "(first \(secs)s ago), so this request was rejected instead of queued behind them. "
+             + "The accessibility connection to the foreground app has most likely dropped. "
+             + "Call reset to rebuild it, or launch_app to bring the target app back to the front. "
+             + "device_info, logs and config still work."
+    }
+
+    /// Record a UI method timing out. Trips the breaker at the threshold.
+    private func noteUITimeout(method: String) {
+        uiHealthLock.lock()
+        uiTimeoutStreak += 1
+        let streak = uiTimeoutStreak
+        if streak == Self.uiBreakerThreshold { uiBreakerTrippedAt = Date() }
+        uiHealthLock.unlock()
+        if streak == Self.uiBreakerThreshold {
+            Self.logBuffer.append("⛔️ UI channel marked unhealthy after \(streak) consecutive timeouts "
+                                + "(latest: \(method)) — UI methods now fail fast; call reset to recover")
+        }
+    }
+
+    /// A UI method finished, so the channel is alive again.
+    private func noteUISuccess() {
+        uiHealthLock.lock()
+        let wasTripped = uiTimeoutStreak >= Self.uiBreakerThreshold
+        uiTimeoutStreak = 0
+        uiBreakerTrippedAt = nil
+        uiHealthLock.unlock()
+        if wasTripped { Self.logBuffer.append("✅ UI channel recovered — resuming normal dispatch") }
+    }
+
+    /// Queue for methods that never touch XCUITest (see `nonUIMethods`).
+    ///
+    /// Concurrent, and deliberately separate from `rpcQueue`: its whole purpose is
+    /// to keep answering while the serial UI queue is blocked by an uncancellable
+    /// XCUITest call. Sharing a queue with the UI work would defeat that.
+    private let nonUIQueue = DispatchQueue(label: "com.openminis.ictrl.rpc.nonui",
+                                           attributes: .concurrent)
 
     /// Hard ceiling for a single RPC before we report failure to the client. With
     /// quiescence disabled + fast defaults, real actions finish well under 1s, so
@@ -728,7 +800,28 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 if first { completion(result.0, result.1) }
             }
 
-            self.rpcQueue.async {
+            // Non-UI methods take their own lane so diagnosis and recovery stay
+            // available while the serial UI queue is wedged.
+            let isUIMethod = !Self.nonUIMethods.contains(method)
+            let queue = isUIMethod ? self.rpcQueue : self.nonUIQueue
+
+            // Circuit breaker: once the UI channel has hung repeatedly, stop
+            // adding to the backlog. Each queued call would wait out the stuck
+            // one and then likely hang itself, so the queue grows without ever
+            // draining. Failing immediately with a recovery hint is strictly
+            // better than a client blocking for minutes.
+            if isUIMethod, let tripped = self.uiBreakerMessage() {
+                Self.logBuffer.append("⛔️ \(method) rejected — UI channel unhealthy")
+                completion(nil, .serverError(tripped))
+                return
+            }
+
+            // reset is the documented way out of a tripped breaker, so give the
+            // UI channel a clean slate — otherwise the next UI call is rejected
+            // by the very state reset was called to clear.
+            if method == "reset" { self.noteUISuccess() }
+
+            queue.async {
                 let start = ProcessInfo.processInfo.systemUptime
                 var result: ([String: JSONValue]?, JSONRPCError?) = (nil, .internalError)
 
@@ -772,6 +865,9 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
                 let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000
                 Self.logBuffer.recordTiming(method: method, ms: ms, ok: result.1 == nil)
+                // Completing at all proves the UI channel is alive, even if the
+                // action itself failed (element not found is a healthy answer).
+                if isUIMethod { self.noteUISuccess() }
                 if let err = result.1 { Self.logBuffer.append("← ERR \(method): \(err.message)") }
                 done.signal()
                 replyOnce(result)  // may be a no-op if the watchdog already replied
@@ -781,6 +877,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             DispatchQueue.global().async {
                 if done.wait(timeout: .now() + Self.rpcTimeout) == .timedOut {
                     Self.logBuffer.append("⏱ TIMEOUT \(method) (>\(Int(Self.rpcTimeout))s) — still running in background")
+                    if isUIMethod { self.noteUITimeout(method: method) }
                     replyOnce((nil, .serverError(
                         "\(method) exceeded \(Int(Self.rpcTimeout))s and may still be running on the device. " +
                         "Do NOT blindly retry — check GET /logs for a '✓ \(method)' entry first; the action may have already succeeded."
@@ -1132,7 +1229,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             clearRemoteFailedNotification()
             sendNotification(
                 title: L10n.t(.serverReadyTitle),
-                body: "\(address):8200 — " + L10n.t(.onDeviceOnlySuffix) + "\n" + L10n.t(.longPressDisableOrStop),
+                body: addressLines(port: server?.port ?? 8200) + " — "
+                      + L10n.t(.onDeviceOnlySuffix) + "\n" + L10n.t(.longPressDisableOrStop),
                 category: Self.serverRemoteCategoryID
             )
         }
@@ -1174,6 +1272,74 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.1, repeats: false)
         )
         UNUserNotificationCenter.current().add(request)
+    }
+
+    /// How many addresses a notification will list before stopping.
+    private static let maxAdvertisedAddresses = 3
+
+    /// Addresses a PEER can reach this device at, best first.
+    ///
+    /// The listener binds all interfaces, so a client can connect over any of
+    /// these — Wi-Fi, cellular, hotspot, VPN. `getDeviceAddress()` picks a single
+    /// one for the places that need exactly one string; this is for telling the
+    /// user what their actual options are.
+    ///
+    /// Returns `(label, address)` pairs so the notification can say which is
+    /// which rather than listing bare numbers.
+    private func allReachableAddresses() -> [(label: String, address: String)] {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return [] }
+        defer { freeifaddrs(ifaddr) }
+
+        var found: [(rank: Int, label: String, address: String)] = []
+        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let interface = ptr.pointee
+            guard interface.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            // Skip interfaces that are down or have no address assigned.
+            guard (interface.ifa_flags & UInt32(IFF_UP)) != 0 else { continue }
+
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                        &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+            let addr = String(cString: hostname)
+            guard addr != "127.0.0.1", !addr.isEmpty else { continue }
+
+            let name = String(cString: interface.ifa_name)
+            // Rank so the most useful address leads. Cellular is listed but is
+            // usually CGNAT — reachable from the device itself, not from a peer.
+            // Cellular (pdp_ip*) is deliberately excluded: the address is
+            // public/CGNAT and reachable only from the device itself, so
+            // printing it as somewhere to connect would be misleading.
+            let (rank, label): (Int, String)
+            switch true {
+            case name == "en0":              (rank, label) = (0, "Wi-Fi")
+            case name.hasPrefix("bridge"):   (rank, label) = (1, "Hotspot")
+            case name.hasPrefix("utun"):     (rank, label) = (2, "VPN")
+            case name.hasPrefix("en"):       (rank, label) = (3, name)
+            default:                          continue
+            }
+            found.append((rank, label, addr))
+        }
+        // A notification has room for a few lines, not an interface dump.
+        return found.sorted { $0.rank < $1.rank }
+                    .prefix(Self.maxAdvertisedAddresses)
+                    .map { ($0.label, $0.address) }
+    }
+
+    /// Address lines for a notification body: one `http://host:port` per
+    /// interface, labelled. Falls back to just the primary address when there is
+    /// only one, so the common single-Wi-Fi case stays terse.
+    private func addressLines(port: UInt16) -> String {
+        let all = allReachableAddresses()
+        // Empty means no peer-reachable interface — cellular-only, say. Fall
+        // back to the primary address (which does include cellular): on-device
+        // clients can still use it, and it beats showing nothing.
+        guard !all.isEmpty else { return "\(getDeviceAddress()):\(port)" }
+        // One address needs no label; several do, so you can tell which network
+        // each belongs to.
+        if all.count == 1 { return "\(all[0].address):\(port)" }
+        return all.map { "\($0.label): http://\($0.address):\(port)" }
+            .joined(separator: "\n")
     }
 
     private func getDeviceAddress() -> String {
@@ -1255,7 +1421,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 if announceSuccess || recovering {
                     self.sendNotification(
                         title: L10n.t(.serverReadyTitle),
-                        body: "\(address):\(portNum)\n" + L10n.t(.longPressDisableOrStop),
+                        body: self.addressLines(port: portNum) + "\n"
+                              + L10n.t(.longPressDisableOrStop),
                         category: Self.serverRemoteCategoryID
                     )
                 }

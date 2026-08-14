@@ -131,11 +131,38 @@ class ActionHandler {
     private var pointSize: CGRect {
         if let cached = cachedPointSize { return cached }
         let frame = app.frame
+        // Refuse to cache a compatibility-mode reading. The runner has no launch
+        // storyboard, so a size sourced from UIScreen (or an app.frame read
+        // before SpringBoard is attached) comes back 320x480 on every device.
+        // Caching that once would silently mis-scale screenshots AND shift every
+        // tap coordinate for the rest of the session — the failure this guard
+        // exists to prevent. Better to re-read next call than to lock in a lie.
+        guard !Self.isCompatibilityModeSize(frame) else {
+            iCTRLUITests.logBuffer.append(
+                "⚠️ screen size read as \(Int(frame.width))x\(Int(frame.height)) "
+                + "(iOS compatibility-mode default) — not caching; retrying on next call")
+            return frame
+        }
         cachedPointSize = frame
         return frame
     }
 
-    /// Device scale factor (points → pixels). UIScreen access does NOT trigger quiescence.
+    /// The 320x480 (and 320x568) sizes iOS hands an app that has no launch
+    /// storyboard. Never a real modern device's point size.
+    private static func isCompatibilityModeSize(_ r: CGRect) -> Bool {
+        let known: [(CGFloat, CGFloat)] = [(320, 480), (320, 568)]
+        return known.contains { $0 == r.width && $1 == r.height }
+    }
+
+    /// Device scale factor (points → pixels). UIScreen access does NOT trigger
+    /// quiescence.
+    ///
+    /// NOTE: `UIScreen.main.bounds` must NEVER be used for the point size here.
+    /// The XCUITest runner ships without a launch storyboard, so iOS runs it in
+    /// compatibility mode and reports a 320x480 screen no matter the hardware —
+    /// use `pointSize` (backed by `app.frame`, which reads true device geometry
+    /// through the accessibility server). `.scale` is unaffected by compatibility
+    /// mode and stays correct, which is the only reason this one is safe.
     private var scale: Double { Double(UIScreen.main.scale) }
 
     /// Validate a coordinate is inside the tappable point-space.
@@ -166,6 +193,9 @@ class ActionHandler {
         let size = pointSize
         return .object([
             "coordinate_space": .string("points"),
+            // Live health. Sustained capture heats the device and iOS throttles
+            // it, so thermal_state explains a stream that is slowing down.
+            "system": .object(systemMetrics()),
             "point_width": .double(size.width),
             "point_height": .double(size.height),
             "scale": .double(scale),
@@ -322,6 +352,8 @@ class ActionHandler {
             return unlock()
         case "is_locked":
             return isLocked()
+        case "reset":
+            return reset()
         case "list_apps", "installed_apps":
             return listApps(cmd)
         case "resolve_app", "search_app", "search_apps":
@@ -355,10 +387,204 @@ class ActionHandler {
 
     // MARK: - Device
 
+    /// Live system health: thermal state, memory, CPU.
+    ///
+    /// What iOS actually allows differs per metric, so each one reports whether
+    /// it worked instead of quietly returning zero:
+    ///   - thermal state and total RAM come from public ProcessInfo API;
+    ///   - this process's footprint and CPU come from task/thread info, which a
+    ///     sandboxed app may always read about ITSELF;
+    ///   - system-wide free memory and CPU need a host port, which the sandbox
+    ///     usually denies. Those keys are simply absent when denied.
+    ///
+    /// Relevant to this project specifically: sustained capture heats the device
+    /// and iOS then throttles it, which is what drags the stream's frame rate
+    /// down over minutes. `thermal_state` is the signal for that.
+    private func systemMetrics() -> [String: JSONValue] {
+        var out: [String: JSONValue] = [:]
+        let pi = ProcessInfo.processInfo
+
+        let thermal: String
+        switch pi.thermalState {
+        case .nominal:  thermal = "nominal"
+        case .fair:     thermal = "fair"
+        case .serious:  thermal = "serious"
+        case .critical: thermal = "critical"
+        @unknown default: thermal = "unknown"
+        }
+        out["thermal_state"] = .string(thermal)
+        out["low_power_mode"] = .bool(pi.isLowPowerModeEnabled)
+        out["total_memory_mb"] = .int(Int(pi.physicalMemory / 1024 / 1024))
+        out["processor_count"] = .int(pi.activeProcessorCount)
+
+        // This process's memory footprint — the number iOS uses for jetsam.
+        var vmInfo = task_vm_info_data_t()
+        var vmCount = mach_msg_type_number_t(MemoryLayout<task_vm_info>.size / MemoryLayout<integer_t>.size)
+        let vmKR = withUnsafeMutablePointer(to: &vmInfo) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(vmCount)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &vmCount)
+            }
+        }
+        if vmKR == KERN_SUCCESS {
+            out["process_memory_mb"] = .int(Int(vmInfo.phys_footprint / 1024 / 1024))
+        }
+
+        // This process's CPU, summed across its threads. Can exceed 100% on
+        // multiple cores.
+        var threads: thread_act_array_t?
+        var threadCount: mach_msg_type_number_t = 0
+        if task_threads(mach_task_self_, &threads, &threadCount) == KERN_SUCCESS, let list = threads {
+            var total = 0.0
+            for i in 0..<Int(threadCount) {
+                var ti = thread_basic_info()
+                var tc = mach_msg_type_number_t(THREAD_INFO_MAX)
+                let kr = withUnsafeMutablePointer(to: &ti) {
+                    $0.withMemoryRebound(to: integer_t.self, capacity: Int(tc)) {
+                        thread_info(list[i], thread_flavor_t(THREAD_BASIC_INFO), $0, &tc)
+                    }
+                }
+                if kr == KERN_SUCCESS, ti.flags & TH_FLAGS_IDLE == 0 {
+                    total += Double(ti.cpu_usage) / Double(TH_USAGE_SCALE) * 100.0
+                }
+            }
+            vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: list)),
+                          vm_size_t(Int(threadCount) * MemoryLayout<thread_t>.size))
+            out["process_cpu_percent"] = .double((total * 10).rounded() / 10)
+        }
+
+        // System-wide free memory. Needs a host port; absent if the sandbox says no.
+        var vmStats = vm_statistics64_data_t()
+        var statCount = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        let statKR = withUnsafeMutablePointer(to: &vmStats) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(statCount)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &statCount)
+            }
+        }
+        if statKR == KERN_SUCCESS {
+            let page = UInt64(vm_kernel_page_size)
+            out["system_free_memory_mb"] = .int(Int(UInt64(vmStats.free_count) * page / 1024 / 1024))
+        }
+
+        out.merge(diskMetrics()) { a, _ in a }
+        out.merge(batteryMetrics()) { a, _ in a }
+        return out
+    }
+
+    /// Storage capacity and free space.
+    ///
+    /// Two different "free" numbers are reported because iOS answers the question
+    /// twice. `volumeAvailableCapacityForImportantUsage` is what Settings shows
+    /// and what an app can actually expect to get — it counts space iOS would
+    /// reclaim by evicting purgeable caches. The raw `volumeAvailableCapacity` is
+    /// usually much smaller and looks alarming without meaning anything is wrong.
+    /// Reporting only one of them invites the wrong conclusion, so both ship.
+    private func diskMetrics() -> [String: JSONValue] {
+        var out: [String: JSONValue] = [:]
+        let url = URL(fileURLWithPath: NSHomeDirectory())
+        let keys: Set<URLResourceKey> = [
+            .volumeTotalCapacityKey,
+            .volumeAvailableCapacityKey,
+            .volumeAvailableCapacityForImportantUsageKey,
+        ]
+        guard let values = try? url.resourceValues(forKeys: keys) else { return out }
+
+        let mb = { (bytes: Int64) in Int(bytes / 1024 / 1024) }
+        if let total = values.volumeTotalCapacity {
+            out["disk_total_mb"] = .int(mb(Int64(total)))
+        }
+        // The realistic figure, and the one to compare against Settings.
+        if let important = values.volumeAvailableCapacityForImportantUsage {
+            out["disk_free_mb"] = .int(mb(important))
+        }
+        // The conservative figure: excludes anything iOS would have to purge.
+        if let available = values.volumeAvailableCapacity {
+            out["disk_available_now_mb"] = .int(mb(Int64(available)))
+        }
+        if let total = values.volumeTotalCapacity, total > 0,
+           let important = values.volumeAvailableCapacityForImportantUsage {
+            let usedPct = (1.0 - Double(important) / Double(total)) * 100.0
+            out["disk_used_percent"] = .double((usedPct * 10).rounded() / 10)
+        }
+        return out
+    }
+
+    /// Battery level and charging state.
+    ///
+    /// Monitoring has to be enabled before iOS populates these, and it is left on
+    /// afterwards: the runner is long-lived, and toggling it per call would make
+    /// every reading the first one (iOS returns -1 until the first update lands).
+    private func batteryMetrics() -> [String: JSONValue] {
+        var out: [String: JSONValue] = [:]
+        let device = UIDevice.current
+        if !device.isBatteryMonitoringEnabled { device.isBatteryMonitoringEnabled = true }
+
+        // -1 means "not known yet" — report nothing rather than a bogus level.
+        let level = device.batteryLevel
+        if level >= 0 { out["battery_percent"] = .int(Int((level * 100).rounded())) }
+
+        let state: String
+        switch device.batteryState {
+        case .charging: state = "charging"
+        case .full:     state = "full"
+        case .unplugged: state = "unplugged"
+        case .unknown:  state = "unknown"
+        @unknown default: state = "unknown"
+        }
+        if device.batteryState != .unknown { out["battery_state"] = .string(state) }
+        return out
+    }
+
+    /// Drop cached automation state so the next UI call starts clean.
+    ///
+    /// Intended for use after the accessibility connection to the foreground app
+    /// drops (`kAXErrorServerNotFound`), which otherwise leaves every UI method
+    /// timing out. What this can and can't do is worth being precise about:
+    ///
+    /// It clears OUR state — element refs (now pointing into a dead tree), the
+    /// sticky bound app, and the cached screen size. It cannot restart XCTest's
+    /// accessibility session; that belongs to the framework and has no public
+    /// reset. The reconnect, if it happens, comes from the next query against a
+    /// foregrounded app. So this is a cheap thing to try before the guaranteed
+    /// fix (relaunch the runner via config{stop_server:true}), not a promise.
+    ///
+    /// Deliberately free of XCUITest calls, so it stays answerable when the UI
+    /// queue is wedged — a recovery method that queues behind the fault it
+    /// recovers from would be useless.
+    func reset() -> ([String: JSONValue]?, JSONRPCError?) {
+        let refCount = refStore.count
+        refStore.removeAll()
+        let previouslyBound = boundBundleId
+        boundBundleId = nil
+        cachedPointSize = nil
+
+        iCTRLUITests.logBuffer.append("♻️ reset — cleared \(refCount) refs"
+                                    + (previouslyBound.map { ", unbound \($0)" } ?? ""))
+
+        // Report the foreground app so the caller can decide what to re-launch;
+        // this reads a private API, not XCUITest, so it can't block.
+        let foreground = ForegroundApp.currentBundleID()
+        var out: [String: JSONValue] = [
+            "reset": .bool(true),
+            "cleared_refs": .double(Double(refCount)),
+            "hint": .string(
+                "Cleared cached refs, the sticky app binding and the screen-size cache. "
+                + "Re-establishing the accessibility connection is up to XCTest: call launch_app "
+                + "(or activate_app) on the target app, then retry. If UI calls still time out, "
+                + "the runner itself must be restarted — config{stop_server:true}, then relaunch it."
+            ),
+        ]
+        if let prev = previouslyBound { out["unbound"] = .string(prev) }
+        if let fg = foreground { out["foreground_app"] = .string(fg) }
+        return (out, nil)
+    }
+
     private func deviceInfo() -> ([String: JSONValue]?, JSONRPCError?) {
         let device = UIDevice.current
-        // device_info intentionally reads the live frame once (and caches it),
-        // so the reported size is authoritative for the session.
+        // Must be app.frame: it is the only source that reports TRUE device
+        // geometry from inside the runner (see compatibilityModeScreenBounds).
+        // This is why device_info stays on the main-thread/UI path despite the
+        // cost — reporting a wrong coordinate space is worse than being slow,
+        // since every tap the client sends is computed against these numbers.
         let frame = pointSize
         let s = scale
         let result: [String: JSONValue] = [
@@ -444,13 +670,25 @@ class ActionHandler {
         // Resize on the server to targetScale so the client gets a smaller PNG.
         let targetPixelW = frame.width * targetScale
         let targetPixelH = frame.height * targetScale
-        let pngData = Self.encodePNG(fullImage, targetPixels: CGSize(width: targetPixelW, height: targetPixelH))
-        let base64 = pngData.base64EncodedString()
+        // JPEG by default. The client has to run the whole response body through
+        // the envelope's HMAC keystream, so response SIZE is what dominates a
+        // screenshot's end-to-end cost — a PNG of a UI screen is typically 5-10x
+        // larger than a visually equivalent JPEG, and that multiplier lands
+        // directly on the client's decrypt loop. PNG stays available for callers
+        // that need lossless output (pixel diffing, OCR on fine text).
+        let wantPNG = (cmd.format ?? "jpeg").lowercased() == "png"
+        let quality = min(max(cmd.quality ?? 0.6, 0.1), 1.0)
+        let targetPixels = CGSize(width: targetPixelW, height: targetPixelH)
+        let imageData = wantPNG
+            ? Self.encodePNG(fullImage, targetPixels: targetPixels)
+            : Self.encodeJPEG(fullImage, targetPixels: targetPixels, quality: quality)
+        let base64 = imageData.base64EncodedString()
 
-        let result: [String: JSONValue] = [
-            "format": .string("png"),
+        var result: [String: JSONValue] = [
+            "format": .string(wantPNG ? "png" : "jpeg"),
             "encoding": .string("base64"),
             "data": .string(base64),
+            "bytes": .double(Double(imageData.count)),
             // Pixel dimensions of THIS (possibly downscaled) image:
             "pixel_width": .double(targetPixelW),
             "pixel_height": .double(targetPixelH),
@@ -471,6 +709,7 @@ class ActionHandler {
                 "x = px / \(targetScale), y = py / \(targetScale). Prefer page_source to avoid this conversion."
             ),
         ]
+        if !wantPNG { result["quality"] = .double(quality) }
         var out = result
         if let bid = scopedTo {
             out["scoped_to"] = .string(bid)
@@ -481,19 +720,33 @@ class ActionHandler {
         return (out, nil)
     }
 
-    /// Render a UIImage to PNG at the requested pixel size (server-side downscale).
-    private static func encodePNG(_ image: UIImage, targetPixels: CGSize) -> Data {
+    /// Render a UIImage to JPEG at the requested pixel size and quality.
+    ///
+    /// Shares the resize path with `encodePNG`; only the final serialization
+    /// differs. `opaque = true` matters here — a screen capture has no alpha, and
+    /// telling the renderer so avoids a needless alpha channel.
+    private static func encodeJPEG(_ image: UIImage, targetPixels: CGSize, quality: Double) -> Data {
+        let resized = resize(image, targetPixels: targetPixels)
+        return resized.jpegData(compressionQuality: CGFloat(quality))
+            ?? image.jpegData(compressionQuality: CGFloat(quality))
+            ?? Data()
+    }
+
+    /// Downscale to an exact pixel size. Shared by the PNG and JPEG encoders.
+    private static func resize(_ image: UIImage, targetPixels: CGSize) -> UIImage {
         let w = max(1, Int(targetPixels.width.rounded()))
         let h = max(1, Int(targetPixels.height.rounded()))
-        let size = CGSize(width: w, height: h)
-
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1               // we specify size in raw pixels
         format.opaque = true
+        let size = CGSize(width: w, height: h)
         let renderer = UIGraphicsImageRenderer(size: size, format: format)
-        let resized = renderer.image { _ in
-            image.draw(in: CGRect(origin: .zero, size: size))
-        }
+        return renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
+    }
+
+    /// Render a UIImage to PNG at the requested pixel size (server-side downscale).
+    private static func encodePNG(_ image: UIImage, targetPixels: CGSize) -> Data {
+        let resized = resize(image, targetPixels: targetPixels)
         return resized.pngData() ?? image.pngData() ?? Data()
     }
 
@@ -1191,6 +1444,41 @@ class ActionHandler {
     /// model to understand layout (element types, labels, identifiers, frames)
     /// without decoding a screenshot image. Pass bundle_id to inspect a specific
     /// foreground app; otherwise the whole screen (SpringBoard) tree is returned.
+    /// Set when locateElement refused to run because the target app can't be
+    /// snapshotted. `locateElement` returns an optional so its callers can treat
+    /// "not found" uniformly; this carries the actionable reason alongside, so a
+    /// backgrounded app reports as such instead of as a plain miss.
+    private var lastLocateError: JSONRPCError?
+
+    /// Refuses a snapshot that is going to fail slowly, before it is attempted.
+    ///
+    /// `snapshot()` on an app that isn't frontmost has no main window to read, so
+    /// the accessibility server answers `kAXErrorServerNotFound` — but only after
+    /// XCTest's internal ~16s timeout. That call cannot be cancelled, and the RPC
+    /// queue is serial, so those 16s block every later request too: one
+    /// backgrounded app stalls tap, screenshot, even device_info. Checking the
+    /// app's state up front turns that into an instant, actionable error.
+    ///
+    /// SpringBoard is always readable, so it's exempt.
+    static func snapshotPrecheck(bundleId: String?, action: String,
+                                 retryWith method: String) -> JSONRPCError? {
+        guard let bid = bundleId, bid != "com.apple.springboard" else { return nil }
+        let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bid)) ?? .unknown
+        switch state {
+        case .notRunning:
+            return JSONRPCError(code: -32004, message:
+                "Can't \(action): app '\(bid)' is not running (it may have crashed or been closed). " +
+                "Call launch_app to (re)open it, then retry.", data: nil)
+        case .background, .backgroundSuspended:
+            return JSONRPCError(code: -32004, message:
+                "Can't \(action): app '\(bid)' is in the background, so it has no snapshottable window. " +
+                "Bring it to the front first — run one interaction (tap/swipe re-focuses the bound app) or call " +
+                "launch_app/activate_app, then retry \(method).", data: nil)
+        default:
+            return nil  // foreground or unknown → proceed (unknown may still work)
+        }
+    }
+
     private func pageSource(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         // Resolve which app to inspect:
         //   explicit bundle_id → that app
@@ -1205,28 +1493,9 @@ class ActionHandler {
             target = app
         }
 
-        // Pre-check the target's state before snapshotting. snapshot() on an app
-        // that isn't frontmost has no main window to read, so the accessibility
-        // server returns kAXErrorServerNotFound — but only after XCTest's internal
-        // ~16s timeout, blocking the whole call (the RPC 6s watchdog can't cancel
-        // the in-flight XCUITest call). A backgrounded bound app is the common
-        // cause (e.g. a tap sent the app to the background). Fail fast with a clear
-        // recoverable error instead. SpringBoard is always readable, so skip it.
-        if let bid = inspectedBundleId, bid != "com.apple.springboard" {
-            let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bid)) ?? .unknown
-            switch state {
-            case .notRunning:
-                return (nil, JSONRPCError(code: -32004, message:
-                    "Can't read the view tree: app '\(bid)' is not running (it may have crashed or been closed). " +
-                    "Call launch_app to (re)open it, then retry.", data: nil))
-            case .background, .backgroundSuspended:
-                return (nil, JSONRPCError(code: -32004, message:
-                    "Can't read the view tree: app '\(bid)' is in the background, so it has no snapshottable window. " +
-                    "Bring it to the front first — run one interaction (tap/swipe re-focuses the bound app) or call " +
-                    "launch_app/activate_app, then retry page_source.", data: nil))
-            default:
-                break  // foreground or unknown → proceed (unknown may still work)
-            }
+        if let err = Self.snapshotPrecheck(bundleId: inspectedBundleId, action: "read the view tree",
+                                           retryWith: "page_source") {
+            return (nil, err)
         }
 
         // Custom snapshot traversal so we can bound depth / count and filter —
@@ -1571,6 +1840,9 @@ class ActionHandler {
     /// hittable match + its index, so both find_element and tap-by-ref agree.
     private func locateElement(query: String, type: String?, bundleId: String?, matchMode: String)
         -> (XCUIElement, ElementRef.Match, Int)? {
+        // Cleared per call: a stale error from an earlier lookup must never be
+        // reported against this one.
+        lastLocateError = nil
         let bid = bundleId ?? resolveForegroundBundleId()
         let target: XCUIApplication = bid.map { XCUIApplication(bundleIdentifier: $0) } ?? app
         let q = elementQuery(in: target, type: type)
@@ -1601,6 +1873,9 @@ class ActionHandler {
             return (first, 0)   // exists but not hittable — caller decides
         }
 
+        // Fast path: one live query for an exact label. When it hits (the common
+        // case for a correctly-spelled label) this beats a snapshot outright, so
+        // the usual success case doesn't pay for the thorough path below.
         var s = nowMonotonic
         if let (el, idx) = firstHittable(q.matching(NSPredicate(format: "label == %@", query))) {
             lap("exact", from: s)
@@ -1610,32 +1885,26 @@ class ActionHandler {
         }
         lap("exact", from: s)
 
-        s = nowMonotonic
-        if let (el, idx) = firstHittable(q.matching(identifier: query)) {
-            lap("id", from: s)
-            let (best, bestIdx) = elevateToButton(match: el, matchIdx: idx, in: target, phases: &phases)
-            done("→id\(bestIdx == idx ? "" : "→button")")
-            return (best, .identifier(query), bestIdx)
-        }
-        lap("id", from: s)
-
-        if matchMode == "contains" {
-            s = nowMonotonic
-            if let (el, idx) = firstHittable(q.matching(NSPredicate(format: "label CONTAINS[c] %@", query))) {
-                lap("contains", from: s)
-                let (best, bestIdx) = elevateToButton(match: el, matchIdx: idx, in: target, phases: &phases)
-                done("→contains\(bestIdx == idx ? "" : "→button")")
-                return (best, .containsLabel(query), bestIdx)
-            }
-            lap("contains", from: s)
+        // The snapshot path is where a backgrounded app costs ~16s of blocked
+        // serial queue, so refuse it up front — the same guard page_source has
+        // had. The live query above needs no such check; it fails fast.
+        if let err = Self.snapshotPrecheck(bundleId: bid, action: "find '\(query)'",
+                                           retryWith: "find_element") {
+            phases.append("precheck=refused")
+            done("✗\(err.message.contains("background") ? "backgrounded" : "not-running")")
+            lastLocateError = err
+            return nil
         }
 
-        // Fallback: some labels carry invisible bidi/format chars (e.g. U+2066/2068
-        // directional isolates around CJK), so a strict "label == query" misses.
-        // Instead of querying each element's .label individually (N accessibility
-        // round-trips), take ONE snapshot of the tree and walk it IN MEMORY (like
-        // WebDriverAgent), then re-resolve only the single winning element to an
-        // XCUIElement. This turns ~30-90 queries into 1 snapshot + 1 resolve.
+        // Everything else runs against ONE snapshot.
+        //
+        // Previously id and contains were separate live queries, each paying its
+        // own accessibility round-trip (~1.5-5s apiece on a rich page) before the
+        // snapshot fallback ran anyway — so a miss cost 14s+ and a misspelled
+        // label was the most expensive request the server could receive. A
+        // snapshot carries label, identifier, value, frame and elementType, which
+        // is everything these strategies need, so one capture answers all of them
+        // and the walk itself is ~20ms.
         let wantExact = Self.normalizeLabel(query)
         s = nowMonotonic
         guard let root = try? target.snapshot() else {
@@ -1644,42 +1913,68 @@ class ActionHandler {
         }
         lap("snapshot", from: s)
 
-        // Depth-first walk collecting the first exact-normalized match and, for
-        // contains mode, the first substring match. We match on label OR value.
+        // Depth-first walk, collecting the best candidate per strategy in one
+        // pass. Ordering is preserved from the old sequential version: an exact
+        // label beats an identifier, which beats a substring.
         s = nowMonotonic
         var exactSnap: XCUIElementSnapshot?
+        var idSnap: XCUIElementSnapshot?
         var containsSnap: XCUIElementSnapshot?
         var stack: [XCUIElementSnapshot] = [root]
         var visited = 0
+        var allNodes: [XCUIElementSnapshot] = []
         while let node = stack.popLast(), visited < 4000 {
             visited += 1
-            let hay = Self.normalizeLabel(node.label + " " + ((node.value as? String) ?? ""))
+            allNodes.append(node)
             if exactSnap == nil, Self.normalizeLabel(node.label) == wantExact {
                 exactSnap = node
                 break   // exact wins immediately
             }
-            if matchMode == "contains", containsSnap == nil,
-               hay.localizedCaseInsensitiveContains(wantExact) {
-                containsSnap = node
+            if idSnap == nil, node.identifier == query {
+                idSnap = node
+            }
+            if matchMode == "contains", containsSnap == nil {
+                let hay = Self.normalizeLabel(node.label + " " + ((node.value as? String) ?? ""))
+                if hay.localizedCaseInsensitiveContains(wantExact) { containsSnap = node }
             }
             stack.append(contentsOf: node.children)
         }
         phases.append("walk=\(Int((nowMonotonic - s) * 1000))ms/\(visited)nodes")
 
-        // Re-resolve the matched snapshot to a live XCUIElement by its label (the
-        // query layer re-finds it; index 0 of the type-filtered label query).
+        // Re-resolve the winning snapshot to a live XCUIElement. Elevation now
+        // reuses `allNodes` instead of re-enumerating every button and cell.
+        let ranked: [(XCUIElementSnapshot, ElementRef.Match, String)] = [
+            exactSnap.map    { ($0, ElementRef.Match.exactLabel($0.label), "→snapshot-exact") },
+            idSnap.map       { ($0, ElementRef.Match.identifier(query),    "→snapshot-id") },
+            containsSnap.map { ($0, ElementRef.Match.exactLabel($0.label), "→snapshot-contains") },
+        ].compactMap { $0 }
+
         s = nowMonotonic
-        if let m = exactSnap {
-            let re = q.matching(NSPredicate(format: "label == %@", m.label)).element(boundBy: 0)
-            if re.exists { lap("resolve", from: s); done("→snapshot-exact"); return (re, .exactLabel(m.label), 0) }
-        }
-        if let m = containsSnap {
-            let re = q.matching(NSPredicate(format: "label == %@", m.label)).element(boundBy: 0)
-            if re.exists { lap("resolve", from: s); done("→snapshot-contains"); return (re, .exactLabel(m.label), 0) }
+        for (snap, match, hit) in ranked {
+            guard let (live, idx) = resolveSnapshot(snap, match: match, in: q) else { continue }
+            lap("resolve", from: s)
+            let (best, bestIdx) = elevateToButton(match: live, matchIdx: idx, snapshot: snap,
+                                                  allNodes: allNodes, phases: &phases)
+            done("\(hit)\(bestIdx == idx ? "" : "→button")")
+            return (best, match, bestIdx)
         }
         lap("resolve", from: s)
         done("✗not-found")
         return nil
+    }
+
+    /// Turn a matched snapshot node back into a live, tappable XCUIElement.
+    private func resolveSnapshot(_ snap: XCUIElementSnapshot, match: ElementRef.Match,
+                                 in q: XCUIElementQuery) -> (XCUIElement, Int)? {
+        // Prefer the identifier when that's what matched — it's more selective
+        // than a label, which several nodes may share.
+        let re: XCUIElement
+        if case .identifier(let ident) = match {
+            re = q.matching(identifier: ident).element(boundBy: 0)
+        } else {
+            re = q.matching(NSPredicate(format: "label == %@", snap.label)).element(boundBy: 0)
+        }
+        return re.exists ? (re, 0) : nil
     }
 
     /// When a label/identifier match landed on a non-interactive element
@@ -1697,16 +1992,9 @@ class ActionHandler {
                                  in target: XCUIApplication,
                                  phases: inout [String]) -> (XCUIElement, Int) {
         let t0 = nowMonotonic
-        // Skip elevation when the match itself is intrinsically tappable —
-        // buttons, cells, switches, keys, and menu items already dispatch
-        // their own handlers on tap.
-        let matchType = match.elementType
-        switch matchType {
-        case .button, .cell, .switch, .toggle, .radioButton, .checkBox,
-             .menuButton, .menuItem, .key, .link, .searchField, .textField, .textView:
-            phases.append("elevate=skip(\(matchType.rawValue))")
+        guard !Self.isIntrinsicallyTappable(match.elementType) else {
+            phases.append("elevate=skip(\(match.elementType.rawValue))")
             return (match, matchIdx)
-        default: break
         }
         let matchFrame = match.frame
         // Empty-frame elements can't be usefully compared for containment.
@@ -1737,6 +2025,70 @@ class ActionHandler {
         return (match, matchIdx)
     }
 
+    /// Snapshot-based elevation: same tightest-containing-ancestor rule as the
+    /// live variant, but the candidates come from the tree we already walked.
+    ///
+    /// The live version calls `allElementsBoundByAccessibilityElement` on both
+    /// `buttons` and `cells` and then reads `.frame` on every result — two full
+    /// enumerations plus a round-trip per candidate, paid on the SUCCESS path. The
+    /// snapshot already carries frame and elementType for every node, so the same
+    /// decision costs a pass over an in-memory array.
+    private func elevateToButton(match: XCUIElement, matchIdx: Int,
+                                 snapshot snap: XCUIElementSnapshot,
+                                 allNodes: [XCUIElementSnapshot],
+                                 phases: inout [String]) -> (XCUIElement, Int) {
+        let t0 = nowMonotonic
+        guard !Self.isIntrinsicallyTappable(snap.elementType) else {
+            phases.append("elevate=skip(\(snap.elementType.rawValue))")
+            return (match, matchIdx)
+        }
+        let matchFrame = snap.frame
+        if matchFrame.width < 1 || matchFrame.height < 1 { return (match, matchIdx) }
+        let centre = CGPoint(x: matchFrame.midX, y: matchFrame.midY)
+
+        var best: XCUIElementSnapshot?
+        var bestArea = CGFloat.greatestFiniteMagnitude
+        var considered = 0
+        for node in allNodes {
+            switch node.elementType {
+            case .button, .cell: break
+            default: continue
+            }
+            considered += 1
+            let f = node.frame
+            if f.width < 1 || f.height < 1 { continue }
+            if !f.contains(centre) { continue }
+            let area = f.width * f.height
+            if area >= bestArea { continue }
+            best = node
+            bestArea = area
+        }
+        phases.append("elevate=\(Int((nowMonotonic - t0) * 1000))ms/\(considered)cands")
+
+        // Re-resolve the chosen ancestor to a live element. Falling back to the
+        // original match keeps this best-effort: a failed elevation must never
+        // turn a found element into a miss.
+        guard let bestSnap = best else { return (match, matchIdx) }
+        let query = bestSnap.elementType == .cell ? app.cells : app.buttons
+        let live = bestSnap.identifier.isEmpty
+            ? query.matching(NSPredicate(format: "label == %@", bestSnap.label)).element(boundBy: 0)
+            : query.matching(identifier: bestSnap.identifier).element(boundBy: 0)
+        if live.exists, live.isHittable { return (live, matchIdx) }
+        return (match, matchIdx)
+    }
+
+    /// Element kinds that already dispatch their own handler on tap, so a
+    /// label match landing on one needs no elevation.
+    private static func isIntrinsicallyTappable(_ type: XCUIElement.ElementType) -> Bool {
+        switch type {
+        case .button, .cell, .switch, .toggle, .radioButton, .checkBox,
+             .menuButton, .menuItem, .key, .link, .searchField, .textField, .textView:
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Strip invisible formatting/bidi control characters so labels compare cleanly.
     private static func normalizeLabel(_ s: String) -> String {
         let stripped = s.unicodeScalars.filter { scalar in
@@ -1755,6 +2107,7 @@ class ActionHandler {
         let matchMode = (cmd.matchMode ?? "exact").lowercased()
         guard let (element, match, index) = locateElement(query: elementId, type: cmd.elementType,
                                                           bundleId: cmd.bundleId, matchMode: matchMode) else {
+            if let err = lastLocateError { return (nil, err) }
             return (nil, JSONRPCError(
                 code: -32602,
                 message: "No element matching label/id '\(elementId)'" +
@@ -1814,6 +2167,7 @@ class ActionHandler {
         let matchMode = (cmd.matchMode ?? "exact").lowercased()
         guard let (element, match, _) = locateElement(query: elementId, type: cmd.elementType,
                                                      bundleId: cmd.bundleId, matchMode: matchMode) else {
+            if let err = lastLocateError { return (nil, err) }
             return (nil, JSONRPCError(
                 code: -32602,
                 message: "find_and_tap: no element matching '\(elementId)'\(cmd.elementType.map { " of type '\($0)'" } ?? ""). Try match:'contains', or a different label from page_source.",
@@ -1853,6 +2207,7 @@ class ActionHandler {
         let matchMode = (cmd.matchMode ?? "exact").lowercased()
         guard let (element, _, _) = locateElement(query: elementId, type: cmd.elementType,
                                                   bundleId: cmd.bundleId, matchMode: matchMode) else {
+            if let err = lastLocateError { return (nil, err) }
             return (nil, JSONRPCError(
                 code: -32602,
                 message: "No element matching '\(elementId)'\(cmd.elementType.map { " of type '\($0)'" } ?? ""). " +

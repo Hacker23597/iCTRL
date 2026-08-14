@@ -38,7 +38,7 @@ struct RPCMethodRegistry {
             name: "device_info",
             description: "Get device name, model, OS version, the coordinate space (point size for tap/swipe, pixel size for screenshots, scale), AND the server's identity: server_version, protocol_version, and a capabilities array — so ONE device_info call gives you both the device and what this server supports (no separate /schema fetch for feature detection). CALL THIS FIRST before any coordinate-based action.",
             params: [],
-            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, a 'hint' string, plus server_version (semver), protocol_version (int), and capabilities (array of feature tags, e.g. envelope_v1, stream_ticket, find_element_ref, clear_text, page, stop_server)."
+            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, a 'hint' string, plus server_version (semver), protocol_version (int), capabilities (array of feature tags, e.g. envelope_v1, stream_ticket, find_element_ref, clear_text, page, stop_server), and a 'system' object of live health: thermal_state, low_power_mode, total_memory_mb, processor_count, process_memory_mb, process_cpu_percent, system_free_memory_mb?, disk_total_mb, disk_free_mb, disk_available_now_mb, disk_used_percent, battery_percent?, battery_state?. Keys the sandbox refuses are absent rather than zero. NOTE: process_cpu_percent is THIS runner's usage (can exceed 100% across cores), not system-wide — iOS does not expose global CPU. disk_free_mb matches what Settings shows (counts purgeable space); disk_available_now_mb is the stricter figure."
         ),
         RPCMethodDef(
             name: "page_source",
@@ -52,13 +52,21 @@ struct RPCMethodRegistry {
             returns: "{source: text tree, truncated, total_returned, filtered?, coordinate_space:'points', hint}. Includes visible overlay windows (fixed bottom/floating bars) automatically."
         ),
         RPCMethodDef(
+            name: "reset",
+            description: "Recover after UI automation stops responding (calls timing out, logs showing kAXErrorServerNotFound). Clears cached element refs, the sticky app binding and the cached screen size, and re-arms the circuit breaker that rejects UI calls once the channel is judged unhealthy. Does NOT itself restart XCTest's accessibility session — after calling it, launch_app (or activate_app) the target app to force a reconnect, then retry. If UI calls still time out, restart the runner: config{stop_server:true}, then relaunch it. Safe to call any time; runs off the UI queue so it works even while UI methods are blocked.",
+            params: [],
+            returns: "Object: {reset:true, cleared_refs, unbound?, foreground_app?, hint}"
+        ),
+        RPCMethodDef(
             name: "screenshot",
-            description: "Capture a screenshot as base64 PNG. SECOND CHOICE after page_source — use when you need visual detail or an element is absent from the view tree. By default captures the WHOLE SCREEN (fast, ~0.4s). Pass bundle_id ONLY if you specifically want just one app's window cropped out (slower; time-bounded with a full-screen fallback). Image is in PIXELS; tap coordinates are in POINTS. Optional 'scale' controls output resolution (default 2, max 3, e.g. 1, 0.5).",
+            description: "Capture a screenshot as base64 JPEG (default) or PNG. SECOND CHOICE after page_source — use when you need visual detail or an element is absent from the view tree. By default captures the WHOLE SCREEN (fast, ~0.4s). Pass bundle_id ONLY if you specifically want just one app's window cropped out (slower; time-bounded with a full-screen fallback). Image is in PIXELS; tap coordinates are in POINTS. Optional 'scale' controls output resolution (default 2, max 3, e.g. 1, 0.5).",
             params: [
                 RPCParamDef(name: "scale", type: "number", required: false, description: "Output pixels-per-point (default 2, max 3; smaller = faster/less detail, e.g. 1 or 0.5)"),
                 RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Crop to just this app's window (slower, time-bounded). OMIT for the default full-screen capture (fast) — the default is NOT scoped to the launched app."),
+                RPCParamDef(name: "format", type: "string", required: false, description: "'jpeg' (default) or 'png'. JPEG is 5-10x smaller, which cuts BOTH transfer and the client's envelope decryption time — response size dominates a screenshot's end-to-end cost. Use 'png' only when you need lossless output (pixel diffing, OCR on fine text)."),
+                RPCParamDef(name: "quality", type: "number", required: false, description: "JPEG quality 0.1-1.0 (default 0.6). Ignored for PNG. Lower = smaller/faster."),
             ],
-            returns: "Object: {data: base64 PNG, pixel_width, pixel_height, point_width, point_height, scale, scope:'screen'|'app', scoped_to?, hint}"
+            returns: "Object: {data: base64 image, format:'jpeg'|'png', bytes, quality?, pixel_width, pixel_height, point_width, point_height, scale, scope:'screen'|'app', scoped_to?, hint}"
         ),
         RPCMethodDef(
             name: "tap",
@@ -310,7 +318,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.4.0"
+    static let serverVersion = "1.6.0"
 
     /// Server capability/protocol version. v1 = encrypted-envelope auth over /pair +
     /// /rpc. Bump when the wire capabilities change so clients can auto-detect.
@@ -334,6 +342,10 @@ struct RPCMethodRegistry {
         "page",                // page{direction} precise paging
         "stop_server",         // config{stop_server:true}
         "logs_history",        // GET /logs/history (persisted logs)
+        "screenshot_jpeg",     // screenshot{format:'jpeg'|'png', quality} — jpeg is the default
+        "reset",               // reset RPC (recover from a dropped accessibility connection)
+        "nonui_lane",          // config/reset/logs answer while UI calls are blocked
+        "system_metrics",      // device_info.system — thermal/cpu/memory/disk/battery
     ]
 
     static func generateSchemaDocument() -> [String: Any] {
