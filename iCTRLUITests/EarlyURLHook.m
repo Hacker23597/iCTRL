@@ -316,6 +316,61 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
                 return;
             }
 
+            // Private suspend APIs first. This build is developer-distributed and
+            // never goes near App Review, so a private call is fair game — and
+            // asking UIKit to suspend us is far more direct than opening some
+            // other app and hoping that displaces us.
+            //
+            // Which of these exists varies by iOS version, so probe rather than
+            // assume: the log names what was found and what worked, which is the
+            // information needed if this ever breaks again.
+            UIApplication *app = UIApplication.sharedApplication;
+            NSArray<NSString *> *suspendSelectors = @[
+                @"suspend",                    // classic, long-lived
+                @"_suspend",
+                @"suspendWithCompletion:",     // newer variants
+                @"_suspendWithCompletion:",
+            ];
+            // Record which of these the OS still has, so a future failure starts
+            // from fact rather than another round of guessing.
+            NSMutableArray<NSString *> *available = [NSMutableArray array];
+            for (NSString *n in suspendSelectors) {
+                if ([app respondsToSelector:NSSelectorFromString(n)]) { [available addObject:n]; }
+            }
+            earlyLog([NSString stringWithFormat:@"🏠 suspend selectors present: %@",
+                      available.count ? [available componentsJoinedByString:@", "] : @"(none)"]);
+            for (NSString *name in suspendSelectors) {
+                SEL sus = NSSelectorFromString(name);
+                if (![app respondsToSelector:sus]) { continue; }
+                earlyLog([NSString stringWithFormat:@"🏠 early-background: trying -[UIApplication %@]", name]);
+                @try {
+                    if ([name hasSuffix:@":"]) {
+                        // Takes a completion block; pass an empty one.
+                        void (^done)(void) = ^{};
+                        NSMethodSignature *ssig = [app methodSignatureForSelector:sus];
+                        NSInvocation *sinv = [NSInvocation invocationWithMethodSignature:ssig];
+                        sinv.target = app;
+                        sinv.selector = sus;
+                        [sinv setArgument:&done atIndex:2];
+                        [sinv invoke];
+                    } else {
+                        ((void (*)(id, SEL))objc_msgSend)(app, sus);
+                    }
+                    // Give UIKit a moment, then see whether it took.
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        UIApplicationState st = UIApplication.sharedApplication.applicationState;
+                        earlyLog(st == UIApplicationStateActive
+                                 ? [NSString stringWithFormat:@"🏠 %@ returned but the runner is STILL ACTIVE", name]
+                                 : [NSString stringWithFormat:@"🏠 early-background confirmed via -[UIApplication %@]", name]);
+                    });
+                    return;
+                } @catch (NSException *e) {
+                    earlyLog([NSString stringWithFormat:@"🏠 %@ raised: %@", name, e.reason]);
+                }
+            }
+            earlyLog(@"🏠 early-background: no usable suspend selector — falling back to opening an app");
+
             // Settings first: it ships with iOS, so it is always there. The host
             // app registers ictrl-app:// but the two IPAs install separately —
             // the runner can be present without it, and opening a scheme nobody
