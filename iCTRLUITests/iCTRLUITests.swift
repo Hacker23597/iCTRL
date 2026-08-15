@@ -415,6 +415,19 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// IOHID reported success while doing nothing, the silent-confirmation
     /// failure Appium documented in WDA PR #1171.
     private func backgroundSelfNow() {
+        // Only once XCTest is genuinely usable.
+        //
+        // Position in the code is not proof of that. XCTest can still be
+        // acquiring its automation authorization here — the passcode prompt the
+        // user has to answer — and suspending into that cancels it and takes the
+        // launch down. Rather than infer readiness, ask: query SpringBoard's
+        // state through XCUIApplication, which is exactly the capability the
+        // authorization grants. A usable answer means the grant landed.
+        guard waitUntilTestable(timeout: 30) else {
+            Self.logBuffer.append("🏠 auto-background skipped — XCTest never became testable")
+            return
+        }
+
         let app = UIApplication.shared
         let sel = NSSelectorFromString("suspend")
         guard app.responds(to: sel) else {
@@ -428,6 +441,38 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
         Self.logBuffer.append(raised.map { "🏠 auto-background raised: \($0)" }
                               ?? "🏠 auto-backgrounded via -[UIApplication suspend]")
+    }
+
+    /// Block until XCTest can actually drive the UI, or give up.
+    ///
+    /// `XCUIApplication.state` is the cheapest call that depends on the
+    /// automation grant: it goes through the accessibility channel the
+    /// authorization opens. While the prompt is still up it throws or answers
+    /// `.unknown`; once the user has answered, it returns a real state.
+    ///
+    /// Generous timeout because the thing being waited on is a human typing a
+    /// passcode. Giving up leaves the runner in the foreground, which is a far
+    /// smaller problem than suspending mid-prompt.
+    private func waitUntilTestable(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        var logged = false
+        while Date() < deadline {
+            var state = 0
+            let raised = ObjCException.catching {
+                state = ForegroundApp.appState(forBundleID: "com.apple.springboard")
+            }
+            // 0 == unknown; anything else means the accessibility channel answered.
+            if raised == nil, state != 0 { return true }
+            if !logged {
+                Self.logBuffer.append("🏠 waiting for XCTest to become testable "
+                                    + "(automation authorization may be pending)")
+                logged = true
+            }
+            // Spin the run loop rather than sleep: the authorization completes on
+            // the main thread, and blocking it here would deadlock the wait.
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.25))
+        }
+        return false
     }
 
     // MARK: - URL Scheme Callback
