@@ -208,6 +208,13 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
     if (original_setDelegate) { original_setDelegate(self, _cmd, delegate); }
 }
 
+/// Private XCTest API: the sanctioned way for a runner to open a URL.
+@interface XCTRunnerDaemonSession : NSObject
++ (instancetype)sharedSession;
+- (void)openDefaultApplicationForURL:(NSURL *)url
+                          completion:(void (^)(BOOL result, NSError *error))completion;
+@end
+
 @implementation EarlyURLHook
 
 + (void)load {
@@ -283,45 +290,72 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
             return;
         }
         @try {
-            Class eventClass = NSClassFromString(@"XCDeviceEvent");
-            Class deviceClass = NSClassFromString(@"XCUIDevice");
-            if (!eventClass || !deviceClass) {
-                earlyLog(@"🏠 early-background unavailable — XCTest classes not loaded");
+            // Leave the foreground by OPENING ANOTHER APP, not by pressing Home.
+            //
+            // IOHID Menu was tried first and is a dead end here: the call returns
+            // YES and the log said "pressed", but bootstrap still stalled the
+            // full 11s until the user intervened — so the event either never
+            // landed or backgrounding isn't what releases it. Either way,
+            // synthesised button events are not a mechanism to rely on (the same
+            // silent-success failure Appium documented in WDA PR #1171).
+            //
+            // XCTRunnerDaemonSession is different: it's the sanctioned way for a
+            // runner to open a URL, it is already how the ictrl:// callback
+            // returns to the host app, and it is observed to work on this OS.
+            // Opening the host app both removes the runner from the foreground
+            // and puts something useful there.
+            Class sessionClass = NSClassFromString(@"XCTRunnerDaemonSession");
+            if (!sessionClass) {
+                earlyLog(@"🏠 early-background unavailable — XCTRunnerDaemonSession missing");
                 return;
             }
-            SEL make = NSSelectorFromString(@"deviceEventWithPage:usage:duration:");
-            if (![eventClass respondsToSelector:make]) { return; }
-            NSMethodSignature *sig = [eventClass methodSignatureForSelector:make];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = eventClass;
-            inv.selector = make;
-            unsigned int page = 0x0C;      // kHIDPage_Consumer
-            unsigned int usage = 0x40;     // kHIDUsage_Csmr_Menu (Home)
-            NSTimeInterval duration = 0.005;
-            [inv setArgument:&page atIndex:2];
-            [inv setArgument:&usage atIndex:3];
-            [inv setArgument:&duration atIndex:4];
-            [inv invoke];
-            __unsafe_unretained id event = nil;
-            [inv getReturnValue:&event];
-            if (!event) { return; }
+            id session = [sessionClass performSelector:@selector(sharedSession)];
+            SEL sel = NSSelectorFromString(@"openDefaultApplicationForURL:completion:");
+            if (!session || ![session respondsToSelector:sel]) {
+                earlyLog(@"🏠 early-background unavailable — daemon session can't open URLs yet");
+                return;
+            }
 
-            id device = [deviceClass performSelector:@selector(sharedDevice)];
-            SEL perform = NSSelectorFromString(@"performDeviceEvent:error:");
-            if (!device || ![device respondsToSelector:perform]) { return; }
-            NSMethodSignature *psig = [device methodSignatureForSelector:perform];
-            NSInvocation *pinv = [NSInvocation invocationWithMethodSignature:psig];
-            pinv.target = device;
-            pinv.selector = perform;
-            NSError *err = nil;
-            __unsafe_unretained id evt = event;
-            [pinv setArgument:&evt atIndex:2];
-            [pinv setArgument:&err atIndex:3];
-            [pinv invoke];
-            BOOL ok = NO;
-            [pinv getReturnValue:&ok];
-            earlyLog(ok ? @"🏠 early-background: Home pressed via IOHID (pre-setUp)"
-                        : @"🏠 early-background: IOHID press returned NO");
+            // Settings first: it ships with iOS, so it is always there. The host
+            // app registers ictrl-app:// but the two IPAs install separately —
+            // the runner can be present without it, and opening a scheme nobody
+            // handles would leave us in the foreground.
+            NSArray<NSString *> *candidates = @[@"App-prefs:", @"ictrl-app://runner-starting"];
+            BOOL opened = NO;
+            for (NSString *candidate in candidates) {
+                NSURL *url = [NSURL URLWithString:candidate];
+                if (!url) { continue; }
+                __block BOOL ok = NO;
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                [session openDefaultApplicationForURL:url completion:^(BOOL result, NSError *err) {
+                    ok = result && (err == nil);
+                    dispatch_semaphore_signal(sem);
+                }];
+                // Bounded: this runs on the main queue and must not wedge it.
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)));
+                if (ok) {
+                    earlyLog([NSString stringWithFormat:@"🏠 early-background: opened %@ (pre-setUp)", candidate]);
+                    opened = YES;
+                    break;
+                }
+                earlyLog([NSString stringWithFormat:@"🏠 early-background: %@ did not open", candidate]);
+            }
+            if (!opened) {
+                earlyLog(@"🏠 early-background: no URL opened — runner stays in front");
+                return;
+            }
+
+            // Confirm the foreground actually moved. Every previous attempt here
+            // reported success from an API return value and was wrong — the IOHID
+            // press logged "pressed" while bootstrap stalled anyway. UIApplication
+            // state is a first-party signal and needs no XCTest.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                UIApplicationState state = UIApplication.sharedApplication.applicationState;
+                earlyLog(state == UIApplicationStateActive
+                         ? @"🏠 early-background: STILL ACTIVE — the open did not take the foreground"
+                         : @"🏠 early-background confirmed — runner is no longer active");
+            });
         } @catch (NSException *e) {
             earlyLog([NSString stringWithFormat:@"🏠 early-background raised: %@", e.reason]);
         }
