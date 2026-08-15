@@ -27,6 +27,7 @@ static NSLock *sEarlyLock;
 // runTestsInBackground: — the passcode prompt on first launch can interrupt the
 // XCTest bootstrap so the test method never runs and the server never comes up.
 static BOOL sTestStarted = NO;
+static BOOL sEarlyBackgroundArmed = NO;
 
 // Set to YES by Swift (via +[EarlyURLHook markSetUpEntered]) the moment
 // setUpWithError runs. This distinguishes the two failure modes:
@@ -248,11 +249,85 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
     // only OBSERVE and log; recovery of a truly-dead bootstrap needs an external
     // relaunch (see notes in the repo).
     [self armBootstrapObserver];
+    [self armEarlyBackgrounding];
 }
 
 /// Diagnostic observer: logs the bootstrap-relevant lifecycle events (retry
 /// window + didBecomeActive) so a passcode repro is fully traceable, but never
 /// calls runTestsInBackground:. Idempotent.
+/// Get the runner out of the foreground BEFORE XCTest's bootstrap needs it.
+///
+/// Observed on iOS 26: after the icon is tapped, +load runs and the scene
+/// connects, then nothing happens — setUpWithError is never reached — until the
+/// user manually backgrounds the app, at which point bootstrap completes in
+/// under a second. Whatever XCTest waits on resolves once the runner stops
+/// being frontmost.
+///
+/// That wait sits BEFORE setUp, so backgrounding from inside the test method is
+/// too late: the code never runs. It has to happen here.
+///
+/// Runs on a short timer rather than inline. XCTest is not initialised at +load
+/// — calling into it there is what previously aborted the runner — and
+/// XCDeviceEvent is an XCTest class, so it needs a moment to exist. Two seconds
+/// is late enough for that and well inside the observed ~10s stall.
++ (void)armEarlyBackgrounding {
+    if (sEarlyBackgroundArmed) { return; }
+    sEarlyBackgroundArmed = YES;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        // Bootstrap already moved on? Leave the foreground alone — the test is
+        // running and something else may legitimately own the screen.
+        if (sSetUpEntered || sTestStarted) {
+            earlyLog(@"🏠 early-background skipped — bootstrap already progressed");
+            return;
+        }
+        @try {
+            Class eventClass = NSClassFromString(@"XCDeviceEvent");
+            Class deviceClass = NSClassFromString(@"XCUIDevice");
+            if (!eventClass || !deviceClass) {
+                earlyLog(@"🏠 early-background unavailable — XCTest classes not loaded");
+                return;
+            }
+            SEL make = NSSelectorFromString(@"deviceEventWithPage:usage:duration:");
+            if (![eventClass respondsToSelector:make]) { return; }
+            NSMethodSignature *sig = [eventClass methodSignatureForSelector:make];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = eventClass;
+            inv.selector = make;
+            unsigned int page = 0x0C;      // kHIDPage_Consumer
+            unsigned int usage = 0x40;     // kHIDUsage_Csmr_Menu (Home)
+            NSTimeInterval duration = 0.005;
+            [inv setArgument:&page atIndex:2];
+            [inv setArgument:&usage atIndex:3];
+            [inv setArgument:&duration atIndex:4];
+            [inv invoke];
+            __unsafe_unretained id event = nil;
+            [inv getReturnValue:&event];
+            if (!event) { return; }
+
+            id device = [deviceClass performSelector:@selector(sharedDevice)];
+            SEL perform = NSSelectorFromString(@"performDeviceEvent:error:");
+            if (!device || ![device respondsToSelector:perform]) { return; }
+            NSMethodSignature *psig = [device methodSignatureForSelector:perform];
+            NSInvocation *pinv = [NSInvocation invocationWithMethodSignature:psig];
+            pinv.target = device;
+            pinv.selector = perform;
+            NSError *err = nil;
+            __unsafe_unretained id evt = event;
+            [pinv setArgument:&evt atIndex:2];
+            [pinv setArgument:&err atIndex:3];
+            [pinv invoke];
+            BOOL ok = NO;
+            [pinv getReturnValue:&ok];
+            earlyLog(ok ? @"🏠 early-background: Home pressed via IOHID (pre-setUp)"
+                        : @"🏠 early-background: IOHID press returned NO");
+        } @catch (NSException *e) {
+            earlyLog([NSString stringWithFormat:@"🏠 early-background raised: %@", e.reason]);
+        }
+    });
+}
+
 + (void)armBootstrapObserver {
     if (sPollArmed) { return; }
     sPollArmed = YES;
