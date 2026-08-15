@@ -28,11 +28,6 @@ static NSLock *sEarlyLock;
 // runTestsInBackground: — the passcode prompt on first launch can interrupt the
 // XCTest bootstrap so the test method never runs and the server never comes up.
 static BOOL sTestStarted = NO;
-static BOOL sEarlyBackgroundArmed = NO;
-/// Set when UIApplicationDidBecomeActive fires. The runner has no real UI
-/// scene, so UIApplication.applicationState never reports .active for it —
-/// the notification is the only signal that we reached the foreground.
-static BOOL sSawDidBecomeActive = NO;
 
 // Set to YES by Swift (via +[EarlyURLHook markSetUpEntered]) the moment
 // setUpWithError runs. This distinguishes the two failure modes:
@@ -261,221 +256,27 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
     // only OBSERVE and log; recovery of a truly-dead bootstrap needs an external
     // relaunch (see notes in the repo).
     [self armBootstrapObserver];
-    [self armEarlyBackgrounding];
 }
 
 /// Diagnostic observer: logs the bootstrap-relevant lifecycle events (retry
 /// window + didBecomeActive) so a passcode repro is fully traceable, but never
 /// calls runTestsInBackground:. Idempotent.
-/// Get the runner out of the foreground BEFORE XCTest's bootstrap needs it.
+/// Backgrounding is NOT done here.
 ///
-/// Observed on iOS 26: after the icon is tapped, +load runs and the scene
-/// connects, then nothing happens — setUpWithError is never reached — until the
-/// user manually backgrounds the app, at which point bootstrap completes in
-/// under a second. Whatever XCTest waits on resolves once the runner stops
-/// being frontmost.
+/// It used to be, on a timer from +load, to clear the pre-setUp stall. That is
+/// unsafe: on first launch XCTest puts up its own "enable UI automation"
+/// passcode prompt, and the device is *unlocked* while it is showing — so the
+/// lockstate check passes and suspending cancels the authorization, killing the
+/// launch outright.
 ///
-/// That wait sits BEFORE setUp, so backgrounding from inside the test method is
-/// too late: the code never runs. It has to happen here.
+/// There is no signal available this early that distinguishes "waiting on the
+/// automation prompt" from "idle in the foreground": the alert belongs to
+/// SpringBoard, and detecting it needs XCUIApplication, which is the very
+/// subsystem being authorized and is unsafe to touch before XCTest is up.
 ///
-/// Runs on a short timer rather than inline. XCTest is not initialised at +load
-/// — calling into it there is what previously aborted the runner — and
-/// XCDeviceEvent is an XCTest class, so it needs a moment to exist. Two seconds
-/// is late enough for that and well inside the observed ~10s stall.
-+ (void)armEarlyBackgrounding {
-    if (sEarlyBackgroundArmed) { return; }
-    sEarlyBackgroundArmed = YES;
-
-    [[NSNotificationCenter defaultCenter]
-        addObserverForName:UIApplicationDidBecomeActiveNotification
-                    object:nil queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification * _Nonnull note) {
-        sSawDidBecomeActive = YES;
-    }];
-    [self attemptEarlyBackgroundingWithRetriesRemaining:30];
-}
-
-/// Poll until the device is actually ready, then background once.
-///
-/// A fixed timer was wrong: on a locked device the runner launches behind the
-/// passcode screen, and firing blindly backgrounded it while the user was still
-/// typing — losing the launch they had just started. The conditions below are
-/// what "ready" means here, and none of them can be assumed after a set delay.
-///
-/// Retries every 0.5s. The cap only bounds the wait; if the device is still
-/// unusable after it, backgrounding is skipped rather than forced.
-+ (void)attemptEarlyBackgroundingWithRetriesRemaining:(NSInteger)retries {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        // Bootstrap already moved on? Leave the foreground alone — the test is
-        // running and something else may legitimately own the screen.
-        if (sSetUpEntered || sTestStarted) {
-            earlyLog(@"🏠 early-background skipped — bootstrap already progressed");
-            return;
-        }
-
-        // 1. Not while the device is locked. The runner can be launched from the
-        //    lock screen (or during a passcode prompt); backgrounding then throws
-        //    away the launch the user is in the middle of.
-        static int lockToken = -1;
-        uint64_t lockState = 0;
-        if (lockToken == -1) {
-            if (notify_register_check("com.apple.springboard.lockstate", &lockToken) != NOTIFY_STATUS_OK) {
-                lockToken = -2;   // unavailable; fall through rather than block forever
-            }
-        }
-        if (lockToken >= 0 && notify_get_state(lockToken, &lockState) == NOTIFY_STATUS_OK && lockState != 0) {
-            if (retries > 0) {
-                [self attemptEarlyBackgroundingWithRetriesRemaining:retries - 1];
-            } else {
-                earlyLog(@"🏠 early-background gave up — device still locked");
-            }
-            return;
-        }
-
-        // 2. Not until we have actually reached the foreground once.
-        //
-        //    Checking applicationState here was wrong and blocked this entirely:
-        //    the log showed didBecomeActive firing at 18:37:32 while the state
-        //    check still said "never became active" 15s later. An XCTest runner
-        //    has no real UI scene, so that property never reports .active for it.
-        //    The notification is the signal that works.
-        if (!sSawDidBecomeActive) {
-            if (retries > 0) {
-                [self attemptEarlyBackgroundingWithRetriesRemaining:retries - 1];
-            } else {
-                earlyLog(@"🏠 early-background gave up — never became active");
-            }
-            return;
-        }
-        @try {
-            // Leave the foreground by OPENING ANOTHER APP, not by pressing Home.
-            //
-            // IOHID Menu was tried first and is a dead end here: the call returns
-            // YES and the log said "pressed", but bootstrap still stalled the
-            // full 11s until the user intervened — so the event either never
-            // landed or backgrounding isn't what releases it. Either way,
-            // synthesised button events are not a mechanism to rely on (the same
-            // silent-success failure Appium documented in WDA PR #1171).
-            //
-            // XCTRunnerDaemonSession is different: it's the sanctioned way for a
-            // runner to open a URL, it is already how the ictrl:// callback
-            // returns to the host app, and it is observed to work on this OS.
-            // Opening the host app both removes the runner from the foreground
-            // and puts something useful there.
-            Class sessionClass = NSClassFromString(@"XCTRunnerDaemonSession");
-            if (!sessionClass) {
-                earlyLog(@"🏠 early-background unavailable — XCTRunnerDaemonSession missing");
-                return;
-            }
-            id session = [sessionClass performSelector:@selector(sharedSession)];
-            SEL sel = NSSelectorFromString(@"openDefaultApplicationForURL:completion:");
-            if (!session || ![session respondsToSelector:sel]) {
-                earlyLog(@"🏠 early-background unavailable — daemon session can't open URLs yet");
-                return;
-            }
-
-            // Private suspend APIs first. This build is developer-distributed and
-            // never goes near App Review, so a private call is fair game — and
-            // asking UIKit to suspend us is far more direct than opening some
-            // other app and hoping that displaces us.
-            //
-            // Which of these exists varies by iOS version, so probe rather than
-            // assume: the log names what was found and what worked, which is the
-            // information needed if this ever breaks again.
-            UIApplication *app = UIApplication.sharedApplication;
-            NSArray<NSString *> *suspendSelectors = @[
-                @"suspend",                    // classic, long-lived
-                @"_suspend",
-                @"suspendWithCompletion:",     // newer variants
-                @"_suspendWithCompletion:",
-            ];
-            // Record which of these the OS still has, so a future failure starts
-            // from fact rather than another round of guessing.
-            NSMutableArray<NSString *> *available = [NSMutableArray array];
-            for (NSString *n in suspendSelectors) {
-                if ([app respondsToSelector:NSSelectorFromString(n)]) { [available addObject:n]; }
-            }
-            earlyLog([NSString stringWithFormat:@"🏠 suspend selectors present: %@",
-                      available.count ? [available componentsJoinedByString:@", "] : @"(none)"]);
-            for (NSString *name in suspendSelectors) {
-                SEL sus = NSSelectorFromString(name);
-                if (![app respondsToSelector:sus]) { continue; }
-                earlyLog([NSString stringWithFormat:@"🏠 early-background: trying -[UIApplication %@]", name]);
-                @try {
-                    if ([name hasSuffix:@":"]) {
-                        // Takes a completion block; pass an empty one.
-                        void (^done)(void) = ^{};
-                        NSMethodSignature *ssig = [app methodSignatureForSelector:sus];
-                        NSInvocation *sinv = [NSInvocation invocationWithMethodSignature:ssig];
-                        sinv.target = app;
-                        sinv.selector = sus;
-                        [sinv setArgument:&done atIndex:2];
-                        [sinv invoke];
-                    } else {
-                        ((void (*)(id, SEL))objc_msgSend)(app, sus);
-                    }
-                    // Give UIKit a moment, then see whether it took.
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        // Advisory only: applicationState is unreliable in a
-                        // runner (it never reports .active), so "still active"
-                        // here is weak evidence, not a verdict.
-                        UIApplicationState st = UIApplication.sharedApplication.applicationState;
-                        earlyLog([NSString stringWithFormat:@"🏠 -[UIApplication %@] done (state=%ld)",
-                                  name, (long)st]);
-                    });
-                    return;
-                } @catch (NSException *e) {
-                    earlyLog([NSString stringWithFormat:@"🏠 %@ raised: %@", name, e.reason]);
-                }
-            }
-            earlyLog(@"🏠 early-background: no usable suspend selector — falling back to opening an app");
-
-            // Settings first: it ships with iOS, so it is always there. The host
-            // app registers ictrl-app:// but the two IPAs install separately —
-            // the runner can be present without it, and opening a scheme nobody
-            // handles would leave us in the foreground.
-            NSArray<NSString *> *candidates = @[@"App-prefs:", @"ictrl-app://runner-starting"];
-            BOOL opened = NO;
-            for (NSString *candidate in candidates) {
-                NSURL *url = [NSURL URLWithString:candidate];
-                if (!url) { continue; }
-                __block BOOL ok = NO;
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                [session openDefaultApplicationForURL:url completion:^(BOOL result, NSError *err) {
-                    ok = result && (err == nil);
-                    dispatch_semaphore_signal(sem);
-                }];
-                // Bounded: this runs on the main queue and must not wedge it.
-                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)));
-                if (ok) {
-                    earlyLog([NSString stringWithFormat:@"🏠 early-background: opened %@ (pre-setUp)", candidate]);
-                    opened = YES;
-                    break;
-                }
-                earlyLog([NSString stringWithFormat:@"🏠 early-background: %@ did not open", candidate]);
-            }
-            if (!opened) {
-                earlyLog(@"🏠 early-background: no URL opened — runner stays in front");
-                return;
-            }
-
-            // Confirm the foreground actually moved. Every previous attempt here
-            // reported success from an API return value and was wrong — the IOHID
-            // press logged "pressed" while bootstrap stalled anyway. UIApplication
-            // state is a first-party signal and needs no XCTest.
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                // Advisory: see note above on applicationState in a runner.
-                UIApplicationState state = UIApplication.sharedApplication.applicationState;
-                earlyLog([NSString stringWithFormat:@"🏠 early-background: URL opened (state=%ld)", (long)state]);
-            });
-        } @catch (NSException *e) {
-            earlyLog([NSString stringWithFormat:@"🏠 early-background raised: %@", e.reason]);
-        }
-    });
-}
+/// So the runner now backgrounds itself from the test body instead, where
+/// reaching that line is itself proof that bootstrap completed and any prompt
+/// was answered. See `backgroundSelfNow` in iCTRLUITests.swift.
 
 + (void)armBootstrapObserver {
     if (sPollArmed) { return; }

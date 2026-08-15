@@ -255,6 +255,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // watchdog timer that's about to fire sees the flag and stays a no-op.
         EarlyURLHook.markTestStarted()
 
+
         // Bound XCTest's application-state wait now that bootstrap is behind us.
         // Doing this any earlier also bounds -[XCUIDevice enableAutomationMode:],
         // which waits for the accessibility server to come up; that wait exceeds
@@ -368,6 +369,20 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // If launched via ictrl://start?callback=..., jump back to the caller now.
         handlePendingCallbackIfAny()
 
+        // Background the runner now that the server is listening.
+        //
+        // Reaching this point is the signal that could not be obtained any
+        // earlier: XCTest's bootstrap completed, which means its "enable UI
+        // automation" passcode prompt — if one was shown — has been answered.
+        // Suspending from +load on a timer cancelled that authorization and
+        // killed the launch outright.
+        //
+        // After the listener is up rather than before it, so suspension can't
+        // curtail the startup work still to be done. A foreground runner gets
+        // killed after a while and its UI is an empty XCTest shell, so there is
+        // nothing lost by stepping aside once there is something to serve.
+        backgroundSelfNow()
+
         Self.logBuffer.append("🔁 entering run loop (keepRunning=\(keepRunning))")
         // WDA-style run loop: block on distantFuture instead of a 0.2s poll. The
         // run loop wakes on any input source — the RPC queue's main.sync, server
@@ -391,6 +406,28 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Only reached when keepRunning was set false (stop_server / notification /
         // config restart). If we ever get here unexpectedly, the log shows it.
         Self.logBuffer.append("🔁 run loop exited (keepRunning=false)")
+    }
+
+    /// Step out of the foreground via -[UIApplication suspend].
+    ///
+    /// `suspend` is the only one of the four probed selectors that iOS 26 still
+    /// has, and it is what finally worked — pressing Home through XCUIDevice or
+    /// IOHID reported success while doing nothing, the silent-confirmation
+    /// failure Appium documented in WDA PR #1171.
+    private func backgroundSelfNow() {
+        let app = UIApplication.shared
+        let sel = NSSelectorFromString("suspend")
+        guard app.responds(to: sel) else {
+            Self.logBuffer.append("🏠 auto-background unavailable — no suspend selector")
+            return
+        }
+        // Wrapped: a throw inside XCTest aborts the runner, and failing to
+        // background must never be worse than staying in front.
+        let raised = ObjCException.catching {
+            _ = app.perform(sel)
+        }
+        Self.logBuffer.append(raised.map { "🏠 auto-background raised: \($0)" }
+                              ?? "🏠 auto-backgrounded via -[UIApplication suspend]")
     }
 
     // MARK: - URL Scheme Callback
