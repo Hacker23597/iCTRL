@@ -19,33 +19,41 @@ struct DDIMountView: View {
     @State private var downloadError: String?
     @State private var vpnInstalled = false
     @State private var tunnelUp = false
+    @State private var onWiFi = false
 
     /// All three prerequisites, in the order the steps present them. The tunnel
     /// is included because it drops on every reboot — leaving it out let the
     /// mount fail with a socket error naming nothing the user could act on.
-    private var canMount: Bool { tunnelUp && hasPairingFile && imagesReady && !mounter.isRunning }
+    /// All prerequisites, in the order the steps present them. Wi-Fi is included
+    /// because the tunnel needs a local interface that cellular doesn't offer.
+    private var canMount: Bool {
+        imagesReady && onWiFi && tunnelUp && hasPairingFile && !mounter.isRunning
+    }
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    Text("Mount the Developer Disk Image without a Mac. iOS needs it before "
-                       + "the automation runner can launch, and it does not survive a reboot.")
+                    Text(L10n.t(.mountIntro))
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
 
+                // Order matters: download the image before touching the VPN.
+                // The tunnel takes over local networking, so fetching ~100MB
+                // afterwards is asking for a stalled download.
+                imageSection
+                wifiSection
                 tunnelSection
                 pairingSection
-                imageSection
                 mountSection
             }
             .listStyle(.insetGrouped)
-            .navigationTitle("Mount DDI")
+            .navigationTitle(L10n.t(.mountTitle))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") { dismiss() }
+                    Button(L10n.t(.doneButton)) { dismiss() }
                 }
             }
             .onAppear { refreshVPNState() }
@@ -72,17 +80,19 @@ struct DDIMountView: View {
 
     /// Names the first unmet prerequisite, so a disabled button explains itself.
     private var missingPrerequisite: String {
+        if !imagesReady { return L10n.t(.imagesNotDownloaded) }
+        if !onWiFi { return L10n.t(.notOnWiFi) }
         if !tunnelUp {
-            return vpnInstalled ? "LocalDevVPN isn't connected" : "LocalDevVPN isn't installed"
+            return vpnInstalled ? L10n.t(.vpnNotConnected) : L10n.t(.vpnNotInstalled)
         }
-        if !hasPairingFile { return "no pairing file imported" }
-        if !imagesReady { return "the image files aren't downloaded" }
+        if !hasPairingFile { return L10n.t(.noPairingFile) }
         return "something is missing"
     }
 
     private func refreshVPNState() {
         vpnInstalled = LocalDevVPN.isInstalled
         tunnelUp = LocalDevVPN.isTunnelUp()
+        onWiFi = NetworkTypeMonitor.shared.current == .wifi
     }
 
     // ① The tunnel. LocalDevVPN exposes localdevvpn://enable?scheme=…, so this
@@ -90,16 +100,16 @@ struct DDIMountView: View {
     //    of just naming an app and hoping.
     private var tunnelSection: some View {
         Section {
-            stepRow(1, done: tunnelUp,
-                    title: "Start LocalDevVPN",
+            stepRow(3, done: tunnelUp,
+                    title: L10n.t(.startLocalDevVPN),
                     detail: tunnelUp
-                        ? "Tunnel is up — this device's debug service is reachable at \(DDIMounter.tunnelAddress)."
+                        ? "\(L10n.t(.tunnelUpDetail)) (\(DDIMounter.tunnelAddress))"
                         : vpnInstalled
-                          ? "Installed. Connect it so this device's debug service becomes reachable at \(DDIMounter.tunnelAddress)."
-                          : "Not installed. It makes this device's debug service reachable — iCTRL then talks to it the same way Xcode on a Mac would.")
+                          ? "\(L10n.t(.vpnInstalledDetail)) (\(DDIMounter.tunnelAddress))"
+                          : L10n.t(.vpnMissingDetail))
 
             if !tunnelUp {
-                actionButton(vpnInstalled ? "Open LocalDevVPN & connect" : "Get LocalDevVPN on the App Store") {
+                actionButton(vpnInstalled ? L10n.t(.openVPNAndConnect) : L10n.t(.getVPNFromAppStore)) {
                     // enable? starts the tunnel and bounces back to us; the bare
                     // App Store link is the fallback when it isn't installed.
                     UIApplication.shared.open(vpnInstalled ? LocalDevVPN.enableURL
@@ -107,32 +117,43 @@ struct DDIMountView: View {
                 }
             }
         } header: {
-            Text("Prerequisite")
+            Text(L10n.t(.prerequisiteHeader))
         } footer: {
             if tunnelUp {
-                Text("Detected by the tunnel's address being present on this device.")
+                Text(L10n.t(.tunnelDetectedFooter))
             } else {
-                Text("iCTRL can't connect the VPN for you — tapping above opens it to do that. "
-                   + "If mounting still fails to connect, check it there first.")
+                Text(L10n.t(.cannotStartVPNFooter))
             }
+        }
+    }
+
+    // ② Wi-Fi. The tunnel rides the local network interface, which cellular
+    //    does not provide — so any Wi-Fi will do, but some Wi-Fi is required.
+    private var wifiSection: some View {
+        Section {
+            stepRow(2, done: onWiFi,
+                    title: L10n.t(.wifiRequired),
+                    detail: onWiFi ? L10n.t(.wifiConnected) : L10n.t(.wifiMissing))
+        } footer: {
+            Text(L10n.t(.wifiFooter))
         }
     }
 
     // ② The pairing file — proves to lockdownd that we're a trusted host.
     private var pairingSection: some View {
         Section {
-            stepRow(2, done: hasPairingFile,
-                    title: "Import a pairing file",
+            stepRow(4, done: hasPairingFile,
+                    title: L10n.t(.importPairingFile),
                     detail: hasPairingFile
-                        ? "Imported\(PairingFileStore.importedAt.map { " · " + $0.formatted(date: .abbreviated, time: .shortened) } ?? "")"
-                        : "Generate it on a Mac with `idevicepair pair`, then send it here (AirDrop, Files, iCloud).")
+                        ? "\(L10n.t(.pairingImported))\(PairingFileStore.importedAt.map { " · " + $0.formatted(date: .abbreviated, time: .shortened) } ?? "")"
+                        : L10n.t(.pairingHint))
 
-            actionButton(hasPairingFile ? "Replace pairing file…" : "Choose pairing file…") {
+            actionButton(hasPairingFile ? L10n.t(.replacePairingFile) : L10n.t(.choosePairingFile)) {
                 showPairingPicker = true
             }
 
             if hasPairingFile {
-                actionButton("Remove pairing file", role: .destructive) {
+                actionButton(L10n.t(.removePairingFile), role: .destructive) {
                     PairingFileStore.remove()
                     hasPairingFile = false
                 }
@@ -149,11 +170,11 @@ struct DDIMountView: View {
     // ③ The image itself.
     private var imageSection: some View {
         Section {
-            stepRow(3, done: imagesReady,
-                    title: "Developer Disk Image",
+            stepRow(1, done: imagesReady,
+                    title: L10n.t(.ddiComponentTitle),
                     detail: imagesReady
-                        ? "Downloaded · \(ByteCountFormatter.string(fromByteCount: DeveloperDiskImageStore.totalBytesOnDisk, countStyle: .file))"
-                        : "About 100 MB. Downloaded once and reused — only the mount has to be repeated after a reboot.")
+                        ? "\(L10n.t(.ddiDownloaded)) · \(ByteCountFormatter.string(fromByteCount: DeveloperDiskImageStore.totalBytesOnDisk, countStyle: .file))"
+                        : L10n.t(.ddiDownloadHint))
 
             if images.isDownloading {
                 VStack(alignment: .leading, spacing: 4) {
@@ -163,7 +184,7 @@ struct DDIMountView: View {
                     }
                 }
             } else if !imagesReady {
-                actionButton("Download image files") {
+                actionButton(L10n.t(.downloadImageFiles)) {
                     Task {
                         do {
                             try await images.download()
@@ -182,9 +203,7 @@ struct DDIMountView: View {
                     .foregroundColor(.orange)
             }
         } footer: {
-            Text("Fetched from the DeveloperDiskImage mirror maintained by the pymobiledevice3 "
-               + "author. Apple doesn't publish these for direct download; the same files ship "
-               + "inside Xcode.")
+            Text(L10n.t(.ddiSourceFooter))
         }
     }
 
@@ -195,7 +214,7 @@ struct DDIMountView: View {
                 Button {
                     Task { await mounter.mount() }
                 } label: {
-                    Label("Mount Developer Disk Image", systemImage: "externaldrive.badge.plus")
+                    Label(L10n.t(.mountButton), systemImage: "externaldrive.badge.plus")
                 }
                 .disabled(!canMount)
 
@@ -208,19 +227,19 @@ struct DDIMountView: View {
             case .uploading(let fraction):
                 VStack(alignment: .leading, spacing: 4) {
                     ProgressView(value: fraction)
-                    Text("Uploading image… \(Int(fraction * 100))%")
+                    Text("\(L10n.t(.uploadingImage)) \(Int(fraction * 100))%")
                         .font(.caption).foregroundColor(.secondary)
                 }
 
             case .mounted:
-                Label("Mounted — the automation runner can launch now",
+                Label(L10n.t(.mountedOK),
                       systemImage: "checkmark.circle.fill")
                     .foregroundColor(.green)
             }
 
             if case .failed(let message) = mounter.phase {
                 VStack(alignment: .leading, spacing: 4) {
-                    Label("Mount failed", systemImage: "exclamationmark.triangle.fill")
+                    Label(L10n.t(.mountFailed), systemImage: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
                     Text(message)
                         .font(.caption)
@@ -230,13 +249,11 @@ struct DDIMountView: View {
             }
         } footer: {
             if case .mounted = mounter.phase {
-                Text("The image is not persistent — after a reboot, run this again. "
-                   + "The pairing file and downloaded image are kept, so it's one tap.")
+                Text(L10n.t(.mountNotPersistentFooter))
             } else if !canMount, !mounter.isRunning {
-                Text("Finish the steps above first — \(missingPrerequisite).")
+                Text("\(L10n.t(.finishStepsFirst)) — \(missingPrerequisite).")
             } else {
-                Text("The first mount asks Apple's signing service for a ticket unique to this "
-                   + "device, so it needs internet access.")
+                Text(L10n.t(.firstMountNetworkFooter))
             }
         }
     }

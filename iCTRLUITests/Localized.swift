@@ -43,6 +43,33 @@ enum L10n {
         case remoteFailedBody, remoteDisabledBody
         case authRequestBody       // %@ = client name
         case onDeviceOnlySuffix
+
+        // ── Host app UI ──
+        //
+        // Only English and Chinese are filled in for these: the rest fall back to
+        // English, which is the point of having a fallback. Technical strings the
+        // user would search for or paste into a bug report (FFI errors, HTTP
+        // status, bundle ids) are deliberately NOT here — translating them makes
+        // them harder to look up, not easier.
+        case runtimeRequirements, developerDiskImage, mountPoint
+        case mountWithoutMac, remount
+        case ddiReadyFooter
+        case serverSectionTitle, statusLabel, addressLabel, checking, running, stopped
+        case startServer, stopServerButton, serverLabel, protocolLabel, methodsLabel, capabilitiesLabel
+        case serverRunningFooter, mountFirstFooter, startOpensRunnerFooter
+        case deviceSection, modelLabel, systemLabel, screenLabel, nameLabel
+        case aboutSection, versionLabel, logsLabel, logsFooter
+        case alternativeSection, alternativeFooter
+        case mountTitle, doneButton, prerequisiteHeader
+        case startLocalDevVPN, tunnelUpDetail, vpnInstalledDetail, vpnMissingDetail
+        case openVPNAndConnect, getVPNFromAppStore, tunnelDetectedFooter, cannotStartVPNFooter
+        case importPairingFile, choosePairingFile, replacePairingFile, removePairingFile
+        case pairingHint, pairingImported
+        case ddiComponentTitle, ddiDownloadHint, ddiDownloaded, downloadImageFiles, ddiSourceFooter
+        case mountButton, mountedOK, mountFailed, mountNotPersistentFooter, firstMountNetworkFooter
+        case finishStepsFirst, vpnNotConnected, vpnNotInstalled, noPairingFile, imagesNotDownloaded
+        case wifiRequired, wifiConnected, wifiMissing, wifiFooter, notOnWiFi
+        case mountIntro, uploadingImage
     }
 
     // key → (lang → text). English is the required fallback for every key.
@@ -114,5 +141,125 @@ enum L10n {
                               .es: "accesible solo en el dispositivo; conéctate por Wi-Fi para acceso LAN",
                               .de: "nur auf dem Gerät erreichbar; für LAN-Zugriff mit WLAN verbinden",
                               .ru: "доступно только на устройстве; для доступа по LAN подключитесь к Wi-Fi"],
+
+        // ── Host app UI (English base, Chinese translations) ──
+        .runtimeRequirements: [.en: "Runtime Requirements", .zhHans: "运行环境要求", .zhHant: "執行環境需求"],
+        .developerDiskImage: [.en: "Developer Disk Image", .zhHans: "开发者磁盘镜像", .zhHant: "開發者磁碟映像"],
+        .mountPoint: [.en: "Mount point", .zhHans: "挂载位置", .zhHant: "掛載位置"],
+        .mountWithoutMac: [.en: "Mount without a Mac…", .zhHans: "无需 Mac 挂载…", .zhHant: "無需 Mac 掛載…"],
+        .remount: [.en: "Re-mount…", .zhHans: "重新挂载…", .zhHant: "重新掛載…"],
+        .ddiReadyFooter: [.en: "The automation runner can launch on this device. The image is dropped by a reboot — re-mount if the runner stops starting.",
+                          .zhHans: "自动化 runner 可以在这台设备上启动。镜像会在重启后丢失——如果 runner 起不来，重新挂载即可。",
+                          .zhHant: "自動化 runner 可以在這台裝置上啟動。映像會在重新開機後遺失——如果 runner 起不來，重新掛載即可。"],
+
+        .serverSectionTitle: [.en: "iCTRL Server (Local)", .zhHans: "iCTRL 服务（本机）", .zhHant: "iCTRL 服務（本機）"],
+        .statusLabel: [.en: "Status", .zhHans: "状态", .zhHant: "狀態"],
+        .addressLabel: [.en: "Address", .zhHans: "地址", .zhHant: "位址"],
+        .checking: [.en: "Checking…", .zhHans: "检测中…", .zhHant: "檢測中…"],
+        .running: [.en: "Running", .zhHans: "运行中", .zhHant: "執行中"],
+        .stopped: [.en: "Stopped", .zhHans: "已停止", .zhHant: "已停止"],
+        .startServer: [.en: "Start Server", .zhHans: "启动服务", .zhHant: "啟動服務"],
+        .stopServerButton: [.en: "Stop Server", .zhHans: "停止服务", .zhHant: "停止服務"],
+        .serverLabel: [.en: "Server", .zhHans: "服务版本", .zhHant: "服務版本"],
+        .protocolLabel: [.en: "Protocol", .zhHans: "协议", .zhHant: "協定"],
+        .methodsLabel: [.en: "Methods", .zhHans: "方法数", .zhHant: "方法數"],
+        .capabilitiesLabel: [.en: "Capabilities", .zhHans: "能力", .zhHant: "能力"],
+        .serverRunningFooter: [.en: "Automation clients connect here; every request is encrypted.",
+                               .zhHans: "自动化客户端连接到这里；每个请求都是加密的。",
+                               .zhHant: "自動化用戶端連線到這裡；每個請求都是加密的。"],
+        .mountFirstFooter: [.en: "Mount the Developer Disk Image first — without it the runner can't launch.",
+                            .zhHans: "请先挂载开发者磁盘镜像——没有它 runner 无法启动。",
+                            .zhHant: "請先掛載開發者磁碟映像——沒有它 runner 無法啟動。"],
+        .startOpensRunnerFooter: [.en: "The server runs inside the automation runner. Starting it opens that app.",
+                                  .zhHans: "服务运行在自动化 runner 里。启动会打开那个 App。",
+                                  .zhHant: "服務執行在自動化 runner 裡。啟動會開啟那個 App。"],
+
+        .deviceSection: [.en: "Device", .zhHans: "设备", .zhHant: "裝置"],
+        .modelLabel: [.en: "Model", .zhHans: "型号", .zhHant: "型號"],
+        .systemLabel: [.en: "System", .zhHans: "系统", .zhHant: "系統"],
+        .screenLabel: [.en: "Screen", .zhHans: "屏幕", .zhHant: "螢幕"],
+        .nameLabel: [.en: "Name", .zhHans: "名称", .zhHant: "名稱"],
+
+        .aboutSection: [.en: "About", .zhHans: "关于", .zhHant: "關於"],
+        .versionLabel: [.en: "Version", .zhHans: "版本", .zhHant: "版本"],
+        .logsLabel: [.en: "Logs", .zhHans: "日志", .zhHant: "日誌"],
+        .logsFooter: [.en: "One log per run, kept for the last 20. Tap to read or share one.",
+                      .zhHans: "每次运行一份日志，保留最近 20 份。点击可查看或分享。",
+                      .zhHant: "每次執行一份日誌，保留最近 20 份。點擊可檢視或分享。"],
+
+        .alternativeSection: [.en: "Alternative", .zhHans: "备选方案", .zhHant: "備選方案"],
+        .alternativeFooter: [.en: "The Developer Disk Image doesn't survive a reboot, so mounting has to be repeated after each restart — by either route.",
+                             .zhHans: "开发者磁盘镜像重启后会丢失，所以每次重启都要重新挂载——两种方式都一样。",
+                             .zhHant: "開發者磁碟映像重新開機後會遺失，所以每次重啟都要重新掛載——兩種方式都一樣。"],
+
+        .mountTitle: [.en: "Mount DDI", .zhHans: "挂载 DDI", .zhHant: "掛載 DDI"],
+        .doneButton: [.en: "Done", .zhHans: "完成", .zhHant: "完成"],
+        .prerequisiteHeader: [.en: "Prerequisite", .zhHans: "前置条件", .zhHant: "前置條件"],
+        .startLocalDevVPN: [.en: "Start LocalDevVPN", .zhHans: "启动 LocalDevVPN", .zhHant: "啟動 LocalDevVPN"],
+        .tunnelUpDetail: [.en: "Tunnel is up — this device's debug service is reachable.",
+                          .zhHans: "隧道已连接——本机调试服务可达。",
+                          .zhHant: "通道已連線——本機除錯服務可達。"],
+        .vpnInstalledDetail: [.en: "Installed. Connect it so this device's debug service becomes reachable.",
+                              .zhHans: "已安装。连接后本机调试服务才可达。",
+                              .zhHant: "已安裝。連線後本機除錯服務才可達。"],
+        .vpnMissingDetail: [.en: "Not installed. It makes this device's debug service reachable — iCTRL then talks to it the same way Xcode on a Mac would.",
+                            .zhHans: "未安装。它让本机的调试服务变得可达——iCTRL 随后以 Mac 上 Xcode 的同样方式与之通信。",
+                            .zhHant: "未安裝。它讓本機的除錯服務變得可達——iCTRL 隨後以 Mac 上 Xcode 的同樣方式與之通訊。"],
+        .openVPNAndConnect: [.en: "Open LocalDevVPN & connect", .zhHans: "打开 LocalDevVPN 并连接", .zhHant: "開啟 LocalDevVPN 並連線"],
+        .getVPNFromAppStore: [.en: "Get LocalDevVPN on the App Store", .zhHans: "在 App Store 获取 LocalDevVPN", .zhHant: "在 App Store 取得 LocalDevVPN"],
+        .tunnelDetectedFooter: [.en: "Detected by the tunnel's address being present on this device.",
+                                .zhHans: "依据本机是否出现隧道地址来判断。",
+                                .zhHant: "依據本機是否出現通道位址來判斷。"],
+        .cannotStartVPNFooter: [.en: "iCTRL can't connect the VPN for you — tapping above opens it to do that. If mounting still fails to connect, check it there first.",
+                                .zhHans: "iCTRL 无法替你连接 VPN——点击上面会打开它去连接。如果挂载仍然连不上，请先去那里检查。",
+                                .zhHant: "iCTRL 無法替你連線 VPN——點擊上面會開啟它去連線。如果掛載仍然連不上，請先去那裡檢查。"],
+
+        .importPairingFile: [.en: "Import a pairing file", .zhHans: "导入配对文件", .zhHant: "匯入配對檔案"],
+        .choosePairingFile: [.en: "Choose pairing file…", .zhHans: "选择配对文件…", .zhHant: "選擇配對檔案…"],
+        .replacePairingFile: [.en: "Replace pairing file…", .zhHans: "更换配对文件…", .zhHant: "更換配對檔案…"],
+        .removePairingFile: [.en: "Remove pairing file", .zhHans: "删除配对文件", .zhHant: "刪除配對檔案"],
+        .pairingHint: [.en: "Generate it on a Mac with `idevicepair pair`, then send it here (AirDrop, Files, iCloud).",
+                       .zhHans: "在 Mac 上用 `idevicepair pair` 生成，然后传到这里（隔空投送、文件、iCloud）。",
+                       .zhHant: "在 Mac 上用 `idevicepair pair` 產生，然後傳到這裡（AirDrop、檔案、iCloud）。"],
+        .pairingImported: [.en: "Imported", .zhHans: "已导入", .zhHant: "已匯入"],
+
+        .ddiComponentTitle: [.en: "Developer Disk Image", .zhHans: "开发者磁盘镜像", .zhHant: "開發者磁碟映像"],
+        .ddiDownloadHint: [.en: "About 100 MB. Downloaded once and reused — only the mount has to be repeated after a reboot.",
+                           .zhHans: "约 100 MB。只需下载一次并重复使用——重启后只需重新挂载。",
+                           .zhHant: "約 100 MB。只需下載一次並重複使用——重新開機後只需重新掛載。"],
+        .ddiDownloaded: [.en: "Downloaded", .zhHans: "已下载", .zhHant: "已下載"],
+        .downloadImageFiles: [.en: "Download image files", .zhHans: "下载镜像文件", .zhHant: "下載映像檔案"],
+        .ddiSourceFooter: [.en: "Fetched from the DeveloperDiskImage mirror maintained by the pymobiledevice3 author. Apple doesn't publish these for direct download; the same files ship inside Xcode.",
+                           .zhHans: "取自 pymobiledevice3 作者维护的 DeveloperDiskImage 镜像源。苹果不提供直接下载；相同文件随 Xcode 一起分发。",
+                           .zhHant: "取自 pymobiledevice3 作者維護的 DeveloperDiskImage 鏡像源。蘋果不提供直接下載；相同檔案隨 Xcode 一起分發。"],
+
+        .mountButton: [.en: "Mount Developer Disk Image", .zhHans: "挂载开发者磁盘镜像", .zhHant: "掛載開發者磁碟映像"],
+        .mountedOK: [.en: "Mounted — the automation runner can launch now", .zhHans: "已挂载——自动化 runner 现在可以启动了", .zhHant: "已掛載——自動化 runner 現在可以啟動了"],
+        .mountFailed: [.en: "Mount failed", .zhHans: "挂载失败", .zhHant: "掛載失敗"],
+        .mountNotPersistentFooter: [.en: "The image is not persistent — after a reboot, run this again. The pairing file and downloaded image are kept, so it's one tap.",
+                                    .zhHans: "镜像不会持久保留——重启后需要再来一次。配对文件和已下载的镜像会保留，所以只需点一下。",
+                                    .zhHant: "映像不會持久保留——重新開機後需要再來一次。配對檔案和已下載的映像會保留，所以只需點一下。"],
+        .firstMountNetworkFooter: [.en: "The first mount asks Apple's signing service for a ticket unique to this device, so it needs internet access.",
+                                   .zhHans: "首次挂载会向苹果签名服务申请本机专属的票据，因此需要联网。",
+                                   .zhHant: "首次掛載會向蘋果簽名服務申請本機專屬的票據，因此需要連網。"],
+
+        .finishStepsFirst: [.en: "Finish the steps above first", .zhHans: "请先完成上面的步骤", .zhHant: "請先完成上面的步驟"],
+        .vpnNotConnected: [.en: "LocalDevVPN isn't connected", .zhHans: "LocalDevVPN 未连接", .zhHant: "LocalDevVPN 未連線"],
+        .vpnNotInstalled: [.en: "LocalDevVPN isn't installed", .zhHans: "LocalDevVPN 未安装", .zhHant: "LocalDevVPN 未安裝"],
+        .noPairingFile: [.en: "no pairing file imported", .zhHans: "尚未导入配对文件", .zhHant: "尚未匯入配對檔案"],
+        .imagesNotDownloaded: [.en: "the image files aren't downloaded", .zhHans: "镜像文件尚未下载", .zhHant: "映像檔案尚未下載"],
+        .wifiRequired: [.en: "Connect to Wi-Fi", .zhHans: "连接 Wi-Fi", .zhHant: "連線 Wi-Fi"],
+        .wifiConnected: [.en: "Connected. Any network will do.", .zhHans: "已连接。任意 Wi-Fi 均可。", .zhHant: "已連線。任意 Wi-Fi 均可。"],
+        .wifiMissing: [.en: "Not on Wi-Fi. Mounting needs it — cellular alone won't do.",
+                       .zhHans: "当前不在 Wi-Fi 下。挂载需要 Wi-Fi——仅蜂窝网络不行。",
+                       .zhHant: "目前不在 Wi-Fi 下。掛載需要 Wi-Fi——僅行動網路不行。"],
+        .wifiFooter: [.en: "Any Wi-Fi network works. The tunnel runs over the local interface, which cellular doesn't provide.",
+                      .zhHans: "任意 Wi-Fi 都可以。隧道走本地网络接口，蜂窝网络不提供这个。",
+                      .zhHant: "任意 Wi-Fi 都可以。通道走本機網路介面，行動網路不提供這個。"],
+        .notOnWiFi: [.en: "not connected to Wi-Fi", .zhHans: "未连接 Wi-Fi", .zhHant: "未連線 Wi-Fi"],
+        .uploadingImage: [.en: "Uploading image…", .zhHans: "正在上传镜像…", .zhHant: "正在上傳映像…"],
+        .mountIntro: [.en: "Mount the Developer Disk Image without a Mac. iOS needs it before the automation runner can launch, and it does not survive a reboot.",
+                      .zhHans: "无需 Mac 即可挂载开发者磁盘镜像。iOS 要求先有它，自动化 runner 才能启动；且它在重启后会丢失。",
+                      .zhHant: "無需 Mac 即可掛載開發者磁碟映像。iOS 要求先有它，自動化 runner 才能啟動；且它在重新開機後會遺失。"],
     ]
 }

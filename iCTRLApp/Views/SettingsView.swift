@@ -72,9 +72,9 @@ struct SettingsView: View {
                         fallbackURL: Self.stikDebugSiteURL
                     )
                 } header: {
-                    Text("Alternative")
+                    Text(L10n.t(.alternativeSection))
                 } footer: {
-                    Text("The Developer Disk Image doesn't survive a reboot, so mounting has to be repeated after each restart — by either route.")
+                    Text(L10n.t(.alternativeFooter))
                 }
             }
 
@@ -96,13 +96,13 @@ struct SettingsView: View {
 
             Section {
                 HStack {
-                    Text("Version")
+                    Text(L10n.t(.versionLabel))
                     Spacer()
                     Text("1.0.0")
                         .foregroundColor(.secondary)
                 }
                 HStack {
-                    Text("Protocol")
+                    Text(L10n.t(.protocolLabel))
                     Spacer()
                     Text("JSON-RPC 2.0")
                         .foregroundColor(.secondary)
@@ -111,19 +111,19 @@ struct SettingsView: View {
                     LogListView()
                 } label: {
                     HStack {
-                        Text("Logs")
+                        Text(L10n.t(.logsLabel))
                         Spacer()
                         Text(verbatim: "\(logCount)")
                             .foregroundColor(.secondary)
                     }
                 }
             } header: {
-                Text("About")
+                Text(L10n.t(.aboutSection))
             } footer: {
                 // The mount runs through a Rust FFI that aborts rather than
                 // throws, so when it fails the log is often the only artifact
                 // besides a crash report — and it can be shared from here.
-                Text("One log per run, kept for the last 20. Tap to read or share one.")
+                Text(L10n.t(.logsFooter))
             }
         }
         .listStyle(.insetGrouped)
@@ -165,7 +165,7 @@ struct SettingsView: View {
     private var requirementsSection: some View {
         Section {
             HStack {
-                Text("Developer Disk Image")
+                Text(L10n.t(.developerDiskImage))
                 Spacer()
                 HStack(spacing: 6) {
                     Circle()
@@ -178,7 +178,7 @@ struct SettingsView: View {
 
             if let layout = ddi.layout {
                 HStack {
-                    Text("Mount point")
+                    Text(L10n.t(.mountPoint))
                     Spacer()
                     Text(layout.rawValue)
                         .font(.system(.body, design: .monospaced))
@@ -193,15 +193,14 @@ struct SettingsView: View {
             Button {
                 showMountSheet = true
             } label: {
-                Label(ddi.isMounted ? "Re-mount…" : "Mount without a Mac…",
+                Label(ddi.isMounted ? L10n.t(.remount) : L10n.t(.mountWithoutMac),
                       systemImage: ddi.isMounted ? "arrow.clockwise" : "externaldrive.badge.plus")
             }
         } header: {
-            Text("Runtime Requirements")
+            Text(L10n.t(.runtimeRequirements))
         } footer: {
             if ddi.isMounted {
-                Text("The automation runner can launch on this device. The image is dropped by a "
-                   + "reboot — re-mount if the runner stops starting.")
+                Text(L10n.t(.ddiReadyFooter))
             } else {
                 Text(ddi.advice ?? "The Developer Disk Image isn't mounted, so the automation "
                                  + "runner can't launch.")
@@ -217,12 +216,12 @@ struct SettingsView: View {
     /// asked when the runner won't start.
     private var deviceSection: some View {
         Section {
-            LabeledRow("Model", DeviceInfo.modelIdentifier)
-            LabeledRow("System", "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)")
-            LabeledRow("Screen", DeviceInfo.screenDescription)
-            LabeledRow("Name", UIDevice.current.name, monospaced: false)
+            LabeledRow(L10n.t(.modelLabel), DeviceInfo.modelIdentifier)
+            LabeledRow(L10n.t(.systemLabel), "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)")
+            LabeledRow(L10n.t(.screenLabel), DeviceInfo.screenDescription)
+            LabeledRow(L10n.t(.nameLabel), UIDevice.current.name, monospaced: false)
         } header: {
-            Text("Device")
+            Text(L10n.t(.deviceSection))
         }
     }
 
@@ -235,29 +234,29 @@ struct SettingsView: View {
     private var serverSection: some View {
         Section {
             HStack {
-                Text("Status")
+                Text(L10n.t(.statusLabel))
                 Spacer()
                 switch runner.state {
                 case .unknown, .checking:
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
-                        Text("Checking…").foregroundColor(.secondary)
+                        Text(L10n.t(.checking)).foregroundColor(.secondary)
                     }
                 case .running:
                     HStack(spacing: 6) {
                         Circle().fill(.green).frame(width: 8, height: 8)
-                        Text("Running").foregroundColor(.secondary)
+                        Text(L10n.t(.running)).foregroundColor(.secondary)
                     }
                 case .stopped:
                     HStack(spacing: 6) {
                         Circle().fill(.secondary).frame(width: 8, height: 8)
-                        Text("Stopped").foregroundColor(.secondary)
+                        Text(L10n.t(.stopped)).foregroundColor(.secondary)
                     }
                 }
             }
 
             HStack {
-                Text("Address")
+                Text(L10n.t(.addressLabel))
                 Spacer()
                 Text(verbatim: "127.0.0.1:\(appState.serverPort)")
                     .font(.system(.body, design: .monospaced))
@@ -267,7 +266,7 @@ struct SettingsView: View {
             if case .running(let info) = runner.state {
                 if let version = info.serverVersion {
                     HStack {
-                        Text("Server")
+                        Text(L10n.t(.serverLabel))
                         Spacer()
                         Text(verbatim: version)
                             .font(.system(.body, design: .monospaced))
@@ -276,7 +275,7 @@ struct SettingsView: View {
                 }
                 if let proto = info.protocolVersion {
                     HStack {
-                        Text("Protocol")
+                        Text(L10n.t(.protocolLabel))
                         Spacer()
                         Text(verbatim: "v\(proto)")
                             .font(.system(.body, design: .monospaced))
@@ -285,7 +284,7 @@ struct SettingsView: View {
                 }
                 if let methods = info.methodCount {
                     HStack {
-                        Text("Methods")
+                        Text(L10n.t(.methodsLabel))
                         Spacer()
                         Text(verbatim: "\(methods)")
                             .foregroundColor(.secondary)
@@ -296,7 +295,7 @@ struct SettingsView: View {
                         CapabilityListView(capabilities: info.capabilities)
                     } label: {
                         HStack {
-                            Text("Capabilities")
+                            Text(L10n.t(.capabilitiesLabel))
                             Spacer()
                             Text(verbatim: "\(info.capabilities.count)")
                                 .foregroundColor(.secondary)
@@ -306,7 +305,7 @@ struct SettingsView: View {
                 Button(role: .destructive) {
                     stopRunner()
                 } label: {
-                    Label("Stop Server", systemImage: "stop.fill")
+                    Label(L10n.t(.stopServerButton), systemImage: "stop.fill")
                 }
             } else {
                 // Start lives here rather than in the toolbar: it belongs beside
@@ -315,20 +314,19 @@ struct SettingsView: View {
                 Button {
                     startRunner()
                 } label: {
-                    Label("Start Server", systemImage: "play.fill")
+                    Label(L10n.t(.startServer), systemImage: "play.fill")
                 }
                 .disabled(!ddi.isMounted)
             }
         } header: {
-            Text("iCTRL Server (Local)")
+            Text(L10n.t(.serverSectionTitle))
         } footer: {
             if case .running = runner.state {
-                Text("Serving on port \(appState.serverPort). Automation clients connect here; "
-                   + "every request is encrypted.")
+                Text("\(L10n.t(.addressLabel)): \(appState.serverPort) · \(L10n.t(.serverRunningFooter))")
             } else if !ddi.isMounted {
-                Text("Mount the Developer Disk Image first — without it the runner can't launch.")
+                Text(L10n.t(.mountFirstFooter))
             } else {
-                Text("The server runs inside the automation runner. Starting it opens that app.")
+                Text(L10n.t(.startOpensRunnerFooter))
             }
         }
     }
