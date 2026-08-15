@@ -258,14 +258,19 @@ struct DDIMountView: View {
     /// to tap, and at caption size they read as annotations instead of actions.
     private func actionButton(_ title: String, role: ButtonRole? = nil,
                               action: @escaping () -> Void) -> some View {
+        // Built as a Label with an INVISIBLE badge rather than a guessed
+        // padding: the real indent is the badge width plus whatever spacing
+        // Label uses, which varies with Dynamic Type. Reusing the same layout
+        // makes the text land exactly under the step title by construction.
         Button(role: role, action: action) {
-            Text(title)
-                .font(.body)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            Label {
+                Text(title)
+                    .font(.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } icon: {
+                stepBadge(0, done: false).hidden()
+            }
         }
-        // Matches the badge (22) + Label's icon spacing, so the button's text
-        // starts exactly under the step's title.
-        .padding(.leading, 30)
     }
 
     private func stepBadge(_ n: Int, done: Bool) -> some View {

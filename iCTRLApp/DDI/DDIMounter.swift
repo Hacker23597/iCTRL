@@ -241,19 +241,11 @@ final class DDIMounter: ObservableObject {
         defer { if let client { lockdownd_client_free(client) } }
         guard let client else { throw DDIError.ffi("Connecting to lockdownd", "no client") }
 
-        // lockdownd wants the classic pairing handle, not the RemotePairing one
-        // the tunnel uses — same file on disk, different FFI type.
-        var pairing: OpaquePointer?
-        try check("Reading pairing file") {
-            idevice_pairing_file_read(PairingFileStore.storedURL.path, &pairing)
-        }
-        defer { if let pairing { idevice_pairing_file_free(pairing) } }
-        if let pairing {
-            try check("Starting a lockdownd session") {
-                lockdownd_start_session(client, pairing)
-            }
-        }
-
+        // No start_session here. A lockdownd client reached over the RSD tunnel
+        // is already authenticated by the RemotePairing handshake, so opening a
+        // second session on it is rejected — that is the InvalidConnection
+        // (code 15) this used to fail with. WebDriverAgent's equivalent (and
+        // StikDebug's) reads the value straight off the connected client.
         var value: plist_t?
         try check("Reading UniqueChipID") {
             lockdownd_get_value(client, "UniqueChipID", nil, &value)
