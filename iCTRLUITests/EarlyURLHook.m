@@ -13,6 +13,7 @@
 #import <QuartzCore/QuartzCore.h>   // CACurrentMediaTime
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <notify.h>
 #import <fcntl.h>
 #import <unistd.h>
 
@@ -281,12 +282,56 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
     if (sEarlyBackgroundArmed) { return; }
     sEarlyBackgroundArmed = YES;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+    [self attemptEarlyBackgroundingWithRetriesRemaining:30];
+}
+
+/// Poll until the device is actually ready, then background once.
+///
+/// A fixed timer was wrong: on a locked device the runner launches behind the
+/// passcode screen, and firing blindly backgrounded it while the user was still
+/// typing — losing the launch they had just started. The conditions below are
+/// what "ready" means here, and none of them can be assumed after a set delay.
+///
+/// Retries every 0.5s. The cap only bounds the wait; if the device is still
+/// unusable after it, backgrounding is skipped rather than forced.
++ (void)attemptEarlyBackgroundingWithRetriesRemaining:(NSInteger)retries {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         // Bootstrap already moved on? Leave the foreground alone — the test is
         // running and something else may legitimately own the screen.
         if (sSetUpEntered || sTestStarted) {
             earlyLog(@"🏠 early-background skipped — bootstrap already progressed");
+            return;
+        }
+
+        // 1. Not while the device is locked. The runner can be launched from the
+        //    lock screen (or during a passcode prompt); backgrounding then throws
+        //    away the launch the user is in the middle of.
+        static int lockToken = -1;
+        uint64_t lockState = 0;
+        if (lockToken == -1) {
+            if (notify_register_check("com.apple.springboard.lockstate", &lockToken) != NOTIFY_STATUS_OK) {
+                lockToken = -2;   // unavailable; fall through rather than block forever
+            }
+        }
+        if (lockToken >= 0 && notify_get_state(lockToken, &lockState) == NOTIFY_STATUS_OK && lockState != 0) {
+            if (retries > 0) {
+                [self attemptEarlyBackgroundingWithRetriesRemaining:retries - 1];
+            } else {
+                earlyLog(@"🏠 early-background gave up — device still locked");
+            }
+            return;
+        }
+
+        // 2. Not unless we are actually the foreground app. If something else is
+        //    in front (a passcode alert, another app), there is nothing for us to
+        //    step out of, and acting would only disturb whatever is.
+        if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
+            if (retries > 0) {
+                [self attemptEarlyBackgroundingWithRetriesRemaining:retries - 1];
+            } else {
+                earlyLog(@"🏠 early-background gave up — never became active");
+            }
             return;
         }
         @try {
