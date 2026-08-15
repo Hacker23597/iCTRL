@@ -35,6 +35,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// home-screen route; this mirrors that.
 + (BOOL)activateOrLaunchBundleID:(NSString *)bundleId;
 
+/// Press Home by injecting an IOHID event, bypassing -[XCUIDevice pressButton:].
+///
+/// `pressButton:` routes through testmanagerd, which on recent iOS waits for a
+/// `ButtonEventsCompleted` confirmation the system never sends — the event is
+/// then "implicitly confirmed", so the call succeeds while nothing happens.
+/// Appium hit the same silent failure on `pressLockButton` (WebDriverAgent
+/// PR #1171) and switched to this path.
+///
+/// Page 0x0C is the HID Consumer page; usage 0x40 is Menu, i.e. Home.
++ (BOOL)pressHomeViaIOHID;
+
 /// Terminate an app by bundle id, catching any XCTest NSException. Returns YES if
 /// termination was attempted without throwing.
 + (BOOL)safeTerminateBundleID:(NSString *)bundleId;
