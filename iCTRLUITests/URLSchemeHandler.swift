@@ -48,6 +48,18 @@ final class URLSchemeHandler {
         onURLReceived?()
     }
 
+    /// True when a queued URL carries a `callback=`, i.e. something is about to
+    /// take the foreground for us. Read without draining, so the caller can
+    /// decide whether to background itself before the queue is processed.
+    var hasPendingCallback: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingURLs.contains { url in
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.contains { $0.name == "callback" && !($0.value ?? "").isEmpty } ?? false
+        }
+    }
+
     /// Returns and clears ALL pending URLs (oldest first). Also pulls in anything
     /// the early Obj-C +load hook captured before our Swift hooks were installed
     /// (the cold-start launch URL).

@@ -368,6 +368,21 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // If launched via ictrl://start?callback=..., jump back to the caller now.
         handlePendingCallbackIfAny()
 
+        // Get out of the foreground once the server is listening.
+        //
+        // The runner's UI is an empty XCTest shell — there is nothing to look at,
+        // and a foreground runner is reported to be killed after a while (the
+        // same has been observed with WebDriverAgent). WDA never hits this
+        // because its runner is a BNDL with no icon: it can only be started by
+        // testmanagerd, never tapped. Ours is an APPL with a home-screen icon, so
+        // it has a state WDA doesn't — launched by hand and left in front.
+        //
+        // Skipped when a callback is pending: that jump hands the foreground to
+        // the caller, and doing both would fight over who gets it.
+        if !URLSchemeHandler.shared.hasPendingCallback {
+            backgroundSelfAfterStartup()
+        }
+
         Self.logBuffer.append("🔁 entering run loop (keepRunning=\(keepRunning))")
         // WDA-style run loop: block on distantFuture instead of a 0.2s poll. The
         // run loop wakes on any input source — the RPC queue's main.sync, server
@@ -391,6 +406,37 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Only reached when keepRunning was set false (stop_server / notification /
         // config restart). If we ever get here unexpectedly, the log shows it.
         Self.logBuffer.append("🔁 run loop exited (keepRunning=false)")
+    }
+
+    /// Send the runner to the background by bringing SpringBoard forward.
+    ///
+    /// Deliberately not `XCUIDevice.press(.home)` — that is a no-op on modern
+    /// hardware with no physical Home button (established while fixing the
+    /// `home` RPC). Activating SpringBoard as an app is what actually works, and
+    /// is what WebDriverAgent uses for its own home-screen route.
+    private func backgroundSelfAfterStartup() {
+        // A moment for the listener to settle, so anything already dialling it
+        // isn't racing a foreground switch.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            guard self.server?.isRunning == true else {
+                Self.logBuffer.append("🏠 skipped auto-background — server isn't running")
+                return
+            }
+            // XCUIApplication.activate blocks until the switch completes, and
+            // XCUITest APIs must run on the main thread — so this stays here, but
+            // wrapped: an activate that throws inside XCTest would otherwise
+            // abort the runner rather than just failing to background it.
+            var ok = false
+            let raised = ObjCException.catching {
+                ok = ForegroundApp.activateOrLaunchBundleID("com.apple.springboard")
+            }
+            if let raised {
+                Self.logBuffer.append("🏠 auto-background raised: \(raised)")
+            } else {
+                Self.logBuffer.append(ok ? "🏠 auto-backgrounded (SpringBoard activated)"
+                                         : "🏠 auto-background failed — runner stays in front")
+            }
+        }
     }
 
     // MARK: - URL Scheme Callback
