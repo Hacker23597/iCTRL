@@ -26,6 +26,11 @@ struct SettingsView: View {
     /// — wondering whether anything happened.
     private static let runnerURL = URL(string: "ictrl://start?callback=ictrl-app://started")!
 
+    /// Stopping goes through the URL scheme too. The only other route is
+    /// `config{stop_server:true}` over /rpc, which needs an encrypted envelope —
+    /// and this app deliberately holds no pairing key.
+    private static let runnerStopURL = URL(string: "ictrl://stop?callback=ictrl-app://stopped")!
+
     /// Provides the local loopback tunnel StikDebug needs to reach lockdownd.
     /// Deliberately an App Store link and not a deep link: neither LocalDevVPN
     /// nor its predecessor StosVPN registers a URL scheme, so any
@@ -42,46 +47,7 @@ struct SettingsView: View {
 
     var body: some View {
         List {
-            Section {
-                HStack {
-                    Text("Developer Disk Image")
-                    Spacer()
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(ddi.isMounted ? .green : .orange)
-                            .frame(width: 8, height: 8)
-                        Text(ddi.summary)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                if let layout = ddi.layout {
-                    HStack {
-                        Text("Mount")
-                        Spacer()
-                        Text(layout.rawValue)
-                            .font(.system(.body, design: .monospaced))
-                            .foregroundColor(.secondary)
-                    }
-                }
-                // Offer the on-device mount whenever there's nothing mounted.
-                // This is the only path that doesn't need a Mac, so it belongs
-                // next to the status that reports the problem.
-                if !ddi.isMounted {
-                    Button {
-                        showMountSheet = true
-                    } label: {
-                        Label("Mount without a Mac…", systemImage: "externaldrive.badge.plus")
-                    }
-                }
-            } header: {
-                Text("Automation")
-            } footer: {
-                // Without a DDI the runner can't launch at all — it dies in dyld
-                // before any of our code runs. Say so here rather than leaving the
-                // user to discover it as a crash after tapping Start.
-                Text(ddi.advice ?? "The automation runner can launch on this device. Tap Start to run it.")
-            }
+            requirementsSection
 
             // Fallback only. The in-app mount above does the same job without
             // leaving iCTRL; StikDebug stays listed because it is the
@@ -125,6 +91,8 @@ struct SettingsView: View {
 
             serverSection
 
+            deviceSection
+
             Section {
                 HStack {
                     Text("Version")
@@ -153,6 +121,7 @@ struct SettingsView: View {
         .onOpenURL { url in
             // The runner bounced back: ictrl-app://started?status=…&address=…
             guard url.scheme == "ictrl-app" else { return }
+            // ictrl-app://started or ictrl-app://stopped
             let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
             let status = items.first { $0.name == "status" }?.value
             launchFailed = (status == "failed")
@@ -165,6 +134,78 @@ struct SettingsView: View {
             ddi = DeveloperDiskImage.status()
         }) {
             DDIMountView()
+        }
+    }
+
+    /// What must be true before automation can run at all.
+    ///
+    /// The Developer Disk Image is the one hard prerequisite: without it the
+    /// XCUITest runner dies in dyld before any of our code runs, so a missing
+    /// DDI is not a degraded mode — it is the whole feature not working. This
+    /// section states that, and offers the fix either way: mount it when it's
+    /// absent, re-mount when it's there but the user has reason to redo it
+    /// (a reboot drops it, and the status here can only report what it can see).
+    private var requirementsSection: some View {
+        Section {
+            HStack {
+                Text("Developer Disk Image")
+                Spacer()
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(ddi.isMounted ? .green : .orange)
+                        .frame(width: 8, height: 8)
+                    Text(ddi.summary)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if let layout = ddi.layout {
+                HStack {
+                    Text("Mount point")
+                    Spacer()
+                    Text(layout.rawValue)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            // Offered in both states. Mounted is not the same as "nothing left
+            // to do": the image is dropped by a reboot, and a stale or partial
+            // mount looks identical from here, so re-mounting has to stay one
+            // tap away rather than something you can only reach by rebooting.
+            Button {
+                showMountSheet = true
+            } label: {
+                Label(ddi.isMounted ? "Re-mount…" : "Mount without a Mac…",
+                      systemImage: ddi.isMounted ? "arrow.clockwise" : "externaldrive.badge.plus")
+            }
+        } header: {
+            Text("Runtime Requirements")
+        } footer: {
+            if ddi.isMounted {
+                Text("The automation runner can launch on this device. The image is dropped by a "
+                   + "reboot — re-mount if the runner stops starting.")
+            } else {
+                Text(ddi.advice ?? "The Developer Disk Image isn't mounted, so the automation "
+                                 + "runner can't launch.")
+            }
+        }
+    }
+
+    /// This device, read locally.
+    ///
+    /// Deliberately not sourced from the server's device_info: these values are
+    /// available whether or not the runner is up, and they're most useful
+    /// precisely when it isn't — "which iOS is this?" is the first question
+    /// asked when the runner won't start.
+    private var deviceSection: some View {
+        Section {
+            LabeledRow("Model", DeviceInfo.modelIdentifier)
+            LabeledRow("System", "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)")
+            LabeledRow("Screen", DeviceInfo.screenDescription)
+            LabeledRow("Name", UIDevice.current.name, monospaced: false)
+        } header: {
+            Text("Device")
         }
     }
 
@@ -245,6 +286,11 @@ struct SettingsView: View {
                         }
                     }
                 }
+                Button(role: .destructive) {
+                    stopRunner()
+                } label: {
+                    Label("Stop Server", systemImage: "stop.fill")
+                }
             } else {
                 // Start lives here rather than in the toolbar: it belongs beside
                 // the state it changes, and this is where the reason it might be
@@ -257,7 +303,7 @@ struct SettingsView: View {
                 .disabled(!ddi.isMounted)
             }
         } header: {
-            Text("iCTRL Local Server")
+            Text("iCTRL Server (Local)")
         } footer: {
             if case .running = runner.state {
                 Text("Serving on port \(appState.serverPort). Automation clients connect here; "
@@ -266,6 +312,21 @@ struct SettingsView: View {
                 Text("Mount the Developer Disk Image first — without it the runner can't launch.")
             } else {
                 Text("The server runs inside the automation runner. Starting it opens that app.")
+            }
+        }
+    }
+
+    private func stopRunner() {
+        // Opening the runner's scheme brings it to the front, where it stops its
+        // server and ends the test. It bounces back here afterwards, but the
+        // probe is what settles the displayed state.
+        UIApplication.shared.open(Self.runnerStopURL) { _ in
+            Task {
+                // Give the runner a moment to actually tear the listener down;
+                // probing instantly would still see it up and flip back to
+                // "Running" for one cycle.
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                await runner.check()
             }
         }
     }
@@ -350,5 +411,60 @@ private struct CapabilityListView: View {
         }
         .navigationTitle("Capabilities")
         .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// A right-aligned value row, the shape the rest of this screen already uses.
+private struct LabeledRow: View {
+    let label: String
+    let value: String
+    var monospaced = true
+
+    init(_ label: String, _ value: String, monospaced: Bool = true) {
+        self.label = label
+        self.value = value
+        self.monospaced = monospaced
+    }
+
+    var body: some View {
+        HStack {
+            Text(label)
+            Spacer()
+            Text(verbatim: value)
+                .font(monospaced ? .system(.body, design: .monospaced) : .body)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+}
+
+/// Facts about this device that don't need the server running.
+enum DeviceInfo {
+    /// e.g. "iPhone17,2". `UIDevice.model` only ever says "iPhone", which
+    /// doesn't distinguish the hardware people actually care about here.
+    static var modelIdentifier: String {
+        // On the simulator `utsname.machine` reports the *host* architecture
+        // ("arm64"), not a device model — the real identifier is passed in the
+        // environment instead. Without this the row reads "arm64", which is
+        // both wrong and confusing next to a real device's "iPhone17,2".
+        if let simulated = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] {
+            return simulated
+        }
+        var sysinfo = utsname()
+        uname(&sysinfo)
+        let raw = withUnsafeBytes(of: &sysinfo.machine) { buf in
+            buf.prefix { $0 != 0 }.map { UInt8($0) }
+        }
+        let id = String(decoding: raw, as: UTF8.self)
+        return id.isEmpty ? UIDevice.current.model : id
+    }
+
+    /// Points and pixels — the two coordinate spaces the automation API mixes,
+    /// so seeing both here saves a round trip when a screenshot looks wrong.
+    static var screenDescription: String {
+        let b = UIScreen.main.bounds
+        let s = UIScreen.main.scale
+        return "\(Int(b.width))×\(Int(b.height)) pt · \(Int(b.width * s))×\(Int(b.height * s)) px"
     }
 }

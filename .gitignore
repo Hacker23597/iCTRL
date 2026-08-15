@@ -15,3 +15,4 @@ xcuserdata/
 
 # Fetched by Scripts/fetch-idevice.sh (215MB release asset, not vendored)
 Frameworks/
+build-sim/

@@ -53,14 +53,18 @@ public enum DeveloperDiskImage {
         }
 
         /// What the user should actually do about it.
+        ///
+        /// Points at the in-app mount rather than a Mac: the app can do this
+        /// itself now, and telling someone to go find a Mac when the button is
+        /// directly below would be worse than saying nothing.
         public var advice: String? {
             if isMounted { return nil }
             if hasDeveloperDirectory {
-                return "Developer Mode is on, but the Developer Disk Image isn't mounted. "
-                     + "It doesn't survive a reboot — connect this device to a Mac with Xcode once to remount it."
+                return "Developer Mode is on, but the Developer Disk Image isn't mounted — "
+                     + "a reboot drops it. Mount it below, or connect this device to a Mac with Xcode once."
             }
-            return "Enable Developer Mode in Settings › Privacy & Security, then connect this device "
-                 + "to a Mac with Xcode once so the Developer Disk Image can be mounted."
+            return "Enable Developer Mode in Settings › Privacy & Security first, then mount the "
+                 + "Developer Disk Image below (or connect this device to a Mac with Xcode once)."
         }
     }
 

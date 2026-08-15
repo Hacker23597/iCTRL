@@ -400,8 +400,31 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let items = comps?.queryItems ?? []
 
-        // Only the "start" host triggers a callback jump; others are ignored.
         let host = url.host?.lowercased()
+
+        // ictrl://stop — shut the server down and end the test.
+        //
+        // This exists because /rpc is the only other way to stop the server and
+        // it requires an encrypted envelope, which the host app has no key for.
+        // The URL scheme is the same trust boundary as ictrl://start: only
+        // something already on this device can open it.
+        if host == "stop" {
+            Self.logBuffer.append("🔗 ictrl://stop — shutting down")
+            let callback = items.first(where: { $0.name == "callback" })?.value
+                .flatMap { Self.normalizeCallback($0) }
+            server?.stop()
+            keepRunning = false
+            if let callback {
+                var cb = URLComponents(url: callback, resolvingAgainstBaseURL: false)
+                var q = cb?.queryItems ?? []
+                q.append(URLQueryItem(name: "status", value: "stopped"))
+                cb?.queryItems = q
+                if let final = cb?.url { openCallback(final, attempt: 1) }
+            }
+            return
+        }
+
+        // Only the "start" host triggers a callback jump; others are ignored.
         guard host == "start" || host == nil else {
             Self.logBuffer.append("🔗 Ignored ictrl:// host: \(host ?? "")")
             return
