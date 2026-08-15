@@ -16,9 +16,15 @@ struct SettingsView: View {
     @State private var ddi = DeveloperDiskImage.status()
     @State private var launchFailed = false
     @State private var showMountSheet = false
+    @StateObject private var runner = RunnerStatus(port: 8200)
 
     /// The runner registers this scheme; opening it starts the automation server.
-    private static let runnerURL = URL(string: "ictrl://start")!
+    ///
+    /// `callback` asks the runner to bounce back to us once it has decided
+    /// whether the server came up, appending `status` and `address`. Without it
+    /// the user is left in the runner — a blank XCTest app with nothing to show
+    /// — wondering whether anything happened.
+    private static let runnerURL = URL(string: "ictrl://start?callback=ictrl-app://started")!
 
     /// Provides the local loopback tunnel StikDebug needs to reach lockdownd.
     /// Deliberately an App Store link and not a deep link: neither LocalDevVPN
@@ -117,14 +123,9 @@ struct SettingsView: View {
                 }
             }
 
+            serverSection
+
             Section {
-                HStack {
-                    Text("Port")
-                    Spacer()
-                    Text(verbatim: "\(appState.serverPort)")
-                        .font(.system(.body, design: .monospaced))
-                        .foregroundColor(.secondary)
-                }
                 HStack {
                     Text("Version")
                     Spacer()
@@ -143,20 +144,129 @@ struct SettingsView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("iCTRL")
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Button("Start") { startRunner() }
-                    // A DDI-less device can't run the runner; leaving the button
-                    // live would just hand the user a silent no-op.
-                    .disabled(!ddi.isMounted)
-            }
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            ddi = DeveloperDiskImage.status()
+            runner.startPolling()
         }
-        .onAppear { ddi = DeveloperDiskImage.status() }
+        .onDisappear { runner.stopPolling() }
+        .onOpenURL { url in
+            // The runner bounced back: ictrl-app://started?status=…&address=…
+            guard url.scheme == "ictrl-app" else { return }
+            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            let status = items.first { $0.name == "status" }?.value
+            launchFailed = (status == "failed")
+            // Trust the probe over the reported status — by the time we're back,
+            // asking the server directly is both cheap and authoritative.
+            Task { await runner.check() }
+        }
         .sheet(isPresented: $showMountSheet, onDismiss: {
             // Re-probe: a successful mount changes what the status row should say.
             ddi = DeveloperDiskImage.status()
         }) {
             DDIMountView()
+        }
+    }
+
+    /// Live state of the automation server.
+    ///
+    /// The server runs inside the XCUITest runner, a separate process, so this
+    /// reports what an HTTP probe of it says rather than anything this app
+    /// knows locally — the runner can be started or killed without the app
+    /// being involved at all.
+    private var serverSection: some View {
+        Section {
+            HStack {
+                Text("Status")
+                Spacer()
+                switch runner.state {
+                case .unknown, .checking:
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Checking…").foregroundColor(.secondary)
+                    }
+                case .running:
+                    HStack(spacing: 6) {
+                        Circle().fill(.green).frame(width: 8, height: 8)
+                        Text("Running").foregroundColor(.secondary)
+                    }
+                case .stopped:
+                    HStack(spacing: 6) {
+                        Circle().fill(.secondary).frame(width: 8, height: 8)
+                        Text("Stopped").foregroundColor(.secondary)
+                    }
+                }
+            }
+
+            HStack {
+                Text("Address")
+                Spacer()
+                Text(verbatim: "127.0.0.1:\(appState.serverPort)")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+
+            if case .running(let info) = runner.state {
+                if let version = info.serverVersion {
+                    HStack {
+                        Text("Server")
+                        Spacer()
+                        Text(verbatim: version)
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                if let proto = info.protocolVersion {
+                    HStack {
+                        Text("Protocol")
+                        Spacer()
+                        Text(verbatim: "v\(proto)")
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                if let methods = info.methodCount {
+                    HStack {
+                        Text("Methods")
+                        Spacer()
+                        Text(verbatim: "\(methods)")
+                            .foregroundColor(.secondary)
+                    }
+                }
+                if !info.capabilities.isEmpty {
+                    NavigationLink {
+                        CapabilityListView(capabilities: info.capabilities)
+                    } label: {
+                        HStack {
+                            Text("Capabilities")
+                            Spacer()
+                            Text(verbatim: "\(info.capabilities.count)")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            } else {
+                // Start lives here rather than in the toolbar: it belongs beside
+                // the state it changes, and this is where the reason it might be
+                // disabled is already on screen.
+                Button {
+                    startRunner()
+                } label: {
+                    Label("Start Server", systemImage: "play.fill")
+                }
+                .disabled(!ddi.isMounted)
+            }
+        } header: {
+            Text("iCTRL Local Server")
+        } footer: {
+            if case .running = runner.state {
+                Text("Serving on port \(appState.serverPort). Automation clients connect here; "
+                   + "every request is encrypted.")
+            } else if !ddi.isMounted {
+                Text("Mount the Developer Disk Image first — without it the runner can't launch.")
+            } else {
+                Text("The server runs inside the automation runner. Starting it opens that app.")
+            }
         }
     }
 
@@ -217,5 +327,28 @@ private struct HelperRow: View {
             guard !ok, let fallbackURL else { return }
             UIApplication.shared.open(fallbackURL)
         }
+    }
+}
+
+/// The capability tags the running server advertises.
+///
+/// A flat list rather than a summary: these are what a client feature-detects
+/// against, so the useful question is "is X there", which a searchable list
+/// answers and a count does not.
+private struct CapabilityListView: View {
+    let capabilities: [String]
+
+    var body: some View {
+        List(capabilities.sorted(), id: \.self) { tag in
+            HStack {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundColor(.green)
+                    .font(.caption)
+                Text(verbatim: tag)
+                    .font(.system(.body, design: .monospaced))
+            }
+        }
+        .navigationTitle("Capabilities")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
