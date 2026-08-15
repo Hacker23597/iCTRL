@@ -122,6 +122,35 @@ final class DDIMounter: ObservableObject {
 
     // MARK: - FFI
 
+    /// Ask the device what images it already has mounted.
+    ///
+    /// iOS refuses a second mount with a bare "ImageMountFailed", so without
+    /// this an already-mounted device reports a hard failure that reads like
+    /// something is broken. StikDebug guards its mount the same way.
+    ///
+    /// Returns nil when the question can't be answered (no tunnel, no pairing
+    /// file) — the caller should treat that as "unknown", not "not mounted".
+    nonisolated static func mountedImageCount(adapter: OpaquePointer,
+                                              handshake: OpaquePointer) -> Int? {
+        var client: OpaquePointer?
+        if let err = image_mounter_connect_rsd(adapter, handshake, &client) {
+            idevice_error_free(err)
+            return nil
+        }
+        guard let client else { return nil }
+        defer { image_mounter_free(client) }
+
+        var devices: UnsafeMutablePointer<plist_t?>?
+        var count = 0
+        if let err = image_mounter_copy_devices(client, &devices, &count) {
+            idevice_error_free(err)
+            return nil
+        }
+        if let devices { idevice_plist_array_free(devices, UInt(count)) }
+        return count
+    }
+
+
     /// Force the rustls crypto provider to be installed before anything needs it.
     ///
     /// The TSS request builds a reqwest client, and this library is compiled
@@ -202,6 +231,17 @@ final class DDIMounter: ObservableObject {
         }
 
         report(.queryingDevice)
+
+        // Already mounted? iOS answers a second mount with a bare
+        // "ImageMountFailed", which reads like a real failure rather than
+        // "nothing to do". Ask first and treat that case as success.
+        if let mounted = mountedImageCount(adapter: adapter, handshake: handshake) {
+            ictrlLog("Device reports \(mounted) mounted image(s)")
+            if mounted > 0 {
+                ictrlLog("✅ A developer image is already mounted — nothing to do")
+                return
+            }
+        }
 
         // The ECID identifies this specific device to Apple's signing service.
         // A personalized image is signed for one device and one nonce, which is
@@ -287,6 +327,15 @@ final class DDIMounter: ObservableObject {
         let code = err.pointee.code
         idevice_error_free(err)
         ictrlLog("❌ \(operation): \(message) (code \(code))")
-        throw DDIError.ffi(operation, "\(message) (code \(code))")
+        // "ImageMountFailed" is the device's own word for it and says nothing
+        // about why, so attach what it usually means rather than passing a bare
+        // string to someone with no way to look it up.
+        var detail = "\(message) (code \(code))"
+        if message.contains("ImageMountFailed") {
+            detail += ". The device rejected the image — usually because it doesn't match this "
+                    + "iOS version, or the download is incomplete. Re-download the image files "
+                    + "and try again; if it persists, this iOS build may be newer than the mirror."
+        }
+        throw DDIError.ffi(operation, detail)
     }
 }
