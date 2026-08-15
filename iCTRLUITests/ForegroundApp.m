@@ -178,56 +178,6 @@
     }
 }
 
-+ (BOOL)pressHomeViaIOHID {
-    @try {
-        Class eventClass = NSClassFromString(@"XCDeviceEvent");
-        if (!eventClass) { return NO; }
-
-        // +[XCDeviceEvent deviceEventWithPage:usage:duration:] — built via
-        // NSInvocation because the argument list mixes unsigned ints with a
-        // double, which an objc_msgSend cast would get wrong on arm64.
-        SEL make = NSSelectorFromString(@"deviceEventWithPage:usage:duration:");
-        if (![eventClass respondsToSelector:make]) { return NO; }
-        NSMethodSignature *sig = [eventClass methodSignatureForSelector:make];
-        if (!sig) { return NO; }
-        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-        inv.target = eventClass;
-        inv.selector = make;
-        unsigned int page = 0x0C;      // kHIDPage_Consumer
-        unsigned int usage = 0x40;     // kHIDUsage_Csmr_Menu (Home)
-        NSTimeInterval duration = 0.005;   // what XCTest uses for a single press
-        [inv setArgument:&page atIndex:2];
-        [inv setArgument:&usage atIndex:3];
-        [inv setArgument:&duration atIndex:4];
-        [inv invoke];
-        __unsafe_unretained id event = nil;
-        [inv getReturnValue:&event];
-        if (!event) { return NO; }
-
-        Class deviceClass = NSClassFromString(@"XCUIDevice");
-        if (!deviceClass) { return NO; }
-        id device = [deviceClass performSelector:@selector(sharedDevice)];
-        SEL perform = NSSelectorFromString(@"performDeviceEvent:error:");
-        if (!device || ![device respondsToSelector:perform]) { return NO; }
-
-        NSMethodSignature *psig = [device methodSignatureForSelector:perform];
-        NSInvocation *pinv = [NSInvocation invocationWithMethodSignature:psig];
-        pinv.target = device;
-        pinv.selector = perform;
-        NSError *err = nil;
-        __unsafe_unretained id evt = event;
-        [pinv setArgument:&evt atIndex:2];
-        [pinv setArgument:&err atIndex:3];
-        [pinv invoke];
-        BOOL ok = NO;
-        [pinv getReturnValue:&ok];
-        return ok;
-    } @catch (NSException *e) {
-        NSLog(@"iCTRL: pressHomeViaIOHID raised: %@", e.reason);
-        return NO;
-    }
-}
-
 + (BOOL)activateOrLaunchBundleID:(NSString *)bundleId {
     if (bundleId.length == 0) { return NO; }
     @try {

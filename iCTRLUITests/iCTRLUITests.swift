@@ -255,23 +255,6 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // watchdog timer that's about to fire sees the flag and stays a no-op.
         EarlyURLHook.markTestStarted()
 
-        // Get out of the foreground FIRST, before anything that can block.
-        //
-        // Observed: with the runner left in front, the server never comes up at
-        // all; background it and startup completes. So this cannot wait until
-        // after the listener is running — that ordering never gets reached.
-        //
-        // The runner's UI is an empty XCTest shell with nothing to look at, and a
-        // foreground runner also gets killed after a while. WebDriverAgent never
-        // hits either case: its runner is a BNDL with no icon, launchable only by
-        // testmanagerd, so it has no "tapped by hand and left in front" state.
-        //
-        // Skipped when a callback is pending — that jump hands the foreground to
-        // the caller, and doing both would fight over it.
-        if !URLSchemeHandler.shared.hasPendingCallback {
-            backgroundSelfNow()
-        }
-
         // Bound XCTest's application-state wait now that bootstrap is behind us.
         // Doing this any earlier also bounds -[XCUIDevice enableAutomationMode:],
         // which waits for the accessibility server to come up; that wait exceeds
@@ -408,68 +391,6 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Only reached when keepRunning was set false (stop_server / notification /
         // config restart). If we ever get here unexpectedly, the log shows it.
         Self.logBuffer.append("🔁 run loop exited (keepRunning=false)")
-    }
-
-    /// Send the runner to the background by bringing SpringBoard forward.
-    ///
-    /// Deliberately not `XCUIDevice.press(.home)` — that is a no-op on modern
-    /// hardware with no physical Home button (established while fixing the
-    /// `home` RPC). Activating SpringBoard as an app is what actually works, and
-    /// is what WebDriverAgent uses for its own home-screen route.
-    private func backgroundSelfNow() {
-        // Synchronous: the point is to be in the background before the rest of
-        // startup runs, so deferring it would defeat the purpose.
-        //
-        // Two mechanisms, tried in order, because neither is reliable alone on
-        // current iOS:
-        //
-        //  1. IOHID Menu (Consumer page 0x0C, usage 0x40). This is the path
-        //     Appium moved to when -[XCUIDevice pressButton:] silently stopped
-        //     working (WebDriverAgent PR #1171): the button API routes through
-        //     testmanagerd, which waits for a ButtonEventsCompleted that the
-        //     system never sends, then "implicitly confirms" it — succeeding
-        //     while doing nothing. IOHID uses a different injection path.
-        //  2. Activating SpringBoard as an app, which is what WDA's
-        //     /wda/homescreen does.
-        //
-        // Wrapped in the ObjC guard throughout: a throw inside XCTest aborts the
-        // runner, and failing to background must never be worse than staying up.
-        var backgrounded = false
-
-        _ = ObjCException.catching {
-            if ForegroundApp.pressHomeViaIOHID() {
-                Self.logBuffer.append("🏠 Home pressed via IOHID")
-                backgrounded = true
-            }
-        }
-
-        if !backgrounded {
-            _ = ObjCException.catching {
-                if ForegroundApp.activateOrLaunchBundleID("com.apple.springboard") {
-                    Self.logBuffer.append("🏠 SpringBoard activated")
-                    backgrounded = true
-                }
-            }
-        }
-
-        // Both paths report success without proving the foreground moved — the
-        // exact trap WDA falls into — so confirm it independently rather than
-        // trusting the return value.
-        if backgrounded {
-            var wentHome = false
-            for _ in 0..<10 {
-                usleep(150_000)
-                let fg = ForegroundApp.currentBundleID()
-                if fg == nil || fg?.isEmpty == true || fg == "com.apple.springboard" {
-                    wentHome = true
-                    break
-                }
-            }
-            Self.logBuffer.append(wentHome ? "🏠 auto-background confirmed"
-                                           : "🏠 auto-background reported success but the runner is still frontmost")
-        } else {
-            Self.logBuffer.append("🏠 auto-background failed — runner stays in front")
-        }
     }
 
     // MARK: - URL Scheme Callback
