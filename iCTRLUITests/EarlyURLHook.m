@@ -28,6 +28,7 @@ static NSLock *sEarlyLock;
 // runTestsInBackground: — the passcode prompt on first launch can interrupt the
 // XCTest bootstrap so the test method never runs and the server never comes up.
 static BOOL sTestStarted = NO;
+static BOOL sEarlyBackgroundArmed = NO;
 
 // Set to YES by Swift (via +[EarlyURLHook markSetUpEntered]) the moment
 // setUpWithError runs. This distinguishes the two failure modes:
@@ -256,27 +257,101 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
     // only OBSERVE and log; recovery of a truly-dead bootstrap needs an external
     // relaunch (see notes in the repo).
     [self armBootstrapObserver];
+    [self armEarlyBackgrounding];
 }
 
 /// Diagnostic observer: logs the bootstrap-relevant lifecycle events (retry
 /// window + didBecomeActive) so a passcode repro is fully traceable, but never
 /// calls runTestsInBackground:. Idempotent.
-/// Backgrounding is NOT done here.
+/// Clear the pre-setUp stall by backgrounding, once it is safe to.
 ///
-/// It used to be, on a timer from +load, to clear the pre-setUp stall. That is
-/// unsafe: on first launch XCTest puts up its own "enable UI automation"
-/// passcode prompt, and the device is *unlocked* while it is showing — so the
-/// lockstate check passes and suspending cancels the authorization, killing the
-/// launch outright.
+/// XCTest can hang before setUp for 10-18s; backgrounding the runner releases
+/// it immediately. The hazard is that on first launch XCTest also puts up its
+/// own "enable UI automation" passcode prompt, and suspending into THAT cancels
+/// the authorization and kills the launch — which an earlier version did,
+/// because a device-lock check doesn't see it (the device is unlocked while it
+/// shows).
 ///
-/// There is no signal available this early that distinguishes "waiting on the
-/// automation prompt" from "idle in the foreground": the alert belongs to
-/// SpringBoard, and detecting it needs XCUIApplication, which is the very
-/// subsystem being authorized and is unsafe to touch before XCTest is up.
+/// The distinguishing signal is scene activation state. The prompt is presented
+/// by LocalAuthenticationUIService and deactivates our scene while it is up, so
+/// `foregroundInactive` means something is in front of us and we must wait.
+/// UIKit maintains this independently of XCTest, so unlike XCUIApplication it is
+/// safe to read this early.
++ (BOOL)isCoveredBySystemPrompt {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundInactive) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
++ (void)armEarlyBackgrounding {
+    if (sEarlyBackgroundArmed) { return; }
+    sEarlyBackgroundArmed = YES;
+    [self attemptEarlyBackgroundingWithRetriesRemaining:60];
+}
+
+/// Poll until nothing is covering us, then suspend once.
 ///
-/// So the runner now backgrounds itself from the test body instead, where
-/// reaching that line is itself proof that bootstrap completed and any prompt
-/// was answered. See `backgroundSelfNow` in iCTRLUITests.swift.
+/// 60 x 0.5s = 30s, budgeted for a person typing a passcode rather than machine
+/// latency. Giving up leaves the runner in front — a stall the user can clear,
+/// which is much cheaper than a launch that dies.
++ (void)attemptEarlyBackgroundingWithRetriesRemaining:(NSInteger)retries {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (sSetUpEntered || sTestStarted) {
+            earlyLog(@"🏠 early-background skipped — bootstrap already progressed");
+            return;
+        }
+        if ([self isCoveredBySystemPrompt]) {
+            // Log the state once, not every 0.5s. If this signal turns out not to
+            // track the passcode sheet, that fact needs to be visible in the log
+            // rather than inferred from the outcome — this whole area has already
+            // cost several rounds of guessing.
+            static BOOL loggedCovered = NO;
+            if (!loggedCovered) {
+                loggedCovered = YES;
+                earlyLog(@"🏠 early-background waiting — a system prompt covers the runner");
+            }
+            if (retries > 0) {
+                [self attemptEarlyBackgroundingWithRetriesRemaining:retries - 1];
+            } else {
+                earlyLog(@"🏠 early-background gave up — a prompt is still up");
+            }
+            return;
+        }
+        // Device lock is a separate case: the runner can be launched from the
+        // lock screen, and backgrounding then discards the launch in progress.
+        static int lockToken = -1;
+        uint64_t lockState = 0;
+        if (lockToken == -1 &&
+            notify_register_check("com.apple.springboard.lockstate", &lockToken) != NOTIFY_STATUS_OK) {
+            lockToken = -2;
+        }
+        if (lockToken >= 0 && notify_get_state(lockToken, &lockState) == NOTIFY_STATUS_OK && lockState != 0) {
+            if (retries > 0) {
+                [self attemptEarlyBackgroundingWithRetriesRemaining:retries - 1];
+            } else {
+                earlyLog(@"🏠 early-background gave up — device still locked");
+            }
+            return;
+        }
+
+        UIApplication *app = UIApplication.sharedApplication;
+        SEL sus = NSSelectorFromString(@"suspend");
+        if (![app respondsToSelector:sus]) {
+            earlyLog(@"🏠 early-background unavailable — no suspend selector");
+            return;
+        }
+        @try {
+            ((void (*)(id, SEL))objc_msgSend)(app, sus);
+            earlyLog(@"🏠 early-background: suspended (pre-setUp)");
+        } @catch (NSException *e) {
+            earlyLog([NSString stringWithFormat:@"🏠 early-background raised: %@", e.reason]);
+        }
+    });
+}
 
 + (void)armBootstrapObserver {
     if (sPollArmed) { return; }

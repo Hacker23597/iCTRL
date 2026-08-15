@@ -457,6 +457,26 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         let deadline = Date().addingTimeInterval(timeout)
         var logged = false
         while Date() < deadline {
+            // Is a system prompt covering us right now?
+            //
+            // The passcode sheet is presented by LocalAuthenticationUIService,
+            // not by us, and the device log shows it deactivating our scene while
+            // it is up. UIScene.activationState is the first-party read of that:
+            // .foregroundInactive means something is in front of us — during a
+            // passcode entry, exactly what we must not suspend into.
+            let sceneBlocked = UIApplication.shared.connectedScenes.contains { scene in
+                scene.activationState == .foregroundInactive
+            }
+            if sceneBlocked {
+                if !logged {
+                    Self.logBuffer.append("🏠 waiting — a system prompt is covering the runner "
+                                        + "(passcode / authorization)")
+                    logged = true
+                }
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.25))
+                continue
+            }
+
             var state = 0
             let raised = ObjCException.catching {
                 state = ForegroundApp.appState(forBundleID: "com.apple.springboard")
