@@ -29,6 +29,10 @@ static NSLock *sEarlyLock;
 // XCTest bootstrap so the test method never runs and the server never comes up.
 static BOOL sTestStarted = NO;
 static BOOL sEarlyBackgroundArmed = NO;
+/// Set when UIApplicationDidBecomeActive fires. The runner has no real UI
+/// scene, so UIApplication.applicationState never reports .active for it —
+/// the notification is the only signal that we reached the foreground.
+static BOOL sSawDidBecomeActive = NO;
 
 // Set to YES by Swift (via +[EarlyURLHook markSetUpEntered]) the moment
 // setUpWithError runs. This distinguishes the two failure modes:
@@ -282,6 +286,12 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
     if (sEarlyBackgroundArmed) { return; }
     sEarlyBackgroundArmed = YES;
 
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification * _Nonnull note) {
+        sSawDidBecomeActive = YES;
+    }];
     [self attemptEarlyBackgroundingWithRetriesRemaining:30];
 }
 
@@ -323,10 +333,14 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
             return;
         }
 
-        // 2. Not unless we are actually the foreground app. If something else is
-        //    in front (a passcode alert, another app), there is nothing for us to
-        //    step out of, and acting would only disturb whatever is.
-        if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
+        // 2. Not until we have actually reached the foreground once.
+        //
+        //    Checking applicationState here was wrong and blocked this entirely:
+        //    the log showed didBecomeActive firing at 18:37:32 while the state
+        //    check still said "never became active" 15s later. An XCTest runner
+        //    has no real UI scene, so that property never reports .active for it.
+        //    The notification is the signal that works.
+        if (!sSawDidBecomeActive) {
             if (retries > 0) {
                 [self attemptEarlyBackgroundingWithRetriesRemaining:retries - 1];
             } else {
@@ -404,10 +418,12 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
                     // Give UIKit a moment, then see whether it took.
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
+                        // Advisory only: applicationState is unreliable in a
+                        // runner (it never reports .active), so "still active"
+                        // here is weak evidence, not a verdict.
                         UIApplicationState st = UIApplication.sharedApplication.applicationState;
-                        earlyLog(st == UIApplicationStateActive
-                                 ? [NSString stringWithFormat:@"🏠 %@ returned but the runner is STILL ACTIVE", name]
-                                 : [NSString stringWithFormat:@"🏠 early-background confirmed via -[UIApplication %@]", name]);
+                        earlyLog([NSString stringWithFormat:@"🏠 -[UIApplication %@] done (state=%ld)",
+                                  name, (long)st]);
                     });
                     return;
                 } @catch (NSException *e) {
@@ -451,10 +467,9 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
             // state is a first-party signal and needs no XCTest.
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
+                // Advisory: see note above on applicationState in a runner.
                 UIApplicationState state = UIApplication.sharedApplication.applicationState;
-                earlyLog(state == UIApplicationStateActive
-                         ? @"🏠 early-background: STILL ACTIVE — the open did not take the foreground"
-                         : @"🏠 early-background confirmed — runner is no longer active");
+                earlyLog([NSString stringWithFormat:@"🏠 early-background: URL opened (state=%ld)", (long)state]);
             });
         } @catch (NSException *e) {
             earlyLog([NSString stringWithFormat:@"🏠 early-background raised: %@", e.reason]);
