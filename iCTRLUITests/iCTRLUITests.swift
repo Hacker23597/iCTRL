@@ -456,6 +456,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private func waitUntilTestable(timeout: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         var logged = false
+        var lastReport = Date.distantPast
         while Date() < deadline {
             // Is a system prompt covering us right now?
             //
@@ -468,10 +469,13 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 scene.activationState == .foregroundInactive
             }
             if sceneBlocked {
-                if !logged {
+                // Periodic rather than once: a silent 30s wait is
+                // indistinguishable from a hang when reading the log later.
+                if Date().timeIntervalSince(lastReport) >= 2 {
+                    lastReport = Date()
+                    let left = Int(deadline.timeIntervalSinceNow)
                     Self.logBuffer.append("🏠 waiting — a system prompt is covering the runner "
-                                        + "(passcode / authorization)")
-                    logged = true
+                                        + "(passcode / authorization, \(left)s left)")
                 }
                 RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.25))
                 continue

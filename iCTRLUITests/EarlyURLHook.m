@@ -289,6 +289,7 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
 + (void)armEarlyBackgrounding {
     if (sEarlyBackgroundArmed) { return; }
     sEarlyBackgroundArmed = YES;
+    earlyLog(@"🏠 early-background armed — will suspend once nothing covers the runner");
     [self attemptEarlyBackgroundingWithRetriesRemaining:60];
 }
 
@@ -309,10 +310,12 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
             // track the passcode sheet, that fact needs to be visible in the log
             // rather than inferred from the outcome — this whole area has already
             // cost several rounds of guessing.
-            static BOOL loggedCovered = NO;
-            if (!loggedCovered) {
-                loggedCovered = YES;
-                earlyLog(@"🏠 early-background waiting — a system prompt covers the runner");
+            // Every 2s rather than every tick: often enough to show progress,
+            // rare enough not to bury the rest of the log.
+            if (retries % 4 == 0) {
+                earlyLog([NSString stringWithFormat:
+                          @"🏠 early-background waiting — a system prompt covers the runner (%.0fs left)",
+                          retries * 0.5]);
             }
             if (retries > 0) {
                 [self attemptEarlyBackgroundingWithRetriesRemaining:retries - 1];
@@ -330,6 +333,10 @@ static void swizzled_setDelegate(id self, SEL _cmd, id<UIApplicationDelegate> de
             lockToken = -2;
         }
         if (lockToken >= 0 && notify_get_state(lockToken, &lockState) == NOTIFY_STATUS_OK && lockState != 0) {
+            if (retries % 4 == 0) {
+                earlyLog([NSString stringWithFormat:
+                          @"🏠 early-background waiting — device is locked (%.0fs left)", retries * 0.5]);
+            }
             if (retries > 0) {
                 [self attemptEarlyBackgroundingWithRetriesRemaining:retries - 1];
             } else {
