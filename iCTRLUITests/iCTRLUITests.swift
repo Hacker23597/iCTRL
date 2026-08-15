@@ -397,13 +397,26 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
     /// Drain any pending ictrl:// URLs and, for each start URL carrying a
     /// callback, jump back to the caller with the server status/address.
+    /// Guards against re-entering the drain from a nested run loop.
+    ///
+    /// The start path spins `RunLoop.current.run(until:)` for up to 8s waiting
+    /// for the server to listen. That nested loop happily dispatches the timer
+    /// and the wake-up hook, which would re-enter this and consume the very URL
+    /// the outer call is still working on.
+    private var isDrainingURLs = false
+
     private func handlePendingCallbackIfAny() {
+        guard !isDrainingURLs else { return }
+        isDrainingURLs = true
+        defer { isDrainingURLs = false }
+
         for url in URLSchemeHandler.shared.takeAllPendingURLs() {
             handleOneURL(url)
         }
     }
 
     private func handleOneURL(_ url: URL) {
+        Self.logBuffer.append("🔗 handling \(url.absoluteString)")
         let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let items = comps?.queryItems ?? []
 
@@ -453,6 +466,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
 
         let running = server?.isRunning ?? false
+        Self.logBuffer.append("🔙 server running=\(running) after wait")
         let address = remoteAccessEnabled ? "\(getDeviceAddress()):\(server?.port ?? 8200)"
                                           : "127.0.0.1:\(server?.port ?? 8200)"
         let status = running ? "ready" : "failed"
@@ -470,7 +484,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
 
         Self.logBuffer.append("🔙 Callback → \(callbackURL.scheme ?? "")://…?status=\(status)")
-        openCallback(finalURL, attempt: 1)
+        // Off the main thread: ForegroundApp.open blocks on a semaphore for up
+        // to 5s waiting for the XCTest daemon, and doing that on main stalls the
+        // very run loop the server needs to keep answering.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.openCallback(finalURL, attempt: 1)
+        }
     }
 
     /// Accept a callback either as a full URL ("minis://home") or as a bare scheme
