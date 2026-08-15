@@ -80,12 +80,31 @@ final class DDIMounter: ObservableObject {
             let trustCache = try Data(contentsOf: DeveloperDiskImageStore.url(for: .trustCache))
             let manifest = try Data(contentsOf: DeveloperDiskImageStore.url(for: .buildManifest))
 
-            try await Task.detached(priority: .userInitiated) { [weak self] in
-                try Self.performMount(pairingPath: pairingPath,
-                                      image: image, trustCache: trustCache, manifest: manifest) { phase in
-                    Task { @MainActor in self?.phase = phase }
+            // A dedicated Thread with an explicit stack, not a Task.
+            //
+            // The TSS request builds a reqwest client, whose TLS setup needs far
+            // more stack than a Swift concurrency worker provides — it aborted
+            // there (SIGABRT, panic inside ClientBuilder::build) on the first
+            // real mount. StikDebug runs the same call on a plain Thread for the
+            // same reason; 4MB is generous enough not to have to think about it.
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                let thread = Thread {
+                    do {
+                        try Self.performMount(pairingPath: pairingPath,
+                                              image: image, trustCache: trustCache,
+                                              manifest: manifest) { phase in
+                            Task { @MainActor in self.phase = phase }
+                        }
+                        cont.resume()
+                    } catch {
+                        cont.resume(throwing: error)
+                    }
                 }
-            }.value
+                thread.stackSize = 4 * 1024 * 1024
+                thread.name = "ictrl.ddi.mount"
+                thread.qualityOfService = .userInitiated
+                thread.start()
+            }
 
             phase = .mounted
         } catch {
@@ -93,66 +112,7 @@ final class DDIMounter: ObservableObject {
         }
     }
 
-    /// Is a developer image already mounted? Cheap, and worth checking before
-    /// offering to mount: the image does not survive a reboot, but it does
-    /// survive an app restart.
-    nonisolated static func isMounted() -> Bool {
-        guard PairingFileStore.exists else { return false }
-        return (try? withMounterClient(pairingPath: PairingFileStore.storedURL.path) { client in
-            var devices: UnsafeMutablePointer<plist_t?>?
-            var count = 0
-            let err = image_mounter_copy_devices(client, &devices, &count)
-            if let err { idevice_error_free(err); return false }
-            if let devices { free(devices) }
-            return count > 0
-        }) ?? false
-    }
-
     // MARK: - FFI
-
-    /// Establish the tunnel + image-mounter client, run `body`, and tear it all
-    /// down. Every handle here is a raw Rust allocation, so the cleanup is
-    /// deliberately unconditional rather than tied to the happy path.
-    nonisolated private static func withMounterClient<T>(pairingPath: String,
-                                             _ body: (OpaquePointer) throws -> T) throws -> T {
-        var pairing: OpaquePointer?
-        try check("Reading pairing file") { rp_pairing_file_read(pairingPath, &pairing) }
-        defer { if let pairing { rp_pairing_file_free(pairing) } }
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = tunnelPort.bigEndian
-        guard tunnelAddress.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else {
-            throw DDIError.tunnelUnavailable("bad tunnel address \(tunnelAddress)")
-        }
-
-        var adapter: OpaquePointer?
-        var handshake: OpaquePointer?
-        try withUnsafePointer(to: &addr) { ptr in
-            try ptr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { sa in
-                try check("Connecting to the device") {
-                    tunnel_create_rppairing(sa, idevice_socklen_t(MemoryLayout<sockaddr_in>.size),
-                                            "iCTRL", pairing, nil, nil, &adapter, &handshake)
-                }
-            }
-        }
-        defer {
-            if let handshake { rsd_handshake_free(handshake) }
-            if let adapter { adapter_free(adapter) }
-        }
-        guard let adapter, let handshake else {
-            throw DDIError.tunnelUnavailable("tunnel returned no handles")
-        }
-
-        var client: OpaquePointer?
-        try check("Opening the image mounter") {
-            image_mounter_connect_rsd(adapter, handshake, &client)
-        }
-        defer { if let client { image_mounter_free(client) } }
-        guard let client else { throw DDIError.ffi("Opening the image mounter", "no client") }
-
-        return try body(client)
-    }
 
     nonisolated private static func performMount(pairingPath: String, image: Data, trustCache: Data,
                                      manifest: Data,
