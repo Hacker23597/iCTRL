@@ -20,6 +20,10 @@ final class NetworkTypeMonitor {
     private let queue = DispatchQueue(label: "com.openminis.ictrl.netmonitor")
     private let lock = NSLock()
     private var cached: NetworkType = .other
+    /// Set once the first path update lands. Until then `current` is a default,
+    /// not an observation — the distinction matters to anything gating UI on it.
+    private var hasResolved = false
+    private var observers: [(NetworkType) -> Void] = []
 
     private init() {
         monitor.pathUpdateHandler = { [weak self] path in
@@ -39,7 +43,31 @@ final class NetworkTypeMonitor {
         } else {
             type = .other
         }
-        lock.lock(); cached = type; lock.unlock()
+        lock.lock()
+        cached = type
+        hasResolved = true
+        let toNotify = observers
+        lock.unlock()
+        for notify in toNotify { notify(type) }
+    }
+
+    /// True once a real path update has been seen. `current` before this is the
+    /// initial default and should not be treated as an answer.
+    var isResolved: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return hasResolved
+    }
+
+    /// Observe changes. Fires immediately if a path has already been resolved, so
+    /// a late subscriber isn't left waiting for the next change that may never
+    /// come on a stable connection.
+    func observe(_ handler: @escaping (NetworkType) -> Void) {
+        lock.lock()
+        observers.append(handler)
+        let resolved = hasResolved
+        let type = cached
+        lock.unlock()
+        if resolved { handler(type) }
     }
 
     /// Current network type. Reflects the most recent path update; the monitor is

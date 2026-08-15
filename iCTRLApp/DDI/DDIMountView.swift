@@ -20,6 +20,7 @@ struct DDIMountView: View {
     @State private var vpnInstalled = false
     @State private var tunnelUp = false
     @State private var onWiFi = false
+    @State private var networkObserved = false
 
     /// All three prerequisites, in the order the steps present them. The tunnel
     /// is included because it drops on every reboot — leaving it out let the
@@ -27,7 +28,7 @@ struct DDIMountView: View {
     /// All prerequisites, in the order the steps present them. Wi-Fi is included
     /// because the tunnel needs a local interface that cellular doesn't offer.
     private var canMount: Bool {
-        imagesReady && onWiFi && tunnelUp && hasPairingFile && !mounter.isRunning
+        hasPairingFile && imagesReady && onWiFi && tunnelUp && !mounter.isRunning
     }
 
     var body: some View {
@@ -42,10 +43,13 @@ struct DDIMountView: View {
                 // Order matters: download the image before touching the VPN.
                 // The tunnel takes over local networking, so fetching ~100MB
                 // afterwards is asking for a stalled download.
+                // Pairing file first: it is the one step that needs another
+                // machine, so surfacing it early avoids finishing the on-device
+                // steps only to discover a Mac is required.
+                pairingSection
                 imageSection
                 wifiSection
                 tunnelSection
-                pairingSection
                 mountSection
             }
             .listStyle(.insetGrouped)
@@ -56,7 +60,10 @@ struct DDIMountView: View {
                     Button(L10n.t(.doneButton)) { dismiss() }
                 }
             }
-            .onAppear { refreshVPNState() }
+            .onAppear {
+                refreshVPNState()
+                subscribeToNetworkOnce()
+            }
             .onReceive(NotificationCenter.default.publisher(
                 for: UIApplication.didBecomeActiveNotification)) { _ in refreshVPNState() }
             .onOpenURL { _ in refreshVPNState() }   // LocalDevVPN bounced us back
@@ -80,18 +87,38 @@ struct DDIMountView: View {
 
     /// Names the first unmet prerequisite, so a disabled button explains itself.
     private var missingPrerequisite: String {
+        if !hasPairingFile { return L10n.t(.noPairingFile) }
         if !imagesReady { return L10n.t(.imagesNotDownloaded) }
         if !onWiFi { return L10n.t(.notOnWiFi) }
         if !tunnelUp {
             return vpnInstalled ? L10n.t(.vpnNotConnected) : L10n.t(.vpnNotInstalled)
         }
-        if !hasPairingFile { return L10n.t(.noPairingFile) }
         return "something is missing"
     }
+
+    /// …and subscribe once for later changes.
+    ///
+    /// NWPathMonitor resolves asynchronously, so a single read at appear returns
+    /// the pre-update default — which reported "not on Wi-Fi" on a device that
+    /// plainly was. The observer fires immediately when the path is already
+    /// known, and again whenever it changes. Guarded because refreshVPNState
+    /// runs on every appear and return-to-foreground; subscribing there would
+    /// stack observers that never go away.
+    private func subscribeToNetworkOnce() {
+        guard !networkObserved else { return }
+        networkObserved = true
+        NetworkTypeMonitor.shared.observe { type in
+            Task { @MainActor in onWiFiChanged(type == .wifi) }
+        }
+    }
+
+    /// Hop back to the main actor for the @State write.
+    @MainActor private func onWiFiChanged(_ connected: Bool) { onWiFi = connected }
 
     private func refreshVPNState() {
         vpnInstalled = LocalDevVPN.isInstalled
         tunnelUp = LocalDevVPN.isTunnelUp()
+        // Read the current value on every refresh…
         onWiFi = NetworkTypeMonitor.shared.current == .wifi
     }
 
@@ -100,7 +127,7 @@ struct DDIMountView: View {
     //    of just naming an app and hoping.
     private var tunnelSection: some View {
         Section {
-            stepRow(3, done: tunnelUp,
+            stepRow(4, done: tunnelUp,
                     title: L10n.t(.startLocalDevVPN),
                     detail: tunnelUp
                         ? "\(L10n.t(.tunnelUpDetail)) (\(DDIMounter.tunnelAddress))"
@@ -131,7 +158,7 @@ struct DDIMountView: View {
     //    does not provide — so any Wi-Fi will do, but some Wi-Fi is required.
     private var wifiSection: some View {
         Section {
-            stepRow(2, done: onWiFi,
+            stepRow(3, done: onWiFi,
                     title: L10n.t(.wifiRequired),
                     detail: onWiFi ? L10n.t(.wifiConnected) : L10n.t(.wifiMissing))
         } footer: {
@@ -142,7 +169,7 @@ struct DDIMountView: View {
     // ② The pairing file — proves to lockdownd that we're a trusted host.
     private var pairingSection: some View {
         Section {
-            stepRow(4, done: hasPairingFile,
+            stepRow(1, done: hasPairingFile,
                     title: L10n.t(.importPairingFile),
                     detail: hasPairingFile
                         ? "\(L10n.t(.pairingImported))\(PairingFileStore.importedAt.map { " · " + $0.formatted(date: .abbreviated, time: .shortened) } ?? "")"
@@ -170,7 +197,7 @@ struct DDIMountView: View {
     // ③ The image itself.
     private var imageSection: some View {
         Section {
-            stepRow(1, done: imagesReady,
+            stepRow(2, done: imagesReady,
                     title: L10n.t(.ddiComponentTitle),
                     detail: imagesReady
                         ? "\(L10n.t(.ddiDownloaded)) · \(ByteCountFormatter.string(fromByteCount: DeveloperDiskImageStore.totalBytesOnDisk, countStyle: .file))"

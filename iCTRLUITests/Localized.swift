@@ -218,9 +218,9 @@ enum L10n {
         .choosePairingFile: [.en: "Choose pairing file…", .zhHans: "选择配对文件…", .zhHant: "選擇配對檔案…"],
         .replacePairingFile: [.en: "Replace pairing file…", .zhHans: "更换配对文件…", .zhHant: "更換配對檔案…"],
         .removePairingFile: [.en: "Remove pairing file", .zhHans: "删除配对文件", .zhHant: "刪除配對檔案"],
-        .pairingHint: [.en: "Generate it on a Mac with `idevicepair pair`, then send it here (AirDrop, Files, iCloud).",
-                       .zhHans: "在 Mac 上用 `idevicepair pair` 生成，然后传到这里（隔空投送、文件、iCloud）。",
-                       .zhHant: "在 Mac 上用 `idevicepair pair` 產生，然後傳到這裡（AirDrop、檔案、iCloud）。"],
+        .pairingHint: [.en: "Export it from iLoader on this device — no Mac needed. Otherwise generate it on a Mac with `idevicepair pair` and send it here (AirDrop, Files, iCloud).",
+                       .zhHans: "可直接用本机的 iLoader 导出，无需 Mac。也可以在 Mac 上用 `idevicepair pair` 生成后传过来（隔空投送、文件、iCloud）。",
+                       .zhHant: "可直接用本機的 iLoader 匯出，無需 Mac。也可以在 Mac 上用 `idevicepair pair` 產生後傳過來（AirDrop、檔案、iCloud）。"],
         .pairingImported: [.en: "Imported", .zhHans: "已导入", .zhHant: "已匯入"],
 
         .ddiComponentTitle: [.en: "Developer Disk Image", .zhHans: "开发者磁盘镜像", .zhHant: "開發者磁碟映像"],
