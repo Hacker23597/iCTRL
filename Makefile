@@ -20,6 +20,7 @@ RUNNER_IPA    = iCTRLUITests-Runner.ipa
 # ──────────────────────────────────────────────
 # Build both targets with Xcode signing
 # ──────────────────────────────────────────────
+build: Frameworks/IDevice.xcframework
 build:
 	xcodebuild build-for-testing \
 		-project $(PROJECT) \
@@ -176,3 +177,8 @@ help:
 	@echo "  make build   Build both apps with Xcode signing"
 	@echo "  make ipa     Build + package both IPAs"
 	@echo "  make clean   Remove build artifacts"
+
+# The idevice xcframework is a 215MB release asset, not vendored (see
+# Scripts/fetch-idevice.sh). Fetch it on demand so a fresh clone builds.
+Frameworks/IDevice.xcframework:
+	@bash Scripts/fetch-idevice.sh

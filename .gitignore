@@ -12,3 +12,6 @@ iCTRL.xcodeproj/
 # Xcode user state
 xcuserdata/
 *.xcuserstate
+
+# Fetched by Scripts/fetch-idevice.sh (215MB release asset, not vendored)
+Frameworks/

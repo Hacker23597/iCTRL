@@ -17,6 +17,13 @@ targets:
     sources:
       - path: iCTRLApp
       - path: iCTRLKit
+    dependencies:
+      # idevice (MIT) — the lockdown/RSD/image-mounter client that does the
+      # actual DDI mount. Fetched by Scripts/fetch-idevice.sh rather than
+      # committed: the upstream xcframework is a 215MB release asset and is not
+      # in the repo tree, so SPM cannot resolve it by URL.
+      - framework: Frameworks/IDevice.xcframework
+        embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.openminis.ictrl

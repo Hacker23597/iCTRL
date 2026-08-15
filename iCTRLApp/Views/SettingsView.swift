@@ -15,6 +15,7 @@ struct SettingsView: View {
     /// at launch goes stale silently.
     @State private var ddi = DeveloperDiskImage.status()
     @State private var launchFailed = false
+    @State private var showMountSheet = false
 
     /// The runner registers this scheme; opening it starts the automation server.
     private static let runnerURL = URL(string: "ictrl://start")!
@@ -57,6 +58,16 @@ struct SettingsView: View {
                             .foregroundColor(.secondary)
                     }
                 }
+                // Offer the on-device mount whenever there's nothing mounted.
+                // This is the only path that doesn't need a Mac, so it belongs
+                // next to the status that reports the problem.
+                if !ddi.isMounted {
+                    Button {
+                        showMountSheet = true
+                    } label: {
+                        Label("Mount without a Mac…", systemImage: "externaldrive.badge.plus")
+                    }
+                }
             } header: {
                 Text("Automation")
             } footer: {
@@ -66,38 +77,31 @@ struct SettingsView: View {
                 Text(ddi.advice ?? "The automation runner can launch on this device. Tap Start to run it.")
             }
 
-            // Recovery path, shown only when it's actually needed. A DDI normally
-            // requires a Mac; these two apps together can mount one on-device.
+            // Fallback only. The in-app mount above does the same job without
+            // leaving iCTRL; StikDebug stays listed because it is the
+            // battle-tested implementation this port is based on, and is worth
+            // trying if our mount fails on a device we haven't seen.
             if !ddi.isMounted {
                 Section {
                     HelperRow(
                         index: 1,
                         title: "LocalDevVPN",
-                        detail: "Open it and start the tunnel. StikDebug reaches this device's lockdownd through it.",
+                        detail: "Required either way — it makes this device's debug service reachable.",
                         actionTitle: "App Store",
                         url: Self.localDevVPNURL
                     )
                     HelperRow(
                         index: 2,
                         title: "StikDebug",
-                        detail: "With the tunnel running, it mounts the Developer Disk Image. Sideload it from stikdebug.xyz — it isn't on the App Store.",
+                        detail: "An alternative mounter, if the in-app one fails. Sideload from stikdebug.xyz — it isn't on the App Store.",
                         actionTitle: "Open",
                         url: Self.stikDebugURL,
                         fallbackURL: Self.stikDebugSiteURL
                     )
-                    HelperRow(
-                        index: 3,
-                        title: "Return here",
-                        detail: "Reopen iCTRL — the status above refreshes, and Start becomes available.",
-                        actionTitle: nil,
-                        url: nil
-                    )
                 } header: {
-                    Text("Mount without a Mac")
+                    Text("Alternative")
                 } footer: {
-                    // Setting expectations: the DDI is not persistent on iOS 17+,
-                    // so this is a per-reboot chore, not a one-time fix.
-                    Text("The Developer Disk Image doesn't survive a reboot, so this has to be repeated after each restart.")
+                    Text("The Developer Disk Image doesn't survive a reboot, so mounting has to be repeated after each restart — by either route.")
                 }
             }
 
@@ -148,6 +152,12 @@ struct SettingsView: View {
             }
         }
         .onAppear { ddi = DeveloperDiskImage.status() }
+        .sheet(isPresented: $showMountSheet, onDismiss: {
+            // Re-probe: a successful mount changes what the status row should say.
+            ddi = DeveloperDiskImage.status()
+        }) {
+            DDIMountView()
+        }
     }
 
     private func startRunner() {
