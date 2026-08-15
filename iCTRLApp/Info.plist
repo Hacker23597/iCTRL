@@ -18,6 +18,7 @@
 		<string>ictrl</string>
 		<string>stikdebug</string>
 		<string>stikjit</string>
+		<string>localdevvpn</string>
 	</array>
 </dict>
 </plist>

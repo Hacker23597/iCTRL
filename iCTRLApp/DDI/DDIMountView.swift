@@ -17,6 +17,8 @@ struct DDIMountView: View {
     @State private var hasPairingFile = PairingFileStore.exists
     @State private var imagesReady = DeveloperDiskImageStore.isComplete
     @State private var downloadError: String?
+    @State private var vpnInstalled = false
+    @State private var tunnelUp = false
 
     private var canMount: Bool { hasPairingFile && imagesReady && !mounter.isRunning }
 
@@ -43,6 +45,8 @@ struct DDIMountView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .onAppear { refreshVPNState() }
+            .onOpenURL { _ in refreshVPNState() }   // LocalDevVPN bounced us back
             .fileImporter(isPresented: $showPairingPicker,
                           allowedContentTypes: PairingFileStore.supportedContentTypes) { result in
                 switch result {
@@ -61,64 +65,62 @@ struct DDIMountView: View {
         }
     }
 
-    // ① The tunnel — supplied by another app, so this step can only instruct.
+    private func refreshVPNState() {
+        vpnInstalled = LocalDevVPN.isInstalled
+        tunnelUp = LocalDevVPN.isTunnelUp()
+    }
+
+    // ① The tunnel. LocalDevVPN exposes localdevvpn://enable?scheme=…, so this
+    //    can send the user straight into connecting and get them back, instead
+    //    of just naming an app and hoping.
     private var tunnelSection: some View {
         Section {
-            Label {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Start LocalDevVPN")
-                    Text("Open it and connect. It makes this device's debug service reachable "
-                       + "at \(DDIMounter.tunnelAddress) — iCTRL talks to it the same way Xcode "
-                       + "on a Mac would.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+            stepRow(1, done: tunnelUp,
+                    title: "Start LocalDevVPN",
+                    detail: tunnelUp
+                        ? "Tunnel is up — this device's debug service is reachable at \(DDIMounter.tunnelAddress)."
+                        : vpnInstalled
+                          ? "Installed. Connect it so this device's debug service becomes reachable at \(DDIMounter.tunnelAddress)."
+                          : "Not installed. It makes this device's debug service reachable — iCTRL then talks to it the same way Xcode on a Mac would.")
+
+            if !tunnelUp {
+                actionButton(vpnInstalled ? "Open LocalDevVPN & connect" : "Get LocalDevVPN on the App Store") {
+                    // enable? starts the tunnel and bounces back to us; the bare
+                    // App Store link is the fallback when it isn't installed.
+                    UIApplication.shared.open(vpnInstalled ? LocalDevVPN.enableURL
+                                                           : LocalDevVPN.appStoreURL)
                 }
-            } icon: {
-                stepNumber(1)
             }
-            Link("Get LocalDevVPN on the App Store",
-                 destination: URL(string: "https://apps.apple.com/app/localdevvpn/id6755608044")!)
-                .font(.footnote)
         } header: {
             Text("Prerequisite")
         } footer: {
-            // Stated plainly because it is the one step iCTRL cannot verify or
-            // perform, and its absence shows up as a confusing connection error.
-            Text("iCTRL can't start the VPN for you, and can't tell whether it's running — "
-               + "if mounting fails to connect, check it first.")
+            if tunnelUp {
+                Text("Detected by the tunnel's address being present on this device.")
+            } else {
+                Text("iCTRL can't connect the VPN for you — tapping above opens it to do that. "
+                   + "If mounting still fails to connect, check it there first.")
+            }
         }
     }
 
     // ② The pairing file — proves to lockdownd that we're a trusted host.
     private var pairingSection: some View {
         Section {
-            Label {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Import a pairing file")
-                    Text(hasPairingFile
-                         ? "Imported\(PairingFileStore.importedAt.map { " · " + $0.formatted(date: .abbreviated, time: .shortened) } ?? "")"
-                         : "Generate it on a Mac with `idevicepair pair`, then send it here "
-                         + "(AirDrop, Files, iCloud).")
-                        .font(.caption)
-                        .foregroundColor(hasPairingFile ? .green : .secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            } icon: {
-                stepNumber(2, done: hasPairingFile)
-            }
+            stepRow(2, done: hasPairingFile,
+                    title: "Import a pairing file",
+                    detail: hasPairingFile
+                        ? "Imported\(PairingFileStore.importedAt.map { " · " + $0.formatted(date: .abbreviated, time: .shortened) } ?? "")"
+                        : "Generate it on a Mac with `idevicepair pair`, then send it here (AirDrop, Files, iCloud).")
 
-            Button(hasPairingFile ? "Replace pairing file…" : "Choose pairing file…") {
+            actionButton(hasPairingFile ? "Replace pairing file…" : "Choose pairing file…") {
                 showPairingPicker = true
             }
-            .font(.footnote)
 
             if hasPairingFile {
-                Button("Remove pairing file", role: .destructive) {
+                actionButton("Remove pairing file", role: .destructive) {
                     PairingFileStore.remove()
                     hasPairingFile = false
                 }
-                .font(.footnote)
             }
 
             if let pairingError {
@@ -132,20 +134,11 @@ struct DDIMountView: View {
     // ③ The image itself.
     private var imageSection: some View {
         Section {
-            Label {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Developer Disk Image")
-                    Text(imagesReady
-                         ? "Downloaded · \(ByteCountFormatter.string(fromByteCount: DeveloperDiskImageStore.totalBytesOnDisk, countStyle: .file))"
-                         : "About 100 MB. Downloaded once and reused — only the mount has to be "
-                         + "repeated after a reboot.")
-                        .font(.caption)
-                        .foregroundColor(imagesReady ? .green : .secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            } icon: {
-                stepNumber(3, done: imagesReady)
-            }
+            stepRow(3, done: imagesReady,
+                    title: "Developer Disk Image",
+                    detail: imagesReady
+                        ? "Downloaded · \(ByteCountFormatter.string(fromByteCount: DeveloperDiskImageStore.totalBytesOnDisk, countStyle: .file))"
+                        : "About 100 MB. Downloaded once and reused — only the mount has to be repeated after a reboot.")
 
             if images.isDownloading {
                 VStack(alignment: .leading, spacing: 4) {
@@ -155,7 +148,7 @@ struct DDIMountView: View {
                     }
                 }
             } else if !imagesReady {
-                Button("Download image files") {
+                actionButton("Download image files") {
                     Task {
                         do {
                             try await images.download()
@@ -166,7 +159,6 @@ struct DDIMountView: View {
                         }
                     }
                 }
-                .font(.footnote)
             }
 
             if let downloadError {
@@ -241,7 +233,42 @@ struct DDIMountView: View {
         }
     }
 
-    private func stepNumber(_ n: Int, done: Bool = false) -> some View {
+    /// One numbered step: badge, title, explanation.
+    ///
+    /// The badge is the row's `Label` icon, so SwiftUI indents the text to a
+    /// consistent leading edge — and `actionButton` pads to match, which is what
+    /// keeps a step's button aligned with its own text instead of the card edge.
+    private func stepRow(_ n: Int, done: Bool, title: String, detail: String) -> some View {
+        Label {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                Text(detail)
+                    .font(.subheadline)
+                    .foregroundColor(done ? .green : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } icon: {
+            stepBadge(n, done: done)
+        }
+    }
+
+    /// A step's action, indented to line up with that step's text.
+    ///
+    /// `.body` rather than `.footnote`: these are the things the user is meant
+    /// to tap, and at caption size they read as annotations instead of actions.
+    private func actionButton(_ title: String, role: ButtonRole? = nil,
+                              action: @escaping () -> Void) -> some View {
+        Button(role: role, action: action) {
+            Text(title)
+                .font(.body)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        // Matches the badge (22) + Label's icon spacing, so the button's text
+        // starts exactly under the step's title.
+        .padding(.leading, 30)
+    }
+
+    private func stepBadge(_ n: Int, done: Bool) -> some View {
         ZStack {
             Circle()
                 .fill(done ? Color.green : Color.accentColor)
