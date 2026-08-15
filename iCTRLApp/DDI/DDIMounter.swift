@@ -56,7 +56,14 @@ final class DDIMounter: ObservableObject {
         case failed(String)
     }
 
-    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var phase: Phase = .idle {
+        didSet {
+            // Progress ticks would flood the file; every other transition is
+            // exactly the breadcrumb trail a failed mount needs.
+            if case .uploading = phase { return }
+            ictrlLog("DDI phase → \(phase)")
+        }
+    }
 
     var isRunning: Bool {
         switch phase {
@@ -108,6 +115,7 @@ final class DDIMounter: ObservableObject {
 
             phase = .mounted
         } catch {
+            ictrlLog("❌ DDI mount failed: \(error.localizedDescription)")
             phase = .failed(error.localizedDescription)
         }
     }
@@ -128,6 +136,7 @@ final class DDIMounter: ObservableObject {
     /// expected to be short-lived; failures here are deliberately ignored,
     /// because the goal is the provider install, not the session.
     nonisolated private static func primeCryptoProvider() {
+        ictrlLog("Priming rustls crypto provider via a throwaway session")
         var pairing: OpaquePointer?
         guard idevice_pairing_file_read(PairingFileStore.storedURL.path, &pairing) == nil,
               let pairing else { return }
@@ -160,6 +169,7 @@ final class DDIMounter: ObservableObject {
     nonisolated private static func performMount(pairingPath: String, image: Data, trustCache: Data,
                                      manifest: Data,
                                      report: @escaping (Phase) -> Void) throws {
+        ictrlLog("DDI mount starting — image \(image.count)B, trustcache \(trustCache.count)B, manifest \(manifest.count)B")
         primeCryptoProvider()
 
         var pairing: OpaquePointer?
@@ -276,6 +286,7 @@ final class DDIMounter: ObservableObject {
         let message = err.pointee.message.map { String(cString: $0) } ?? "code \(err.pointee.code)"
         let code = err.pointee.code
         idevice_error_free(err)
+        ictrlLog("❌ \(operation): \(message) (code \(code))")
         throw DDIError.ffi(operation, "\(message) (code \(code))")
     }
 }

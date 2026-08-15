@@ -17,6 +17,7 @@ struct SettingsView: View {
     @State private var launchFailed = false
     @State private var showMountSheet = false
     @StateObject private var runner = RunnerStatus(port: 8200)
+    @State private var logCount = AppLog.allFiles().count
 
     /// The runner registers this scheme; opening it starts the automation server.
     ///
@@ -106,8 +107,23 @@ struct SettingsView: View {
                     Text("JSON-RPC 2.0")
                         .foregroundColor(.secondary)
                 }
+                NavigationLink {
+                    LogListView()
+                } label: {
+                    HStack {
+                        Text("Logs")
+                        Spacer()
+                        Text(verbatim: "\(logCount)")
+                            .foregroundColor(.secondary)
+                    }
+                }
             } header: {
                 Text("About")
+            } footer: {
+                // The mount runs through a Rust FFI that aborts rather than
+                // throws, so when it fails the log is often the only artifact
+                // besides a crash report — and it can be shared from here.
+                Text("One log per run, kept for the last 20. Tap to read or share one.")
             }
         }
         .listStyle(.insetGrouped)
@@ -115,6 +131,7 @@ struct SettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             ddi = DeveloperDiskImage.status()
+            logCount = AppLog.allFiles().count
             runner.startPolling()
         }
         .onDisappear { runner.stopPolling() }

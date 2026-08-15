@@ -64,6 +64,7 @@ enum PairingFileStore {
         try data.write(to: dest, options: [.atomic, .completeFileProtection])
         try? FileManager.default.setAttributes([.posixPermissions: 0o600],
                                                ofItemAtPath: dest.path)
+        ictrlLog("Pairing file imported (\(data.count)B)")
     }
 
     static func remove() {

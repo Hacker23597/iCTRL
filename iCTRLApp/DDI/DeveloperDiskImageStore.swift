@@ -111,6 +111,7 @@ final class DeveloperDiskImageStore: ObservableObject {
             }
         }
         try data.write(to: dest, options: .atomic)
+        ictrlLog("Downloaded \(component.rawValue) — \(data.count)B")
         onProgress(1.0)
     }
 
