@@ -358,6 +358,13 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             self.verifyRemoteReachableThenNotify(address: self.getDeviceAddress(), announceSuccess: false)
         }
 
+        // Drain immediately on any incoming URL rather than waiting for the
+        // safety timer — a warm runner would otherwise take up to 2s to bounce
+        // back, which reads as "the callback didn't work".
+        URLSchemeHandler.shared.onURLReceived = { [weak self] in
+            DispatchQueue.main.async { self?.handlePendingCallbackIfAny() }
+        }
+
         // If launched via ictrl://start?callback=..., jump back to the caller now.
         handlePendingCallbackIfAny()
 

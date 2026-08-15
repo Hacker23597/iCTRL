@@ -26,6 +26,10 @@ final class URLSchemeHandler {
 
     private init() {}
 
+    /// Called when a fresh URL lands, so the test's run loop can drain it
+    /// immediately instead of waiting for the next safety-timer tick.
+    var onURLReceived: (() -> Void)?
+
     func record(_ url: URL) {
         guard url.scheme?.lowercased() == Self.scheme else { return }
         lock.lock()
@@ -35,6 +39,13 @@ final class URLSchemeHandler {
         }
         lock.unlock()
         iCTRLUITests.logBuffer.append("🔗 Received URL: \(url.scheme ?? "")://\(url.host ?? "")")
+
+        // Wake the waiting run loop. It blocks on distantFuture, so without a
+        // nudge a URL arriving at an already-running runner sat in the queue
+        // until the 2s timer happened to fire — long enough that the callback
+        // looked like it never came, and the user was left staring at a blank
+        // XCTest screen.
+        onURLReceived?()
     }
 
     /// Returns and clears ALL pending URLs (oldest first). Also pulls in anything
