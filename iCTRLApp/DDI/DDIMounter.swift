@@ -114,9 +114,54 @@ final class DDIMounter: ObservableObject {
 
     // MARK: - FFI
 
+    /// Force the rustls crypto provider to be installed before anything needs it.
+    ///
+    /// The TSS request builds a reqwest client, and this library is compiled
+    /// with `rustls-no-provider` — so if no process-default provider has been
+    /// installed, `Client::new()` panics and aborts the app. The library only
+    /// installs one from inside `start_session`, which the RSD path never calls
+    /// (an RSD connection is already authenticated by the RemotePairing
+    /// handshake — calling it there is what produced InvalidConnection).
+    ///
+    /// So we open a throwaway plain connection to the tunnel and start a session
+    /// on it purely for that side effect. Both the connection and the session are
+    /// expected to be short-lived; failures here are deliberately ignored,
+    /// because the goal is the provider install, not the session.
+    nonisolated private static func primeCryptoProvider() {
+        var pairing: OpaquePointer?
+        guard idevice_pairing_file_read(PairingFileStore.storedURL.path, &pairing) == nil,
+              let pairing else { return }
+        defer { idevice_pairing_file_free(pairing) }
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = tunnelPort.bigEndian
+        guard tunnelAddress.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else { return }
+
+        var device: OpaquePointer?
+        withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { sa in
+                if let err = idevice_new_tcp_socket(sa, idevice_socklen_t(MemoryLayout<sockaddr_in>.size),
+                                                    "iCTRL-crypto-prime", &device) {
+                    idevice_error_free(err)
+                }
+            }
+        }
+        guard let device else { return }
+        defer { idevice_free(device) }
+
+        // The session itself may well fail — the provider is installed before
+        // that can matter, which is the whole point of the call.
+        if let err = idevice_start_session(device, pairing, false) {
+            idevice_error_free(err)
+        }
+    }
+
     nonisolated private static func performMount(pairingPath: String, image: Data, trustCache: Data,
                                      manifest: Data,
                                      report: @escaping (Phase) -> Void) throws {
+        primeCryptoProvider()
+
         var pairing: OpaquePointer?
         try check("Reading pairing file") { rp_pairing_file_read(pairingPath, &pairing) }
         defer { if let pairing { rp_pairing_file_free(pairing) } }
