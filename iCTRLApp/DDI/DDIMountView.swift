@@ -20,7 +20,10 @@ struct DDIMountView: View {
     @State private var vpnInstalled = false
     @State private var tunnelUp = false
 
-    private var canMount: Bool { hasPairingFile && imagesReady && !mounter.isRunning }
+    /// All three prerequisites, in the order the steps present them. The tunnel
+    /// is included because it drops on every reboot — leaving it out let the
+    /// mount fail with a socket error naming nothing the user could act on.
+    private var canMount: Bool { tunnelUp && hasPairingFile && imagesReady && !mounter.isRunning }
 
     var body: some View {
         NavigationStack {
@@ -46,6 +49,8 @@ struct DDIMountView: View {
                 }
             }
             .onAppear { refreshVPNState() }
+            .onReceive(NotificationCenter.default.publisher(
+                for: UIApplication.didBecomeActiveNotification)) { _ in refreshVPNState() }
             .onOpenURL { _ in refreshVPNState() }   // LocalDevVPN bounced us back
             .fileImporter(isPresented: $showPairingPicker,
                           allowedContentTypes: PairingFileStore.supportedContentTypes) { result in
@@ -63,6 +68,16 @@ struct DDIMountView: View {
                 }
             }
         }
+    }
+
+    /// Names the first unmet prerequisite, so a disabled button explains itself.
+    private var missingPrerequisite: String {
+        if !tunnelUp {
+            return vpnInstalled ? "LocalDevVPN isn't connected" : "LocalDevVPN isn't installed"
+        }
+        if !hasPairingFile { return "no pairing file imported" }
+        if !imagesReady { return "the image files aren't downloaded" }
+        return "something is missing"
     }
 
     private func refreshVPNState() {
@@ -217,6 +232,8 @@ struct DDIMountView: View {
             if case .mounted = mounter.phase {
                 Text("The image is not persistent — after a reboot, run this again. "
                    + "The pairing file and downloaded image are kept, so it's one tap.")
+            } else if !canMount, !mounter.isRunning {
+                Text("Finish the steps above first — \(missingPrerequisite).")
             } else {
                 Text("The first mount asks Apple's signing service for a ticket unique to this "
                    + "device, so it needs internet access.")

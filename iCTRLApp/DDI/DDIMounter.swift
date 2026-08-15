@@ -6,6 +6,7 @@ enum DDIError: LocalizedError {
     case missingPairingFile
     case missingImage
     case tunnelUnavailable(String)
+    case tunnelDown
     case ffi(String, String)          // operation, message
     case downloadFailed(String, String)
 
@@ -17,6 +18,9 @@ enum DDIError: LocalizedError {
             return "No pairing file imported yet."
         case .missingImage:
             return "Developer Disk Image files are missing — download them first."
+        case .tunnelDown:
+            return "LocalDevVPN isn't connected. The tunnel doesn't survive a reboot — "
+                 + "open LocalDevVPN and connect it (step 1), then mount again."
         case .tunnelUnavailable(let why):
             return "Can't reach the device's debug service: \(why)"
         case .ffi(let op, let msg):
@@ -81,6 +85,11 @@ final class DDIMounter: ObservableObject {
         do {
             guard PairingFileStore.exists else { throw DDIError.missingPairingFile }
             guard DeveloperDiskImageStore.isComplete else { throw DDIError.missingImage }
+            // Check the tunnel before dialling it. Without this a disconnected
+            // VPN surfaces as "device socket io failed", which names a socket
+            // rather than the step the user has to fix — and the tunnel is down
+            // after every reboot, so this is the common case, not an edge one.
+            guard LocalDevVPN.isTunnelUp() else { throw DDIError.tunnelDown }
 
             let pairingPath = PairingFileStore.storedURL.path
             let image = try Data(contentsOf: DeveloperDiskImageStore.url(for: .image))
@@ -331,6 +340,10 @@ final class DDIMounter: ObservableObject {
         // about why, so attach what it usually means rather than passing a bare
         // string to someone with no way to look it up.
         var detail = "\(message) (code \(code))"
+        if message.contains("device socket io failed") || message.contains("connect:") {
+            detail += ". The tunnel isn't reachable — LocalDevVPN is most likely disconnected "
+                    + "(it doesn't survive a reboot). Connect it and try again."
+        }
         if message.contains("ImageMountFailed") {
             detail += ". The device rejected the image — usually because it doesn't match this "
                     + "iOS version, or the download is incomplete. Re-download the image files "
