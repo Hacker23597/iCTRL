@@ -1,6 +1,31 @@
 import XCTest
 import UIKit
 
+extension XCUIElement {
+    /// `exists`, without the ability to kill the runner.
+    ///
+    /// The property looks like a field read but is a query XCTest resolves in
+    /// the target app across IPC, and it raises an Obj-C NSException when that
+    /// resolution fails. Swift can't intercept that — `try?` catches only Swift
+    /// `throws` — so it unwinds into XCTest's terminate handler and the process
+    /// dies with SIGABRT.
+    ///
+    /// Observed on iOS 16.1 (iPhone 8 Plus): `exists` threw from inside
+    /// `-[XCTActivityRecordStack didFinishActivity:]` on a background queue and
+    /// took the runner down mid-`find_element`. Older XCTest records an activity
+    /// per query and is stricter about that stack being balanced, so every one
+    /// of these reads is a crash risk on older systems even though the same code
+    /// has run for months on iOS 26.
+    var safeExists: Bool {
+        ForegroundApp.safeBoolProperty("exists", ofElement: self, fallback: false)
+    }
+
+    /// `isHittable`, guarded the same way and for the same reason.
+    var safeIsHittable: Bool {
+        ForegroundApp.safeBoolProperty("isHittable", ofElement: self, fallback: false)
+    }
+}
+
 class ActionHandler {
     private let app: XCUIApplication
     private let fastHandler: FastActionHandler
@@ -71,7 +96,7 @@ class ActionHandler {
         case .containsLabel(let v): query = base.matching(NSPredicate(format: "label CONTAINS[c] %@", v))
         }
         let el = query.element(boundBy: ref.index)
-        return el.exists ? el : nil
+        return el.safeExists ? el : nil
     }
 
     private func elementQuery(in target: XCUIApplication, type: String?) -> XCUIElementQuery {
@@ -783,7 +808,7 @@ class ActionHandler {
         guard let el = resolveRef(refId) else {
             return (nil, JSONRPCError(code: -32602, message: "ref '\(refId)' no longer resolves — element gone, view changed, or ref expired (refs live 1 hour). Re-find it with find_element/scroll_to_element.", data: nil))
         }
-        guard el.isHittable else {
+        guard el.safeIsHittable else {
             let f = el.frame
             return (nil, JSONRPCError(code: -32602, message: "Element for ref '\(refId)' exists but isn't hittable; scroll it fully into view (scroll_to_element) or tap its center by coordinate (\(Int(f.midX)),\(Int(f.midY))).", data: nil))
         }
@@ -1217,10 +1242,10 @@ class ActionHandler {
             let target = XCUIApplication(bundleIdentifier: bid)
             // The focused field usually surfaces as the element with keyboardFocus.
             let focused = target.textFields.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-            if focused.exists, let v = focused.value as? String { count = v.count }
+            if focused.safeExists, let v = focused.value as? String { count = v.count }
             if count == 0 {
                 let sv = target.secureTextFields.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-                if sv.exists, let v = sv.value as? String { count = v.count }
+                if sv.safeExists, let v = sv.value as? String { count = v.count }
             }
         }
         // Fall back to a generous fixed count if we couldn't measure it. Cap the
@@ -2210,8 +2235,8 @@ class ActionHandler {
             iCTRLUITests.logBuffer.append("🔎 locate '\(query)' \(hit) [\(phases.joined(separator: " "))] total=\(Int((nowMonotonic - t0) * 1000))ms")
         }
 
-        // Every .exists / .isHittable below is a round-trip that XCTest answers by
-        // walking the app's hierarchy, so each one scales with tree size. On a
+        // Every .safeExists / .safeIsHittable below is a round-trip that XCTest
+        // answers by walking the app's hierarchy, so each scales with tree size. On a
         // long-scrolled feed a single probe ran into seconds, and the old loop of
         // up to 10 of them turned one find_element into 69.8s — during which the
         // serial UI queue is blocked and every later request piles up behind it.
@@ -2219,8 +2244,8 @@ class ActionHandler {
         let liveQueryDeadline = nowMonotonic + Self.liveQueryBudget
         func firstHittable(_ query: XCUIElementQuery) -> (XCUIElement, Int)? {
             let first = query.element(boundBy: 0)
-            guard first.exists else { return nil }
-            if first.isHittable { return (first, 0) }
+            guard first.safeExists else { return nil }
+            if first.safeIsHittable { return (first, 0) }
             // Probe siblings only while budget remains; 3 is plenty in practice
             // (the wanted element is almost always the first or second match).
             for i in 1..<3 {
@@ -2229,8 +2254,8 @@ class ActionHandler {
                     break
                 }
                 let el = query.element(boundBy: i)
-                if !el.exists { break }
-                if el.isHittable { return (el, i) }
+                if !el.safeExists { break }
+                if el.safeIsHittable { return (el, i) }
             }
             return (first, 0)   // exists but not hittable — caller decides
         }
@@ -2266,7 +2291,7 @@ class ActionHandler {
             }
         }
 
-        // Run the live query under a hard wall-clock cap. A single .exists on a
+        // Run the live query under a hard wall-clock cap. A single .safeExists on a
         // huge tree has been seen to take tens of seconds and cannot be
         // cancelled, so the work continues in the background — but we stop
         // waiting on it and fall through, which keeps the RPC inside its own
@@ -2432,7 +2457,7 @@ class ActionHandler {
         } else {
             re = q.matching(NSPredicate(format: "label == %@", snap.label)).element(boundBy: 0)
         }
-        return re.exists ? (re, 0) : nil
+        return re.safeExists ? (re, 0) : nil
     }
 
     /// When a label/identifier match landed on a non-interactive element
@@ -2477,7 +2502,7 @@ class ActionHandler {
             best = (c, f)
         }
         phases.append("elevate=\(Int((nowMonotonic - t0) * 1000))ms/\(candidates.count)cands")
-        if let (bestEl, _) = best, bestEl.isHittable {
+        if let (bestEl, _) = best, bestEl.safeIsHittable {
             return (bestEl, matchIdx)
         }
         return (match, matchIdx)
@@ -2536,7 +2561,7 @@ class ActionHandler {
         let live = bestSnap.identifier.isEmpty
             ? query.matching(NSPredicate(format: "label == %@", bestSnap.label)).element(boundBy: 0)
             : query.matching(identifier: bestSnap.identifier).element(boundBy: 0)
-        if live.exists, live.isHittable { return (live, matchIdx, bestSnap) }
+        if live.safeExists, live.safeIsHittable { return (live, matchIdx, bestSnap) }
         return (match, matchIdx, snap)
     }
 
@@ -2594,7 +2619,7 @@ class ActionHandler {
             || element.elementType == .secureTextField
         var result: [String: JSONValue] = [
             "exists": .bool(true),
-            "hittable": .bool(element.isHittable),
+            "hittable": .bool(element.safeIsHittable),
             "ref": .string(ref),
             "element_type": .string(typeName),
             "is_text_input": .bool(isTextInput),
@@ -2646,7 +2671,7 @@ class ActionHandler {
         if cmd.fast == false {
             let f = element.frame
             let label = element.label
-            guard element.isHittable else {
+            guard element.safeIsHittable else {
                 return (nil, JSONRPCError(
                     code: -32602,
                     message: "find_and_tap: element '\(elementId)' exists but is not hittable (off-screen, covered, or zero-size). Scroll it into view (scroll_to_element).",
@@ -2688,7 +2713,7 @@ class ActionHandler {
         let label = lastLocateSnapLabel ?? ""
 
         ts = nowMonotonic
-        let hittable = element.isHittable
+        let hittable = element.safeIsHittable
         tail.append("hittable=\(Int((nowMonotonic - ts) * 1000))ms")
 
         guard hittable else {
@@ -2740,7 +2765,7 @@ class ActionHandler {
                 data: nil
             ))
         }
-        guard element.isHittable else {
+        guard element.safeIsHittable else {
             let f = element.frame
             return (nil, JSONRPCError(
                 code: -32602,

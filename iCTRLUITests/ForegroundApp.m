@@ -452,6 +452,21 @@ static id ICTRLDeepestLabelledNode(id snapshot, NSUInteger depth) {
     }
 }
 
++ (BOOL)safeBoolProperty:(NSString *)name ofElement:(id)element fallback:(BOOL)fallback {
+    if (!element) { return fallback; }
+    @try {
+        SEL sel = NSSelectorFromString(name);
+        if (![element respondsToSelector:sel]) { return fallback; }
+        BOOL (*fn)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
+        return fn(element, sel);
+    } @catch (NSException *e) {
+        // Answering "no" is the safe reading: a query XCTest can't resolve is
+        // not one the caller should act on.
+        NSLog(@"iCTRL: safeBoolProperty(%@) caught exception: %@", name, e.reason);
+        return fallback;
+    }
+}
+
 + (nullable id)boundedSnapshotForBundleID:(NSString *)bundleId
                                  maxDepth:(NSInteger)maxDepth
                               maxChildren:(NSInteger)maxChildren {

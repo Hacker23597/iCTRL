@@ -78,6 +78,24 @@ NS_ASSUME_NONNULL_BEGIN
 /// Returns nil when the snapshot is unavailable, so callers can fall back.
 + (nullable id)safeSnapshotOfElement:(id)element;
 
+/// Reads a BOOL property of an element without letting it kill the runner.
+///
+/// `exists` and `isHittable` look like plain property reads, but each one asks
+/// the target app to resolve the query across IPC — and XCTest raises an Obj-C
+/// NSException when that resolution fails. Swift cannot intercept it: `try?`
+/// only catches Swift `throws`, so the exception unwinds into XCTest's
+/// terminate handler and the process dies with SIGABRT.
+///
+/// Seen on iOS 16.1: `-[XCUIElement exists]` threw from inside
+/// `-[XCTActivityRecordStack didFinishActivity:]` while the caller was on a
+/// background queue, killing the runner outright. Older XCTest builds record
+/// an activity per query and are stricter about the stack being balanced, so
+/// this is far likelier off the main queue and on older systems.
+///
+/// `fallback` is returned when the read throws, letting the caller treat an
+/// unanswerable query as "no" rather than as a crash.
++ (BOOL)safeBoolProperty:(NSString *)name ofElement:(id)element fallback:(BOOL)fallback;
+
 /// Fetches an accessibility snapshot with the traversal bounded ON THE DEVICE.
 ///
 /// `XCUIElement.snapshot()` asks the target app to walk and serialise its whole
