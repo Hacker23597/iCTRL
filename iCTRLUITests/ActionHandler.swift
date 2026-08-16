@@ -354,6 +354,8 @@ class ActionHandler {
             return isLocked()
         case "reset":
             return reset()
+        case "snapshot_bench":
+            return snapshotBench(cmd)
         case "list_apps", "installed_apps":
             return listApps(cmd)
         case "resolve_app", "search_app", "search_apps":
@@ -628,8 +630,10 @@ class ActionHandler {
             "hint": .string(
                 "All tap/swipe/drag/long_press coordinates are in POINTS, range " +
                 "x∈[0,\(Int(frame.width))] y∈[0,\(Int(frame.height))]. " +
-                "Screenshots are \(Int(frame.width * s))×\(Int(frame.height * s)) PIXELS. " +
-                "To tap a screenshot location: point = pixel / \(s). " +
+                "screen_scale (\(s)) is the PANEL's ratio — do NOT divide screenshot pixels by it. " +
+                "A screenshot defaults to scale 2 (\(Int(frame.width * 2))×\(Int(frame.height * 2)) px), " +
+                "so dividing by \(s) would put a tap far off target. Always read `scale` from the " +
+                "screenshot response itself and use point = pixel / that scale. " +
                 "Bottom tab bars sit above the home-indicator safe area (~y \(Int(frame.height) - 60)–\(Int(frame.height) - 20))."
             ),
             // Live device health. This is the call /remote polls for its status
@@ -855,19 +859,44 @@ class ActionHandler {
         if let refId = cmd.ref {
             let (el, err) = resolveRefForAction(refId)
             if let err = err { return (nil, err) }
+            // Synthesized rather than XCUIElement.doubleTap(), for the same
+            // reason tap(ref:) synthesizes: the native gesture waits for
+            // quiescence on both sides — measured 6230ms here, and it timed out
+            // hard enough to trip the UI circuit breaker.
+            let f = el!.frame
+            let label = el!.label
+            let (cx, cy) = humanizedPoint(in: f)
+            let r = fastHandler.fastDoubleTap(x: cx, y: cy)
+            if r.1 == nil {
+                return (["message": .string("Double tapped ref \(refId) ('\(label)')")], nil)
+            }
             el!.doubleTap()
-            return (["message": .string("Double tapped ref \(refId) ('\(el!.label)')")], nil)
+            return (["message": .string("Double tapped ref \(refId) ('\(label)') (native)")], nil)
         }
         guard let x = cmd.x, let y = cmd.y else {
             return (nil, JSONRPCError(code: -32602, message: "double_tap requires x and y (in points), or a 'ref'", data: nil))
         }
         if let err = validateCoordinate(x: x, y: y, context: "double_tap") { return (nil, err) }
 
+        if cmd.fast != false {
+            // mode:"separate" sends two independent synthesize calls; the default
+            // packs both presses into one event path so the gap is exact.
+            let separate = (cmd.matchMode ?? "").lowercased() == "separate"
+            let r = separate
+                ? fastHandler.fastDoubleTapSeparate(x: x, y: y)
+                : fastHandler.fastDoubleTap(x: x, y: y)
+            if r.1 == nil {
+                return (["message": .string("Double tapped at (\(x), \(y))" +
+                                            (separate ? " (two records)" : " (one record)")),
+                         "screen": coordinateHint], nil)
+            }
+        }
+
         let normalized = app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
         let coordinate = normalized.withOffset(CGVector(dx: x, dy: y))
         coordinate.doubleTap()
 
-        return (["message": .string("Double tapped at (\(x), \(y))"), "screen": coordinateHint], nil)
+        return (["message": .string("Double tapped at (\(x), \(y)) (native)"), "screen": coordinateHint], nil)
     }
 
     private func longPress(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
@@ -876,19 +905,37 @@ class ActionHandler {
         if let refId = cmd.ref {
             let (el, err) = resolveRefForAction(refId)
             if let err = err { return (nil, err) }
+            let label = el!.label
+            // Native: a synthesized hold is not recognised as a long press (see
+            // the coordinate path below).
             el!.press(forDuration: duration)
-            return (["message": .string("Long pressed ref \(refId) ('\(el!.label)') for \(duration)s")], nil)
+            return (["message": .string("Long pressed ref \(refId) ('\(label)') for \(duration)s")], nil)
         }
         guard let x = cmd.x, let y = cmd.y else {
             return (nil, JSONRPCError(code: -32602, message: "long_press requires x and y (in points), or a 'ref'", data: nil))
         }
         if let err = validateCoordinate(x: x, y: y, context: "long_press") { return (nil, err) }
 
+        // Native by default — unlike tap/swipe, a synthesized hold does NOT work.
+        // XCPointerEventPath reports the press and the lift (and any samples in
+        // between), but UIKit's long-press recognizer never fires: WeChat opened
+        // the chat as an ordinary tap, and on a message bubble no action menu
+        // appeared, while the native press at the same point produced the full
+        // copy/forward/delete menu. Opt in with fast:true if an app disagrees.
+        if cmd.fast == true {
+            let r = fastHandler.fastLongPress(x: x, y: y, duration: duration)
+            if r.1 == nil {
+                return (["message": .string("Long pressed at (\(x), \(y)) for \(duration)s (synthesized — " +
+                                            "may register as a tap; omit fast:true if no menu appears)"),
+                         "screen": coordinateHint], nil)
+            }
+        }
+
         let normalized = app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
         let coordinate = normalized.withOffset(CGVector(dx: x, dy: y))
         coordinate.press(forDuration: duration)
 
-        return (["message": .string("Long pressed at (\(x), \(y)) for \(duration)s"), "screen": coordinateHint], nil)
+        return (["message": .string("Long pressed at (\(x), \(y)) for \(duration)s (native)"), "screen": coordinateHint], nil)
     }
 
     // MARK: - Swipe & Scroll
@@ -1005,12 +1052,7 @@ class ActionHandler {
 
     private func scroll(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         let direction = cmd.direction ?? "down"
-        switch direction {
-        case "up":    app.swipeUp()
-        case "down":  app.swipeDown()
-        case "left":  app.swipeLeft()
-        case "right": app.swipeRight()
-        default:
+        guard ["up", "down", "left", "right"].contains(direction) else {
             return (nil, JSONRPCError(
                 code: -32602,
                 message: "Invalid scroll direction '\(direction)'. Use one of: up, down, left, right. " +
@@ -1018,7 +1060,45 @@ class ActionHandler {
                 data: nil
             ))
         }
-        return (["message": .string("Scrolled \(direction)")], nil)
+
+        // Synthesized by default, like tap/swipe. app.swipeUp() and friends run
+        // XCTest's element-aware gesture, which waits for quiescence before AND
+        // after the event — the same settling that cost find_and_tap ~7.6s per
+        // call. A synthesized drag over the same distance doesn't wait at all.
+        // fast:false keeps the native gesture for apps where synthesis doesn't
+        // land (SwiftUI Lists being the known case).
+        if cmd.fast != false {
+            let s = pointSize
+            let midX = s.width / 2
+            // Vertical travel stays inside the middle band (30%..80% of height).
+            // Starting a downward drag near the top is read as a pull-down by
+            // several apps — WeChat opened its mini-program panel instead of
+            // scrolling — and the bottom eighth is the home-indicator area.
+            let topY = s.height * 0.30, botY = s.height * 0.80
+            let dx = s.width * 0.275
+            let midY = s.height / 2
+            let (fx, fy, tx, ty): (Double, Double, Double, Double)
+            switch direction {
+            case "up":    (fx, fy, tx, ty) = (midX, botY, midX, topY)
+            case "down":  (fx, fy, tx, ty) = (midX, topY, midX, botY)
+            case "left":  (fx, fy, tx, ty) = (midX + dx, midY, midX - dx, midY)
+            default:      (fx, fy, tx, ty) = (midX - dx, midY, midX + dx, midY)
+            }
+            let r = fastHandler.fastSwipe(fromX: fx, fromY: fy, toX: tx, toY: ty, duration: 0.3)
+            if r.1 == nil {
+                return (["message": .string("Scrolled \(direction) (synthesized)"),
+                         "screen": coordinateHint], nil)
+            }
+            // fall through to the native gesture when synthesis failed
+        }
+
+        switch direction {
+        case "up":    app.swipeUp()
+        case "down":  app.swipeDown()
+        case "left":  app.swipeLeft()
+        default:      app.swipeRight()
+        }
+        return (["message": .string("Scrolled \(direction) (native)")], nil)
     }
 
     // MARK: - Type
@@ -1325,12 +1405,37 @@ class ActionHandler {
             ]))
         }
 
+        // An empty list is NOT proof the app is missing. This enumeration goes
+        // through LSApplicationWorkspace, which iOS has been progressively
+        // locking down — on iOS 26 it has been observed returning nothing at all
+        // on a device with dozens of apps installed. Saying so here matters:
+        // otherwise a caller reads count:0 as "not installed" and abandons a
+        // task that was perfectly doable.
+        var hint = "Use a bundle_id with launch_app. Pass {\"text\":\"大麦\"} to filter, " +
+                   "or {\"element_type\":\"all\"} to include system apps."
+        if items.isEmpty {
+            hint = "⚠️ Empty result — this does NOT mean the app is absent. App enumeration is a " +
+                   "private API that newer iOS versions may refuse, returning nothing even when the " +
+                   "app IS installed. Do not conclude 'not installed' from this alone. " +
+                   Self.appLookupFallbackHint
+        }
         return ([
             "count": .int(items.count),
             "apps": .array(items),
-            "hint": .string("Use a bundle_id with launch_app. Pass {\"text\":\"大麦\"} to filter, or {\"element_type\":\"all\"} to include system apps."),
+            "hint": .string(hint),
         ], nil)
     }
+
+    /// What to do when a bundle id can't be confirmed by lookup. Spotlight is
+    /// the authority the OS itself uses, so it finds apps the private
+    /// enumeration/catalog paths miss — and it works by NAME, which is what a
+    /// user asks for anyway.
+    static let appLookupFallbackHint =
+        "To verify for real: (1) call launch_app with a candidate bundle_id — an error means genuinely " +
+        "not installed, success means it was there all along; or (2) ask iOS itself: call `home`, then " +
+        "swipe{direction:\"down\"} from mid-screen to open Spotlight, type the app's NAME, and read the " +
+        "result — Spotlight indexes every installed app regardless of API limits. " +
+        "Only report 'not installed' after one of these, never from an empty list."
 
     /// Built-in app catalog (name → bundle_id), loaded once from AppBundles.plist
     /// bundled into the runner. Lets resolve_app answer common apps instantly and
@@ -1384,7 +1489,15 @@ class ActionHandler {
                 "term": .string(term),
                 "source": .string("built-in"),
                 "apps": .array(apps),
-                "hint": .string("Matched the built-in app catalog (instant, offline). Use a bundle_id with launch_app. For apps not in the catalog, search still falls through to the App Store."),
+                // The catalog says what a bundle id IS, never whether it is on
+                // this device — it is a static, offline name→id table. A match
+                // here reads like confirmation and is not one: resolving 美团 to
+                // com.meituan.imeituan succeeded on a device that did not have
+                // it, and only launch_app revealed that.
+                "hint": .string("Matched the built-in app catalog (instant, offline) — this maps a NAME to a " +
+                                "bundle_id and does NOT mean the app is installed here. Confirm by calling " +
+                                "launch_app: success proves it, an error means genuinely absent. " +
+                                Self.appLookupFallbackHint),
             ], nil)
         }
 
@@ -1491,9 +1604,14 @@ class ActionHandler {
         boundBundleId = bundleId       // sticky target for subsequent actions
         lastBoundActivateAt = nowMonotonic  // just brought forward — skip redundant re-activate
         return ([
-            "message": .string("Opened \(bundleId). Actions now target this app until you open another. IMPORTANT: the app is still launching/rendering — wait 2-3s (call wait), THEN page_source to confirm the UI is stable before locating elements. Acting too early matches placeholder/splash elements or is very slow (cold-start element queries can take 6s+)."),
+            "message": .string("Opened \(bundleId). Actions now target this app until you open another."),
             "bound_app": .string(bundleId),
-            "advice": .string("wait 2-3s, then page_source"),
+            // Advisory text goes in `hint`, like every other method — this used
+            // to be a separate "advice" key, so a caller reading hints uniformly
+            // silently missed it.
+            "hint": .string("The app is still launching/rendering — wait 2-3s (call wait), THEN page_source " +
+                            "to confirm the UI is stable before locating elements. Acting too early matches " +
+                            "placeholder/splash elements or is very slow (cold-start element queries can take 6s+)."),
         ], nil)
     }
 
@@ -1547,6 +1665,13 @@ class ActionHandler {
     /// backgrounded app reports as such instead of as a plain miss.
     private var lastLocateError: JSONRPCError?
 
+    /// Snapshot geometry of the node the last locate finally chose
+    /// (post-elevation). nil when the live-query fallback matched — that path
+    /// has no snapshot, and consumers must read the live element instead.
+    /// Same clear-per-call pattern as lastLocateError.
+    private var lastLocateSnapFrame: CGRect?
+    private var lastLocateSnapLabel: String?
+
     /// Refuses a snapshot that is going to fail slowly, before it is attempted.
     ///
     /// `snapshot()` on an app that isn't frontmost has no main window to read, so
@@ -1576,6 +1701,34 @@ class ActionHandler {
         }
     }
 
+    /// Diagnostic: measures whether XCTest's snapshot request honours a
+    /// server-side depth limit, which is the only way to make page_source cheaper
+    /// on a large tree — our own max_depth trims after the whole tree has already
+    /// been walked and shipped across IPC.
+    private func snapshotBench(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+        guard let bundleId = cmd.bundleId ?? resolveForegroundBundleId() else {
+            return (nil, .serverError("snapshot_bench needs a bundle_id (or a resolvable foreground app)."))
+        }
+        if let err = Self.snapshotPrecheck(bundleId: bundleId, action: "benchmark the view tree",
+                                           retryWith: "snapshot_bench") {
+            return (nil, err)
+        }
+        // element_id names the single property to sample off a node; reading
+        // several undocumented getters in one pass hard-crashed the runner.
+        ForegroundApp.setProbeSelectorName(cmd.elementId)
+        let depth = cmd.maxDepth ?? 8
+        guard let raw = ForegroundApp.benchmarkSnapshot(forBundleID: bundleId, maxDepth: depth) else {
+            return (nil, .serverError("snapshot_bench unavailable: private XCTest API missing on this build."))
+        }
+        var out: [String: JSONValue] = ["bundle_id": .string(bundleId)]
+        for (k, v) in raw {
+            guard let key = k as? String else { continue }
+            if let n = v as? NSNumber { out[key] = .int(n.intValue) }
+            else if let s = v as? String { out[key] = .string(s) }
+        }
+        return (out, nil)
+    }
+
     private func pageSource(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         // Resolve which app to inspect:
         //   explicit bundle_id → that app
@@ -1598,9 +1751,16 @@ class ActionHandler {
         // Custom snapshot traversal so we can bound depth / count and filter —
         // debugDescription enumerates & serializes the WHOLE tree (68KB+ on rich
         // pages), which is what makes the first call block for tens of seconds.
-        let maxDepth = cmd.maxDepth ?? Int.max
+        // 40 covers the deepest rows real apps put content at (X's feed cells sit
+        // near depth 22) without walking the pathological tail of a long-scrolled
+        // list. Unbounded was the old default and is what made a deep feed read
+        // take seconds.
+        let maxDepth = cmd.maxDepth ?? Self.defaultMaxDepth
         // Hard cap to prevent timeouts even when the caller passes nothing.
-        let maxElements = min(cmd.maxElements ?? 500, 2000)
+        // Raised with max_children: a timeline page already returned ~370 nodes
+        // under the old 100-child cap, so leaving this at 500 would just move the
+        // truncation from one limit to the other.
+        let maxElements = min(cmd.maxElements ?? 1500, 4000)
         let filter = SnapshotFilter(type: cmd.filterType, label: cmd.filterLabel, text: cmd.filterText)
 
         // Snapshot roots to render. We take the single application.snapshot()
@@ -1612,7 +1772,56 @@ class ActionHandler {
         // ones. Here we frame-check first and only snapshot the 1-2 windows the
         // user can actually see, under a hard 3s budget.
         var roots: [XCUIElementSnapshot] = []
-        let appSnap = try? target.snapshot()
+        // Prefer the device-bounded fetch: it applies max_depth/max_children
+        // while the app walks its own tree, instead of shipping everything over
+        // and trimming here. On a scrolled X timeline that is ~1.6s vs 6.5-8.5s.
+        // It rides on private XCTest API that has already moved several times, so
+        // any failure falls through to the supported call rather than surfacing.
+        // Rendered in Obj-C: the bounded fetch returns an XCElementSnapshot, and
+        // bridging it to the XCUIElementSnapshot protocol silently degrades it —
+        // frames read as zero and children stop after one level. Filters still
+        // run through the protocol path, so fall back when one is active.
+        var usedBoundedSnapshot = false
+        var boundedBody: String?
+        var boundedCount = 0
+        var boundedTruncated = false
+        // Re-enabled after the empty-tree cause was found. It was never the
+        // renderer: the bounded fetch passed standardAttributeNames raw, whose
+        // snapshot-domain names ("label") the AX server silently ignores — only
+        // the XC_kAXXCAttribute* wire keys fetch content, and snapshot_bench had
+        // them while this path didn't. With the same attrs both read full text.
+        // Verify snapshot_path:"bounded" appears in responses; a silent fall
+        // back to "full" is how a future private-API shift will present.
+        let boundedEnabled = true
+        if boundedEnabled, !filter.active, let bid = inspectedBundleId,
+           let bounded = ForegroundApp.boundedSnapshot(
+                forBundleID: bid,
+                maxDepth: maxDepth == Int.max ? Self.defaultMaxDepth : maxDepth,
+                maxChildren: Self.maxChildrenPerNode) {
+            var n = 0
+            var t: ObjCBool = false
+            // Acceptance: a sizeable tree with NO labels at all is the known
+            // bad-fetch signature (wrong attribute domain → shape without
+            // content), not a plausible real screen. Falling back to the full
+            // snapshot there costs seconds; shipping a content-free tree costs
+            // the caller a wrong "this page is empty" conclusion.
+            if let text = ForegroundApp.renderBoundedSnapshot(
+                    bounded,
+                    maxDepth: maxDepth == Int.max ? Self.defaultMaxDepth : maxDepth,
+                    maxElements: maxElements,
+                    nodesWritten: &n,
+                    truncated: &t), n > 1,
+               n < 40 || text.contains("label:") {
+                boundedBody = text
+                boundedCount = n
+                boundedTruncated = t.boolValue
+                usedBoundedSnapshot = true
+            }
+        }
+
+        let appSnap = usedBoundedSnapshot
+            ? nil
+            : (ForegroundApp.safeSnapshot(ofElement: target) as? XCUIElementSnapshot)
         if let appSnap = appSnap { roots.append(appSnap) }
 
         let screen = pointSize
@@ -1620,7 +1829,11 @@ class ActionHandler {
         // keep the overlay budget tight too so total page_source stays well under
         // the 6s RPC watchdog even on a busy/animating page.
         let budgetDeadline = nowMonotonic + 2.0
-        let windowCount = min(target.windows.count, 6)
+        // Skip entirely when the bounded root is in play: win.snapshot() is the
+        // unbounded call, so walking overlays here would pay back the very cost
+        // the bounded fetch just avoided. The bounded root is taken at the
+        // application element, so it already spans that app's windows.
+        let windowCount = usedBoundedSnapshot ? 0 : min(target.windows.count, 6)
         for i in 0..<windowCount {
             if nowMonotonic >= budgetDeadline { break }
             let win = target.windows.element(boundBy: i)
@@ -1638,9 +1851,11 @@ class ActionHandler {
                Int(f.minY) == Int(appSnap.frame.minY) {
                 continue
             }
-            if let ws = try? win.snapshot() { roots.append(ws) }
+            if let ws = ForegroundApp.safeSnapshot(ofElement: win) as? XCUIElementSnapshot {
+                roots.append(ws)
+            }
         }
-        guard !roots.isEmpty else {
+        guard usedBoundedSnapshot || !roots.isEmpty else {
             return (nil, .serverError(
                 "Could not snapshot the accessibility tree. The app may still be launching — wait briefly and retry, or take a screenshot."
             ))
@@ -1660,7 +1875,11 @@ class ActionHandler {
             if count >= maxElements { break }
         }
 
-        let body = lines.joined(separator: "\n")
+        let body = boundedBody ?? lines.joined(separator: "\n")
+        if usedBoundedSnapshot {
+            count = boundedCount
+            truncated = boundedTruncated
+        }
 
         var hint = "Accessibility tree (types, labels, identifiers, frames in POINTS), including visible overlay " +
             "windows (fixed bottom/floating bars). Frames are {{x,y},{w,h}} — tap an element at its frame center " +
@@ -1675,6 +1894,20 @@ class ActionHandler {
                 "Remove the filter for the full tree. " + hint
         }
 
+        // State the active limits every time, not only when they bite. A caller
+        // that doesn't know a cap applied will read a partial tree as the whole
+        // page and conclude an element is absent when it was merely cut off.
+        let usedDefaults = cmd.maxDepth == nil && cmd.maxElements == nil
+        let depthLabel = maxDepth == Int.max ? "unlimited" : String(maxDepth)
+        let limits = "Limits on THIS response: max_depth=\(depthLabel), max_children=\(Self.maxChildrenPerNode), " +
+            "max_elements=\(maxElements)\(usedDefaults ? " (defaults)" : " (as requested)"). " +
+            "Deeper or wider reads are available — pass max_depth / max_elements — but cost scales with the " +
+            "number of nodes actually walked: on a feed that has been scrolled for a while, offscreen rows " +
+            "accumulate and a full read can take seconds and may exceed the 6s call limit. Cheaper first " +
+            "moves: filter:{label:\"…\"}/{type:\"button\"} to fetch only what you need, or relaunch the app " +
+            "to drop accumulated rows."
+        hint = limits + " " + hint
+
         var result: [String: JSONValue] = [
             "format": .string("text"),
             "source": .string(body),
@@ -1682,6 +1915,10 @@ class ActionHandler {
             "total_returned": .int(count),
             "coordinate_space": .string("points"),
             "hint": .string(hint),
+            // Which fetch ran. The bounded path can drop out silently if the
+            // private API shifts again, and the only symptom would be the old
+            // multi-second timings — so make it observable.
+            "snapshot_path": .string(usedBoundedSnapshot ? "bounded" : "full"),
         ]
         if filter.active { result["filtered"] = .bool(true) }
         if let bid = inspectedBundleId {
@@ -1698,6 +1935,14 @@ class ActionHandler {
     }
 
     // MARK: - Snapshot rendering (depth/count-bounded, filterable)
+
+    /// Default traversal bounds for page_source, reported back in every response
+    /// so a caller can tell a capped read from a complete one.
+    static let defaultMaxDepth = 40
+    /// 100 cut every page of a scrolled X timeline (8 of 9 reads came back
+    /// truncated), because a feed keeps hundreds of rendered rows under one
+    /// container. 500 clears that; the cost is bounded by max_elements anyway.
+    static let maxChildrenPerNode = 500
 
     private struct SnapshotFilter {
         let type: String?       // element type name substring (e.g. "button")
@@ -1751,8 +1996,15 @@ class ActionHandler {
         var descendantMatched = false
 
         if depth < maxDepth {
+            // Cap siblings per node as well as total depth: a single list can
+            // hold hundreds of rendered rows, and walking all of them is what
+            // makes a scrolled feed expensive. Reported in the response hint.
+            //
+            var childrenWalked = 0
             for child in s.children {
                 if globalCount >= maxElements { truncated = true; break }
+                if childrenWalked >= Self.maxChildrenPerNode { truncated = true; break }
+                childrenWalked += 1
                 var sub: [String] = []
                 var subCount = 0
                 let kept = renderSnapshotInto(child, depth: depth + 1, maxDepth: maxDepth,
@@ -1938,8 +2190,11 @@ class ActionHandler {
     private func locateElement(query: String, type: String?, bundleId: String?, matchMode: String)
         -> (XCUIElement, ElementRef.Match, Int)? {
         // Cleared per call: a stale error from an earlier lookup must never be
-        // reported against this one.
+        // reported against this one — and stale geometry from an earlier screen
+        // must never aim this call's tap.
         lastLocateError = nil
+        lastLocateSnapFrame = nil
+        lastLocateSnapLabel = nil
         let bid = bundleId ?? resolveForegroundBundleId()
         let target: XCUIApplication = bid.map { XCUIApplication(bundleIdentifier: $0) } ?? app
         let q = elementQuery(in: target, type: type)
@@ -1955,14 +2210,24 @@ class ActionHandler {
             iCTRLUITests.logBuffer.append("🔎 locate '\(query)' \(hit) [\(phases.joined(separator: " "))] total=\(Int((nowMonotonic - t0) * 1000))ms")
         }
 
+        // Every .exists / .isHittable below is a round-trip that XCTest answers by
+        // walking the app's hierarchy, so each one scales with tree size. On a
+        // long-scrolled feed a single probe ran into seconds, and the old loop of
+        // up to 10 of them turned one find_element into 69.8s — during which the
+        // serial UI queue is blocked and every later request piles up behind it.
+        // Bound the whole scan instead of trusting any single call to be quick.
+        let liveQueryDeadline = nowMonotonic + Self.liveQueryBudget
         func firstHittable(_ query: XCUIElementQuery) -> (XCUIElement, Int)? {
-            // Avoid query.count (it waits for idle and is expensive). Probe element
-            // 0 first; if nothing matches, return fast. Only scan a few when a match
-            // exists. isHittable implies exists, so we skip the extra .exists query.
             let first = query.element(boundBy: 0)
             guard first.exists else { return nil }
             if first.isHittable { return (first, 0) }
-            for i in 1..<10 {
+            // Probe siblings only while budget remains; 3 is plenty in practice
+            // (the wanted element is almost always the first or second match).
+            for i in 1..<3 {
+                if nowMonotonic >= liveQueryDeadline {
+                    phases.append("live-budget-hit")
+                    break
+                }
                 let el = query.element(boundBy: i)
                 if !el.exists { break }
                 if el.isHittable { return (el, i) }
@@ -1970,17 +2235,57 @@ class ActionHandler {
             return (first, 0)   // exists but not hittable — caller decides
         }
 
-        // Fast path: one live query for an exact label. When it hits (the common
-        // case for a correctly-spelled label) this beats a snapshot outright, so
-        // the usual success case doesn't pay for the thorough path below.
+        // The live-query "fast path" is only fast on a small tree. XCUIElementQuery
+        // evaluates its predicate node-by-node across the IPC boundary while the
+        // app walks its whole hierarchy, so it scales with tree size just like a
+        // snapshot does — measured at 5245ms to find WeChat's search field, and
+        // 69865ms on a long-scrolled X timeline. One snapshot of the same WeChat
+        // screen costs ~4100ms and answers exact/id/contains together, so it is
+        // tried first and the live query is kept only as the fallback.
         var s = nowMonotonic
-        if let (el, idx) = firstHittable(q.matching(NSPredicate(format: "label == %@", query))) {
-            lap("exact", from: s)
+        var snapshotAlreadyTried = false
+        if !Self.preferLiveQueryFirst,
+           Self.snapshotPrecheck(bundleId: bid, action: "find '\(query)'",
+                                 retryWith: "find_element") == nil {
+            snapshotAlreadyTried = true
+            if let hit = locateViaSnapshot(query: query, matchMode: matchMode, target: target,
+                                           q: q, appendPhase: { phases.append($0) }, lap: lap) {
+                done("\(hit.2)")
+                return (hit.0, hit.1, hit.3)
+            }
+            // A completed snapshot walk is authoritative: it saw every node and
+            // the label was not among them, so the live query can only reach the
+            // same verdict — at the cost of a full second traversal. Measured on
+            // a scrolled X timeline: the snapshot answered in 4.6s, then the
+            // redundant live query ran another 7.1s before hitting its budget.
+            // Only skip it when the walk actually happened; if the snapshot
+            // itself failed we learned nothing and still owe the live query.
+            if !phases.contains("snapshot=failed") {
+                done("✗no-match")
+                return nil
+            }
+        }
+
+        // Run the live query under a hard wall-clock cap. A single .exists on a
+        // huge tree has been seen to take tens of seconds and cannot be
+        // cancelled, so the work continues in the background — but we stop
+        // waiting on it and fall through, which keeps the RPC inside its own
+        // 6s watchdog instead of blocking the queue for a minute.
+        // Boxed so the abandoned worker can keep writing safely after we stop
+        // waiting: reading `liveHit` only once runWithTimeout reports success
+        // means the two never touch it at the same time.
+        final class HitBox { var value: (XCUIElement, Int)? }
+        let box = HitBox()
+        let liveDone = runWithTimeout(seconds: Self.liveQueryBudget) {
+            box.value = firstHittable(q.matching(NSPredicate(format: "label == %@", query)))
+        }
+        lap("exact", from: s)
+        if !liveDone { phases.append("exact=timeout") }
+        if liveDone, let (el, idx) = box.value {
             let (best, bestIdx) = elevateToButton(match: el, matchIdx: idx, in: target, phases: &phases)
             done("→exact\(bestIdx == idx ? "" : "→button")")
             return (best, .exactLabel(query), bestIdx)
         }
-        lap("exact", from: s)
 
         // The snapshot path is where a backgrounded app costs ~16s of blocked
         // serial queue, so refuse it up front — the same guard page_source has
@@ -1993,22 +2298,71 @@ class ActionHandler {
             return nil
         }
 
-        // Everything else runs against ONE snapshot.
-        //
-        // Previously id and contains were separate live queries, each paying its
-        // own accessibility round-trip (~1.5-5s apiece on a rich page) before the
-        // snapshot fallback ran anyway — so a miss cost 14s+ and a misspelled
-        // label was the most expensive request the server could receive. A
-        // snapshot carries label, identifier, value, frame and elementType, which
-        // is everything these strategies need, so one capture answers all of them
-        // and the walk itself is ~20ms.
+        // Only when the snapshot-first attempt above didn't already run. A miss
+        // used to capture the tree twice (logged as snapshot=…ms … snapshot=…ms),
+        // paying the most expensive step of the lookup a second time for nothing.
+        if !snapshotAlreadyTried,
+           let hit = locateViaSnapshot(query: query, matchMode: matchMode, target: target,
+                                       q: q, appendPhase: { phases.append($0) }, lap: lap) {
+            done("\(hit.2)")
+            return (hit.0, hit.1, hit.3)
+        }
+        done("✗no-match")
+        return nil
+    }
+
+    /// Whether to try the live XCUIElementQuery before the snapshot walk.
+    ///
+    /// Snapshot-first is the faster order on every screen measured (a live query
+    /// took 5245ms to find WeChat's search field, 69865ms on a scrolled X
+    /// timeline; one snapshot of the same WeChat screen is ~4100ms and answers
+    /// exact/id/contains together). Promoting it once aborted the runner —
+    /// snapshot() raises an NSException that `try?` cannot catch — so every call
+    /// now goes through ForegroundApp.safeSnapshot, which catches it in Obj-C.
+    /// Wall-clock cap on the live XCUIElementQuery stage of a lookup.
+    ///
+    /// 2.5s leaves room for the snapshot fallback to still finish inside the 6s
+    /// RPC watchdog. Without a cap this stage measured 69.8s on a scrolled X
+    /// timeline, blocking the serial UI queue for every request behind it.
+    static let liveQueryBudget: TimeInterval = 2.5
+
+    /// Flip to true to fall back to the old ordering without a code change.
+    ///
+    /// The two aborts this caused were never about XCTest: the crash report put
+    /// swift_beginAccess -> fatalError directly under `lap`, i.e. `phases` was
+    /// captured by that closure AND passed inout to the same call, so Swift
+    /// trapped on overlapping exclusive access. Fixed by passing an appendPhase
+    /// closure instead of the array.
+    static let preferLiveQueryFirst = false
+
+    /// Finds `query` by walking ONE snapshot, answering exact-label, identifier
+    /// and substring matching in a single capture.
+    ///
+    /// A snapshot carries label, identifier, value, frame and elementType, which
+    /// is everything these strategies need, so one capture answers all of them
+    /// and the walk itself is ~20ms — versus a live query per strategy, each
+    /// paying its own accessibility round-trip.
+    /// `phases` is NOT taken inout: the caller's `lap` closure already captures
+    /// and mutates that same array, so passing it inout as well opens two
+    /// overlapping exclusive accesses and Swift traps at runtime
+    /// (swift_beginAccess -> fatalError), killing the runner. Everything that
+    /// needs to record a phase goes through `lap` / `appendPhase`.
+    private func locateViaSnapshot(query: String, matchMode: String, target: XCUIApplication,
+                                   q: XCUIElementQuery,
+                                   appendPhase: (String) -> Void,
+                                   lap: (String, TimeInterval) -> Void)
+        -> (XCUIElement, ElementRef.Match, String, Int)? {
         let wantExact = Self.normalizeLabel(query)
-        s = nowMonotonic
-        guard let root = try? target.snapshot() else {
-            lap("snapshot", from: s); done("✗no-snapshot")
+        var s = nowMonotonic
+        // Via the Obj-C wrapper: snapshot() throws an NSException that `try?`
+        // cannot catch, which aborted the runner when this became the primary
+        // path (SIGABRT on the first call, no phases logged).
+        guard let root = ForegroundApp.safeSnapshot(ofElement: target) as? XCUIElementSnapshot else {
+            lap("snapshot", s)
+            appendPhase("snapshot=failed")   // distinguishes "couldn't look" from "looked, absent"
             return nil
         }
-        lap("snapshot", from: s)
+        lap("snapshot", s)
 
         // Depth-first walk, collecting the best candidate per strategy in one
         // pass. Ordering is preserved from the old sequential version: an exact
@@ -2036,7 +2390,7 @@ class ActionHandler {
             }
             stack.append(contentsOf: node.children)
         }
-        phases.append("walk=\(Int((nowMonotonic - s) * 1000))ms/\(visited)nodes")
+        appendPhase("walk=\(Int((nowMonotonic - s) * 1000))ms/\(visited)nodes")
 
         // Re-resolve the winning snapshot to a live XCUIElement. Elevation now
         // reuses `allNodes` instead of re-enumerating every button and cell.
@@ -2049,14 +2403,21 @@ class ActionHandler {
         s = nowMonotonic
         for (snap, match, hit) in ranked {
             guard let (live, idx) = resolveSnapshot(snap, match: match, in: q) else { continue }
-            lap("resolve", from: s)
-            let (best, bestIdx) = elevateToButton(match: live, matchIdx: idx, snapshot: snap,
-                                                  allNodes: allNodes, phases: &phases)
-            done("\(hit)\(bestIdx == idx ? "" : "→button")")
-            return (best, match, bestIdx)
+            lap("resolve", s)
+            // Local array, then hand the results to appendPhase: elevateToButton
+            // needs an inout, and the caller's copy is already owned by `lap`.
+            var elevatePhases: [String] = []
+            let (best, bestIdx, finalSnap) = elevateToButton(match: live, matchIdx: idx, snapshot: snap,
+                                                             allNodes: allNodes, phases: &elevatePhases)
+            elevatePhases.forEach(appendPhase)
+            // Geometry of the FINAL node (post-elevation), free to read — the
+            // snapshot is already materialised. findAndTap uses this to skip
+            // re-buying frame/label from the live element.
+            lastLocateSnapFrame = finalSnap.frame
+            lastLocateSnapLabel = finalSnap.label
+            return (best, match, "\(hit)\(bestIdx == idx ? "" : "→button")", bestIdx)
         }
-        lap("resolve", from: s)
-        done("✗not-found")
+        lap("resolve", s)
         return nil
     }
 
@@ -2130,17 +2491,22 @@ class ActionHandler {
     /// enumerations plus a round-trip per candidate, paid on the SUCCESS path. The
     /// snapshot already carries frame and elementType for every node, so the same
     /// decision costs a pass over an in-memory array.
+    /// Also returns the snapshot of the node the caller should treat as FINAL —
+    /// the elevated ancestor's when elevation succeeded, the original match's
+    /// otherwise. Callers that reuse snapshot geometry must take it from here:
+    /// after elevation the tap target is the Button/Cell, and using the inner
+    /// match's frame would aim at the row instead of its control.
     private func elevateToButton(match: XCUIElement, matchIdx: Int,
                                  snapshot snap: XCUIElementSnapshot,
                                  allNodes: [XCUIElementSnapshot],
-                                 phases: inout [String]) -> (XCUIElement, Int) {
+                                 phases: inout [String]) -> (XCUIElement, Int, XCUIElementSnapshot) {
         let t0 = nowMonotonic
         guard !Self.isIntrinsicallyTappable(snap.elementType) else {
             phases.append("elevate=skip(\(snap.elementType.rawValue))")
-            return (match, matchIdx)
+            return (match, matchIdx, snap)
         }
         let matchFrame = snap.frame
-        if matchFrame.width < 1 || matchFrame.height < 1 { return (match, matchIdx) }
+        if matchFrame.width < 1 || matchFrame.height < 1 { return (match, matchIdx, snap) }
         let centre = CGPoint(x: matchFrame.midX, y: matchFrame.midY)
 
         var best: XCUIElementSnapshot?
@@ -2165,13 +2531,13 @@ class ActionHandler {
         // Re-resolve the chosen ancestor to a live element. Falling back to the
         // original match keeps this best-effort: a failed elevation must never
         // turn a found element into a miss.
-        guard let bestSnap = best else { return (match, matchIdx) }
+        guard let bestSnap = best else { return (match, matchIdx, snap) }
         let query = bestSnap.elementType == .cell ? app.cells : app.buttons
         let live = bestSnap.identifier.isEmpty
             ? query.matching(NSPredicate(format: "label == %@", bestSnap.label)).element(boundBy: 0)
             : query.matching(identifier: bestSnap.identifier).element(boundBy: 0)
-        if live.exists, live.isHittable { return (live, matchIdx) }
-        return (match, matchIdx)
+        if live.exists, live.isHittable { return (live, matchIdx, bestSnap) }
+        return (match, matchIdx, snap)
     }
 
     /// Element kinds that already dispatch their own handler on tap, so a
@@ -2271,23 +2637,85 @@ class ActionHandler {
                 data: nil
             ))
         }
-        guard element.isHittable else {
+        // fast:false — the original behaviour, kept as the escape hatch this
+        // method historically existed for: native XCUIElement.tap() resolves the
+        // element at hit time and works on SwiftUI Lists, where a synthesized
+        // event reports success but the tap never lands (so the automatic
+        // fallback below cannot catch it). Slow — quiescence waits on both
+        // sides — but reliable.
+        if cmd.fast == false {
             let f = element.frame
+            let label = element.label
+            guard element.isHittable else {
+                return (nil, JSONRPCError(
+                    code: -32602,
+                    message: "find_and_tap: element '\(elementId)' exists but is not hittable (off-screen, covered, or zero-size). Scroll it into view (scroll_to_element).",
+                    data: ["x": .double(f.midX), "y": .double(f.midY)]
+                ))
+            }
+            element.tap()
+            return ([
+                "message": .string("find_and_tap '\(label.isEmpty ? elementId : label)' via native XCUIElement.tap() (fast:false)"),
+                "matched": .string(String(describing: match)),
+                "frame": .object([
+                    "x": .double(f.origin.x), "y": .double(f.origin.y),
+                    "w": .double(f.width),    "h": .double(f.height),
+                ]),
+            ], nil)
+        }
+
+        // Phase-timed tail, two round trips instead of three. The 热榜 incident
+        // put 9.3s of a 14.9s call here: frame + label + isHittable, each
+        // re-running the live query (~3s apiece on an 856-node tree). The live
+        // frame read stays — it is the existence check (throws if the element
+        // vanished) and the tap aims at it, exactly as before. isHittable stays —
+        // covering does NOT move a frame, so no probe can replace it. The label
+        // read is gone: it only decorates the reply text, and locate's snapshot
+        // already carries it. Comparing live vs snapshot frame is logged as
+        // stable/drift telemetry — real-world drift rates are what will tell us
+        // whether the frame read itself can ever be safely dropped.
+        var tail: [String] = []
+        var ts = nowMonotonic
+        let f = element.frame
+        tail.append("frame=\(Int((nowMonotonic - ts) * 1000))ms")
+        if let sf = lastLocateSnapFrame {
+            let stable = abs(sf.midX - f.midX) <= 2 && abs(sf.midY - f.midY) <= 2
+            tail.append(stable ? "stable" : "drift(\(Int(sf.midX)),\(Int(sf.midY))→\(Int(f.midX)),\(Int(f.midY)))")
+        } else {
+            tail.append("no-snap")
+        }
+        // Cosmetic only — never worth a live round trip.
+        let label = lastLocateSnapLabel ?? ""
+
+        ts = nowMonotonic
+        let hittable = element.isHittable
+        tail.append("hittable=\(Int((nowMonotonic - ts) * 1000))ms")
+
+        guard hittable else {
+            iCTRLUITests.logBuffer.append("🎯 find_and_tap tail [\(tail.joined(separator: " "))] ✗not-hittable")
             return (nil, JSONRPCError(
                 code: -32602,
                 message: "find_and_tap: element '\(elementId)' exists but is not hittable (off-screen, covered, or zero-size). Scroll it into view (scroll_to_element).",
                 data: ["x": .double(f.midX), "y": .double(f.midY)]
             ))
         }
-        // Native tap — drives the OS's real touch pipeline via XCTest. This
-        // is why we exist: it works on SwiftUI Lists where the synthesized
-        // fastTap path doesn't. Slower (may take a few hundred ms to a couple
-        // of seconds if the tap navigates), but reliable.
-        let f = element.frame
-        let label = element.label
-        element.tap()
+
+        // Synthesized tap at the element's own centre, same as tap(ref:) does.
+        // XCUIElement.tap() waits for quiescence and post-event settling, which
+        // measured ~7.6s here — the single most expensive part of find_and_tap,
+        // costing more than locating the element. Fall back to the native tap
+        // when synthesis fails, since that path still works on SwiftUI Lists
+        // where synthesized events don't land.
+        let (cx, cy) = humanizedPoint(in: f)
+        ts = nowMonotonic
+        let synth = fastHandler.fastTap(x: cx, y: cy)
+        let usedNative = synth.1 != nil
+        if usedNative { element.tap() }
+        tail.append("tap=\(Int((nowMonotonic - ts) * 1000))ms\(usedNative ? "(native)" : "")")
+        iCTRLUITests.logBuffer.append("🎯 find_and_tap tail [\(tail.joined(separator: " "))]")
         return ([
-            "message": .string("find_and_tap '\(label.isEmpty ? elementId : label)' via native XCUIElement.tap()"),
+            "message": .string("find_and_tap '\(label.isEmpty ? elementId : label)' via " +
+                               (usedNative ? "native XCUIElement.tap()" : "synthesized tap at (\(Int(cx)),\(Int(cy)))")),
             "matched": .string(String(describing: match)),
             "frame": .object([
                 "x": .double(f.origin.x), "y": .double(f.origin.y),
