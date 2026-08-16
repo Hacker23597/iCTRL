@@ -21,12 +21,14 @@ struct SettingsView: View {
 
     /// Sideload state. Kept here rather than in AppState because it is
     /// transient UI feedback for one action, not app-wide state.
-    @State private var showIPAPicker = false
     @State private var installBusy = false
     @State private var installPhase: IPAInstaller.Phase = .idle
     @State private var anisetteReport: AnisetteProbe.Report?
-    @State private var signBeforeInstalling = false
     @State private var pendingSignURL: PickedIPA?
+    @State private var showPackagePicker = false
+    /// Defaults to the runner shipped inside this app — the package almost
+    /// everyone wants, already matched to this build.
+    @State private var selectedPackage: SelectedPackage? = BundledRunner.url.map { .bundled($0) }
 
     /// The runner registers this scheme; opening it starts the automation server.
     ///
@@ -252,21 +254,40 @@ struct SettingsView: View {
                 }
             }
 
-            Button {
-                signBeforeInstalling = false
-                showIPAPicker = true
-            } label: {
-                Label("Install a signed .ipa…", systemImage: "square.and.arrow.down")
+            // What the two buttons below act on. Named rather than left
+            // implicit so it's clear what "Install" is about to install.
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(selectedPackage?.displayName ?? "No package selected")
+                        .font(.subheadline)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if selectedPackage == nil {
+                        Text("This build carries no runner — choose one.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                }
+                Spacer()
+                Button("Change") { showPackagePicker = true }
+                    .buttonStyle(.bordered)
+                    .disabled(installBusy)
             }
-            .disabled(!installable || installBusy)
 
             Button {
-                signBeforeInstalling = true
-                showIPAPicker = true
+                guard let package = selectedPackage else { return }
+                startInstall(package)
+            } label: {
+                Label("Install", systemImage: "square.and.arrow.down")
+            }
+            .disabled(!installable || installBusy || selectedPackage == nil)
+
+            Button {
+                guard let package = selectedPackage else { return }
+                pendingSignURL = PickedIPA(url: package.url)
             } label: {
                 Label("Sign with my Apple ID, then install…", systemImage: "signature")
             }
-            .disabled(!installable || installBusy)
+            .disabled(!installable || installBusy || selectedPackage == nil)
 
             switch installPhase {
             case .idle:
@@ -315,19 +336,9 @@ struct SettingsView: View {
         .sheet(item: $pendingSignURL) { pending in
             SignAndInstallView(ipaURL: pending.url)
         }
-        .fileImporter(isPresented: $showIPAPicker,
-                      allowedContentTypes: [.data],
-                      allowsMultipleSelection: false) { result in
-            switch result {
-            case .success(let urls):
-                guard let url = urls.first else { return }
-                if signBeforeInstalling {
-                    pendingSignURL = PickedIPA(url: url)
-                } else {
-                    startInstall(url)
-                }
-            case .failure(let err):
-                installPhase = .failed(err.localizedDescription)
+        .sheet(isPresented: $showPackagePicker) {
+            PackagePickerView { package in
+                selectedPackage = package
             }
         }
     }
@@ -349,11 +360,12 @@ struct SettingsView: View {
         }
     }
 
-    private func startInstall(_ url: URL) {
-        // A picked file lives outside the app's container; without the security
-        // scope the read fails with a permissions error that looks nothing like
-        // a permissions error.
-        let scoped = url.startAccessingSecurityScopedResource()
+    private func startInstall(_ package: SelectedPackage) {
+        let url = package.url
+        // Only a file the user picked lives outside our container. Claiming the
+        // scope for a bundled or downloaded package is harmless but pointless,
+        // and balancing a claim that was never granted is worse.
+        let scoped = package.needsSecurityScope && url.startAccessingSecurityScopedResource()
         installBusy = true
         installPhase = .connecting
         Task {

@@ -42,17 +42,10 @@ build:
 # ──────────────────────────────────────────────
 ipa: build
 	@echo ""
-	@# === Main App IPA ===
-	@echo "📦 Packaging $(MAIN_IPA)..."
-	rm -rf "$(BUILD_DIR)/Payload"
-	mkdir -p "$(BUILD_DIR)/Payload"
-	cp -R "$(BUILD_DIR)/$(MAIN_APP)" "$(BUILD_DIR)/Payload/"
-	cd "$(BUILD_DIR)" && zip -qr "$(MAIN_IPA)" Payload/
-	mv "$(BUILD_DIR)/$(MAIN_IPA)" ./
-	rm -rf "$(BUILD_DIR)/Payload"
-	@echo "✅ $(MAIN_IPA)"
-	@ls -lh $(MAIN_IPA)
-	@echo ""
+	@# The runner is packaged FIRST so the app can carry a copy of it: the app's
+	@# installer offers the bundled runner as its default package, which means
+	@# the .ipa has to exist before the app is zipped. Both come out of the same
+	@# xcodebuild invocation, so this is purely an ordering constraint.
 	@# === Runner IPA ===
 	@echo "🎨 Copying app icon to Runner..."
 	@# Copy main app's icon assets into Runner so it shows the same icon
@@ -167,6 +160,33 @@ ipa: build
 	mv "$(BUILD_DIR)/$(RUNNER_IPA)" ./
 	rm -rf "$(BUILD_DIR)/Payload"
 	@echo "✅ $(RUNNER_IPA)"
+	@echo ""
+	@# === Main App IPA (carrying the runner just built) ===
+	@# Copied in after the app is built rather than declared as a project
+	@# resource: the runner doesn't exist until the step above, so XcodeGen has
+	@# nothing to reference at generate time.
+	@echo "🎁 Embedding $(RUNNER_IPA) into the app..."
+	@cp "$(RUNNER_IPA)" "$(BUILD_DIR)/$(MAIN_APP)/$(RUNNER_IPA)"
+	@ls -lh "$(BUILD_DIR)/$(MAIN_APP)/$(RUNNER_IPA)" | awk '{print "   " $$5 "  " $$9}'
+	@# Re-sign: adding a file to a signed bundle invalidates its signature, and
+	@# an app whose seal is broken is rejected at install.
+	@set -e; \
+	APP="$(BUILD_DIR)/$(MAIN_APP)"; \
+	AUTH="$$(codesign -dvv "$$APP" 2>&1 | sed -n 's/^Authority=//p' | head -1)"; \
+	if [ -z "$$AUTH" ]; then echo "🔴 could not read signing identity from $$APP"; exit 1; fi; \
+	SHA="$$(security find-identity -v -p codesigning 2>/dev/null | grep -F "$$AUTH" | head -1 | awk '{print $$2}')"; \
+	codesign --force --sign "$${SHA:-$$AUTH}" --preserve-metadata=entitlements "$$APP"; \
+	codesign -v "$$APP" || { echo "🔴 re-sign failed"; exit 1; }; \
+	echo "   ✅ app re-signed"
+	@echo "📦 Packaging $(MAIN_IPA)..."
+	rm -rf "$(BUILD_DIR)/Payload"
+	mkdir -p "$(BUILD_DIR)/Payload"
+	cp -R "$(BUILD_DIR)/$(MAIN_APP)" "$(BUILD_DIR)/Payload/"
+	cd "$(BUILD_DIR)" && zip -qr "$(MAIN_IPA)" Payload/
+	mv "$(BUILD_DIR)/$(MAIN_IPA)" ./
+	rm -rf "$(BUILD_DIR)/Payload"
+	@echo "✅ $(MAIN_IPA)"
+	@ls -lh $(MAIN_IPA)
 	@ls -lh $(RUNNER_IPA)
 	@echo ""
 	@echo "════════════════════════════════════════"
