@@ -28,7 +28,11 @@ targets:
       # selection below mirrors that podspec's subspecs; see NOTICE.md.
       - path: Dependencies/AltSign/AltSign
         excludes:
-          - "**/*.plist"
+          # AltSign's own framework Info.plist. Copied as a resource it lands
+          # at the bundle root and overwrites the app's, stripping
+          # CFBundleIdentifier and CFBundleExecutable — the bundle then builds
+          # fine and is rejected at install as "not a valid bundle".
+          - "Info.plist"
       # ldid.cpp is deliberately absent: AltSign's alt_ldid.cpp `#include`s it
       # textually, so compiling it as its own unit duplicates every ldid symbol.
       - path: Dependencies/AltSign/Dependencies/ldid/lookup2.c
@@ -97,10 +101,6 @@ targets:
         # ours, and failing the build on them would mean patching a vendored
         # dependency we deliberately track unmodified.
         GCC_WARN_INHIBIT_ALL_WARNINGS: YES
-    preBuildScripts:
-      - name: "Link AltSign headers"
-        script: '"$SRCROOT/Scripts/link-altsign-headers.sh"'
-        basedOnDependencyAnalysis: false
         GENERATE_INFOPLIST_FILE: YES
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: 1
@@ -117,6 +117,13 @@ targets:
         # iOS denies UIApplication.open() for these schemes with no error, which
         # would break the Start button and the StikDebug shortcut.
         INFOPLIST_FILE: iCTRLApp/Info.plist
+    preBuildScripts:
+      # AltSign's headers `#import <AltSign/X.h>` while the files themselves sit
+      # in subdirectories; this builds the flat directory that makes those
+      # resolve. Runs every build so it can't go stale against the submodule.
+      - name: "Link AltSign headers"
+        script: '"$SRCROOT/Scripts/link-altsign-headers.sh"'
+        basedOnDependencyAnalysis: false
 
   iCTRLUITests:
     type: bundle.ui-testing

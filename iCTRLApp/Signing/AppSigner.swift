@@ -201,7 +201,7 @@ final class AppSigner: ObservableObject {
         let name = await UIDeviceName.current()
 
         let existing: [ALTDevice] = try await withCheckedThrowingContinuation { continuation in
-            ALTAppleAPI.shared.fetchDevices(for: team, types: .iphone, session: session) { devices, error in
+            ALTAppleAPI.shared.fetchDevices(for: team, session: session) { devices, error in
                 if let devices {
                     continuation.resume(returning: devices)
                 } else {
@@ -310,7 +310,7 @@ final class AppSigner: ObservableObject {
         }
 
         return try await withCheckedThrowingContinuation { continuation in
-            ALTAppleAPI.shared.fetchProvisioningProfile(for: appID, deviceType: .iphone, team: team, session: session) { profile, error in
+            ALTAppleAPI.shared.fetchProvisioningProfile(for: appID, team: team, session: session) { profile, error in
                 if let profile {
                     continuation.resume(returning: profile)
                 } else {

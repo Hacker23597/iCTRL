@@ -25,6 +25,8 @@ struct SettingsView: View {
     @State private var installBusy = false
     @State private var installPhase: IPAInstaller.Phase = .idle
     @State private var anisetteReport: AnisetteProbe.Report?
+    @State private var signBeforeInstalling = false
+    @State private var pendingSignURL: PickedIPA?
 
     /// The runner registers this scheme; opening it starts the automation server.
     ///
@@ -251,11 +253,20 @@ struct SettingsView: View {
             }
 
             Button {
+                signBeforeInstalling = false
                 showIPAPicker = true
             } label: {
-                Label("Choose an .ipa…", systemImage: "square.and.arrow.down")
+                Label("Install a signed .ipa…", systemImage: "square.and.arrow.down")
             }
-            .disabled(!ddi.isMounted || !PairingFileStore.exists || installBusy)
+            .disabled(!installable || installBusy)
+
+            Button {
+                signBeforeInstalling = true
+                showIPAPicker = true
+            } label: {
+                Label("Sign with my Apple ID, then install…", systemImage: "signature")
+            }
+            .disabled(!installable || installBusy)
 
             switch installPhase {
             case .idle:
@@ -299,7 +310,10 @@ struct SettingsView: View {
         } header: {
             Text("Install an app")
         } footer: {
-            Text("Sideloads a package onto this device. The .ipa must already be signed for it — signing on-device isn't implemented yet.")
+            Text("Sideloads a package onto this device. Signing re-signs it with a certificate Apple issues to your own Apple ID — on a free account, apps signed this way stop launching after seven days.")
+        }
+        .sheet(item: $pendingSignURL) { pending in
+            SignAndInstallView(ipaURL: pending.url)
         }
         .fileImporter(isPresented: $showIPAPicker,
                       allowedContentTypes: [.data],
@@ -307,11 +321,21 @@ struct SettingsView: View {
             switch result {
             case .success(let urls):
                 guard let url = urls.first else { return }
-                startInstall(url)
+                if signBeforeInstalling {
+                    pendingSignURL = PickedIPA(url: url)
+                } else {
+                    startInstall(url)
+                }
             case .failure(let err):
                 installPhase = .failed(err.localizedDescription)
             }
         }
+    }
+
+    /// Both install paths need the same transport: a mounted developer image
+    /// and a pairing file.
+    private var installable: Bool {
+        ddi.isMounted && PairingFileStore.exists
     }
 
     private func progressRow(text: String, value: Double?) -> some View {
