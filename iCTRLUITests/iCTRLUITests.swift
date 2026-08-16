@@ -941,6 +941,31 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// before the next request runs.
     private static let rpcTimeout: TimeInterval = 6
 
+    /// page_source gets a longer leash than actions do. On a long-scrolled feed
+    /// the read is legitimately slow — audited at 6.7–9.6s per call on X with
+    /// every one COMPLETING on the device — so a flat 6s cap was discarding
+    /// finished work, and two such "failures" in a row tripped the circuit
+    /// breaker, which then rejected everything: the mechanic behind a measured
+    /// 51% page_source failure rate. Most actions keep the tight cap; for them
+    /// a 6-second silence really does mean something is wrong.
+    ///
+    /// find_and_tap / tap_element are the exception: they are locate-driven,
+    /// and locating during a screen transition is legitimately slow — XCTest's
+    /// AX layer stalls per query while the UI animates (a 30-node mid-transition
+    /// WeChat tree cost 5–6.5s per snapshot; the settled 120-node tree, 169ms).
+    /// Three consecutive find_and_tap "timeouts" all completed server-side at
+    /// 10.2–11.6s. A false timeout is WORSE for an action than for a read: the
+    /// documented remedy for ambiguity is to retry, and retrying an already-
+    /// landed tap fires it twice. The longer watchdog does not hold the serial
+    /// queue any longer — the work occupies it either way — it only keeps the
+    /// client waiting for the real answer.
+    private static let extendedTimeoutMethods: Set<String> = ["page_source", "find_and_tap", "tap_element"]
+    private static let extendedRpcTimeout: TimeInterval = 15
+
+    private static func rpcBudget(for method: String) -> TimeInterval {
+        extendedTimeoutMethods.contains(method) ? extendedRpcTimeout : rpcTimeout
+    }
+
     /// Wire RPC dispatch + public logs onto a server instance.
     private func configureServerCallbacks(_ srv: JSONRPCServer) {
         srv.onRPCRequest = { [weak self] method, params, completion in
@@ -1037,12 +1062,13 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             }
 
             // Watchdog: if the work doesn't finish in time, tell the client now.
+            let budget = Self.rpcBudget(for: method)
             DispatchQueue.global().async {
-                if done.wait(timeout: .now() + Self.rpcTimeout) == .timedOut {
-                    Self.logBuffer.append("⏱ TIMEOUT \(method) (>\(Int(Self.rpcTimeout))s) — still running in background")
+                if done.wait(timeout: .now() + budget) == .timedOut {
+                    Self.logBuffer.append("⏱ TIMEOUT \(method) (>\(Int(budget))s) — still running in background")
                     if isUIMethod { self.noteUITimeout(method: method) }
                     replyOnce((nil, .serverError(
-                        "\(method) exceeded \(Int(Self.rpcTimeout))s and may still be running on the device. " +
+                        "\(method) exceeded \(Int(budget))s and may still be running on the device. " +
                         "Do NOT blindly retry — check GET /logs for a '✓ \(method)' entry first; the action may have already succeeded."
                     )))
                 }
