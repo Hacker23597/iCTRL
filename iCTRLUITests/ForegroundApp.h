@@ -50,6 +50,73 @@ NS_ASSUME_NONNULL_BEGIN
 /// UI to dismiss it first. Caught safely; returns NO on any error.
 + (BOOL)hasSystemAlert;
 
+/// Benchmarks the two ways XCTest can fetch an accessibility tree, on the same
+/// live UI, so we can tell where page_source's cost actually is.
+///
+/// `XCUIElement.snapshot()` (what page_source uses) resolves to
+/// `snapshotForElement:attributes:parameters:` with `defaultParameters` — no
+/// depth limit — so the target app walks and serializes its ENTIRE tree before
+/// anything crosses the IPC boundary. Our max_depth/max_elements then trim the
+/// already-materialized result, which cannot recover that cost.
+///
+/// XCUIAutomation exposes `maxDepth`/`maxChildren`/`maxArrayCount` parameter
+/// keys that ride along with the request and are applied by the AX server on the
+/// far side. Whether the server actually honours them is the open question this
+/// answers empirically — the key existing in the binary is not proof it is
+/// implemented on iOS 26.
+///
+/// Returns a dictionary of timings/sizes per variant, or nil if the private API
+/// is unavailable. Never throws.
+/// Takes `-[XCUIElement snapshotWithError:]` without letting it kill the runner.
+///
+/// XCTest raises an Obj-C NSException from snapshot() in states Swift cannot
+/// intercept — `try?` only catches Swift `throws`, so the exception reaches
+/// XCTest's terminate handler and the process dies with SIGABRT. That is exactly
+/// what happened when the snapshot walk was promoted to find_element's primary
+/// path: it aborted on the first call, before a single phase was logged.
+///
+/// Returns nil when the snapshot is unavailable, so callers can fall back.
++ (nullable id)safeSnapshotOfElement:(id)element;
+
+/// Fetches an accessibility snapshot with the traversal bounded ON THE DEVICE.
+///
+/// `XCUIElement.snapshot()` asks the target app to walk and serialise its whole
+/// tree before anything crosses the IPC boundary, so a long-scrolled feed costs
+/// seconds no matter what the caller intends to keep. XCTest's underlying
+/// request accepts `maxDepth`/`maxChildren`, which the app applies while
+/// walking — measured at 1.6s versus 6.5-8.5s for the same X timeline, with the
+/// feed's text intact.
+///
+/// Returns an `XCUIElementSnapshot`-conforming root, or nil if any part of the
+/// private path is unavailable (it moved four times on iOS 26 alone) — callers
+/// must fall back to `snapshot()` rather than treating nil as an empty screen.
++ (nullable id)boundedSnapshotForBundleID:(NSString *)bundleId
+                                 maxDepth:(NSInteger)maxDepth
+                              maxChildren:(NSInteger)maxChildren;
+
+/// Renders a bounded snapshot tree to the same one-line-per-node text
+/// `page_source` produces.
+///
+/// Done here rather than in Swift because the returned object is an
+/// `XCElementSnapshot`, and casting it to the `XCUIElementSnapshot` protocol
+/// yields a value whose `frame` reads {{0,0},{0,0}} and whose `children` stops
+/// after the first level — the tree looks 16 nodes deep and empty when it
+/// actually holds hundreds. Reading the same properties through the runtime
+/// returns the real values.
++ (nullable NSString *)renderBoundedSnapshot:(id)root
+                                    maxDepth:(NSInteger)maxDepth
+                                 maxElements:(NSInteger)maxElements
+                                 nodesWritten:(NSInteger *)outCount
+                                    truncated:(BOOL *)outTruncated;
+
+/// Selects the single snapshot property `benchmarkSnapshotForBundleID:` samples.
+/// Undocumented getters can crash the process outright (SIGBUS, which @catch
+/// cannot intercept), so exactly one is read per call and it is named here.
++ (void)setProbeSelectorName:(nullable NSString *)name;
+
++ (nullable NSDictionary *)benchmarkSnapshotForBundleID:(NSString *)bundleId
+                                               maxDepth:(NSInteger)maxDepth;
+
 @end
 
 NS_ASSUME_NONNULL_END
