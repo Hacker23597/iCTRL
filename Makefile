@@ -81,8 +81,17 @@ ipa: build
 	@# one bind record at it — the symbol is only touched on the --run-as-tool
 	@# path, which testmanagerd-launched runs never take.
 	@echo "🩹 Building + inserting the older-iOS compat shim..."
+	@# Both steps below are one-shot: optool would add a second load command,
+	@# and the bind record is already re-pointed, so retarget-bind-ordinal.py
+	@# finds nothing to change and fails the build. That happens whenever `make
+	@# ipa` runs twice without the runner being rebuilt in between, which reads
+	@# as a broken build rather than as work already done.
 	@set -e; \
 	APP="$(BUILD_DIR)/$(RUNNER_APP)"; \
+	if otool -L "$$APP/$(RUNNER_BIN)" | grep -q libXCTCompatShim; then \
+		echo "   ✅ shim already present — skipping"; \
+		exit 0; \
+	fi; \
 	SDK="$$(xcrun --sdk iphoneos --show-sdk-path)"; \
 	mkdir -p "$$APP/Frameworks"; \
 	xcrun -sdk iphoneos clang -dynamiclib -arch arm64 -isysroot "$$SDK" \
