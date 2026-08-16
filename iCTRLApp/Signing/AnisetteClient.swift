@@ -15,19 +15,6 @@ import Foundation
 /// the honest framing for the UI is: pick one you trust, or run your own.
 enum AnisetteClient {
 
-    /// One fetch's worth of headers, in the shape the GSA handshake wants.
-    struct AnisetteData: Equatable {
-        var machineID: String              // X-Apple-I-MD-M
-        var oneTimePassword: String        // X-Apple-I-MD
-        var routingInfo: String            // X-Apple-I-MD-RINFO
-        var localUserID: String            // X-Apple-I-MD-LU
-        var deviceUniqueIdentifier: String // X-Mme-Device-Id
-        var deviceSerialNumber: String     // X-Apple-I-SRL-NO
-        var date: Date
-        var locale: Locale
-        var timeZone: TimeZone
-    }
-
     enum AnisetteError: LocalizedError {
         case http(Int)
         case malformed(String)
@@ -45,23 +32,53 @@ enum AnisetteClient {
         }
     }
 
-    /// Providers answer with slightly different key spellings depending on which
-    /// implementation they run, so each field is looked up under every name it
-    /// is known by. Failing on a cosmetic key difference would look to the user
-    /// like the server being down.
-    private static func string(_ dict: [String: Any], _ names: [String]) -> String? {
-        for name in names {
-            if let value = dict[name] as? String { return value }
+    /// Servers answer in one of two shapes: the header spellings Apple uses
+    /// (`X-Apple-I-MD-M`) or AltSign's camel-cased names (`machineID`). Both are
+    /// accepted, since which one you get depends on the provider's
+    /// implementation rather than on anything the user chose.
+    private static let aliases: [String: [String]] = [
+        "machineID":              ["machineID", "X-Apple-I-MD-M"],
+        "oneTimePassword":        ["oneTimePassword", "X-Apple-I-MD"],
+        "localUserID":            ["localUserID", "X-Apple-I-MD-LU"],
+        "routingInfo":            ["routingInfo", "X-Apple-I-MD-RINFO"],
+        "deviceUniqueIdentifier": ["deviceUniqueIdentifier", "X-Mme-Device-Id"],
+        "deviceSerialNumber":     ["deviceSerialNumber", "X-Apple-I-SRL-NO"],
+        "deviceDescription":      ["deviceDescription", "X-Mme-Client-Info"],
+        "date":                   ["date", "X-Apple-I-Client-Time"],
+        "locale":                 ["locale", "X-Apple-Locale"],
+        "timeZone":               ["timeZone", "X-Apple-I-TimeZone"],
+    ]
+
+    /// Fields a server may legitimately omit, with what to use instead.
+    ///
+    /// `ALTAnisetteData.initWithJSON:` returns nil unless all ten keys are
+    /// present, which is stricter than servers actually behave — several send
+    /// only the fingerprint proper and leave the client to fill in its own
+    /// locale and clock. Failing the login over a missing time zone would
+    /// report "server broken" for something that isn't.
+    private static func defaultValue(for key: String) -> String? {
+        switch key {
+        case "deviceDescription":
+            return "<MacBookPro13,2> <Mac OS X;10.14.6;18G103> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>"
+        case "date":
+            return ISO8601DateFormatter().string(from: Date())
+        case "locale":
+            return Locale.current.identifier
+        case "timeZone":
+            return TimeZone.current.abbreviation() ?? "UTC"
+        default:
+            // The fingerprint fields have no sensible stand-in; a made-up
+            // machine identifier would be rejected by Apple anyway.
+            return nil
         }
-        return nil
     }
 
-    /// Fetches anisette from `server`.
+    /// Fetches anisette from `server` and returns it in AltSign's shape.
     ///
     /// Deliberately takes the server as a parameter with no default: there is no
     /// safe default here, and picking one silently would hide the trust decision
     /// from the person making it.
-    static func fetch(from server: URL) async throws -> AnisetteData {
+    static func fetch(from server: URL) async throws -> ALTAnisetteData {
         ictrlLog("Fetching anisette from \(server.host ?? server.absoluteString)")
 
         var request = URLRequest(url: server)
@@ -72,31 +89,34 @@ enum AnisetteClient {
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw AnisetteError.http(http.statusCode)
         }
-        guard let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw AnisetteError.malformed("not JSON")
         }
 
-        guard let machineID = string(dict, ["X-Apple-I-MD-M", "machineID", "md-m"]),
-              let otp = string(dict, ["X-Apple-I-MD", "oneTimePassword", "md"])
-        else {
-            // These two are the fingerprint proper; without them the reply is
-            // not anisette regardless of what else it contains.
-            throw AnisetteError.malformed("missing the machine identifier or one-time password")
+        // Some servers nest the payload; unwrap before looking for fields so a
+        // wrapper key doesn't read as "nothing here".
+        let body = (raw["result"] as? [String: Any]) ?? raw
+
+        var normalized: [String: String] = [:]
+        var missing: [String] = []
+        for (key, names) in aliases {
+            if let value = names.compactMap({ body[$0] }).first {
+                normalized[key] = "\(value)"
+            } else if let fallback = defaultValue(for: key) {
+                normalized[key] = fallback
+            } else {
+                missing.append(key)
+            }
         }
 
-        let anisette = AnisetteData(
-            machineID: machineID,
-            oneTimePassword: otp,
-            routingInfo: string(dict, ["X-Apple-I-MD-RINFO", "routingInfo", "md-rinfo"]) ?? "17106176",
-            localUserID: string(dict, ["X-Apple-I-MD-LU", "localUserID", "md-lu"]) ?? "",
-            deviceUniqueIdentifier: string(dict, ["X-Mme-Device-Id", "deviceUniqueIdentifier", "device-id"]) ?? "",
-            deviceSerialNumber: string(dict, ["X-Apple-I-SRL-NO", "deviceSerialNumber", "serial"]) ?? "0",
-            date: Date(),
-            locale: Locale.current,
-            timeZone: TimeZone.current
-        )
+        guard missing.isEmpty else {
+            throw AnisetteError.malformed("missing \(missing.sorted().joined(separator: ", "))")
+        }
+        guard let anisette = ALTAnisetteData(json: normalized) else {
+            throw AnisetteError.malformed("AltSign rejected the fields")
+        }
 
-        ictrlLog("Anisette fetched — machineID \(machineID.prefix(8))…")
+        ictrlLog("Anisette fetched — machineID \(normalized["machineID"]?.prefix(8) ?? "?")…")
         return anisette
     }
 
@@ -118,7 +138,7 @@ enum AnisetteClient {
         }
     }
 
-    static func fetchFromConfiguredServer() async throws -> AnisetteData {
+    static func fetchFromConfiguredServer() async throws -> ALTAnisetteData {
         guard let server = configuredServer else { throw AnisetteError.noServerConfigured }
         return try await fetch(from: server)
     }
