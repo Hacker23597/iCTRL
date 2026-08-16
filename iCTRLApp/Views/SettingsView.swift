@@ -19,6 +19,13 @@ struct SettingsView: View {
     @StateObject private var runner = RunnerStatus(port: 8200)
     @State private var logCount = AppLog.allFiles().count
 
+    /// Sideload state. Kept here rather than in AppState because it is
+    /// transient UI feedback for one action, not app-wide state.
+    @State private var showIPAPicker = false
+    @State private var installBusy = false
+    @State private var installPhase: IPAInstaller.Phase = .idle
+    @State private var anisetteReport: AnisetteProbe.Report?
+
     /// The runner registers this scheme; opening it starts the automation server.
     ///
     /// `callback` asks the runner to bounce back to us once it has decided
@@ -89,6 +96,8 @@ struct SettingsView: View {
                     }
                 }
             }
+
+            installSection
 
             serverSection
 
@@ -222,6 +231,114 @@ struct SettingsView: View {
             LabeledRow(L10n.t(.nameLabel), UIDevice.current.name, monospaced: false)
         } header: {
             Text(L10n.t(.deviceSection))
+        }
+    }
+
+    /// Installs an .ipa onto this device over the same tunnel the DDI mount
+    /// uses — the transport half of self-signing, built and shipped first so
+    /// the "can we install at all over RSD?" question is answered before any
+    /// Apple ID / re-signing machinery exists. The picker accepts any .ipa, so
+    /// this is usable on its own for sideloading an already-signed package.
+    private var installSection: some View {
+        Section {
+            if !ddi.isMounted {
+                Label {
+                    Text("Mount the developer image first — installing uses the same tunnel.")
+                        .font(.footnote)
+                } icon: {
+                    Image(systemName: "info.circle")
+                }
+            }
+
+            Button {
+                showIPAPicker = true
+            } label: {
+                Label("Choose an .ipa…", systemImage: "square.and.arrow.down")
+            }
+            .disabled(!ddi.isMounted || !PairingFileStore.exists || installBusy)
+
+            switch installPhase {
+            case .idle:
+                EmptyView()
+            case .connecting:
+                progressRow(text: "Connecting…", value: nil)
+            case .uploading(let f):
+                progressRow(text: "Uploading — \(Int(f * 100))%", value: f)
+            case .installing(let f):
+                progressRow(text: "Installing — \(Int(f * 100))%", value: f)
+            case .done(let what):
+                Label {
+                    Text("Installed \(what)").font(.footnote)
+                } icon: {
+                    Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+                }
+            case .failed(let why):
+                Label {
+                    Text(why).font(.footnote).foregroundColor(.secondary)
+                } icon: {
+                    Image(systemName: "xmark.circle.fill").foregroundColor(.red)
+                }
+            }
+
+            Button {
+                anisetteReport = AnisetteProbe.run()
+            } label: {
+                Label("Check on-device signing support", systemImage: "stethoscope")
+            }
+
+            if let report = anisetteReport {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(report.summary).font(.footnote)
+                    ForEach(report.lines, id: \.self) { line in
+                        Text(line)
+                            .font(.caption2.monospaced())
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+        } header: {
+            Text("Install an app")
+        } footer: {
+            Text("Sideloads a package onto this device. The .ipa must already be signed for it — signing on-device isn't implemented yet.")
+        }
+        .fileImporter(isPresented: $showIPAPicker,
+                      allowedContentTypes: [.data],
+                      allowsMultipleSelection: false) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                startInstall(url)
+            case .failure(let err):
+                installPhase = .failed(err.localizedDescription)
+            }
+        }
+    }
+
+    private func progressRow(text: String, value: Double?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(text).font(.footnote)
+            if let value {
+                ProgressView(value: value)
+            } else {
+                ProgressView()
+            }
+        }
+    }
+
+    private func startInstall(_ url: URL) {
+        // A picked file lives outside the app's container; without the security
+        // scope the read fails with a permissions error that looks nothing like
+        // a permissions error.
+        let scoped = url.startAccessingSecurityScopedResource()
+        installBusy = true
+        installPhase = .connecting
+        Task {
+            await IPAInstaller.install(ipaURL: url,
+                                       pairingPath: PairingFileStore.storedURL.path) { phase in
+                installPhase = phase
+            }
+            if scoped { url.stopAccessingSecurityScopedResource() }
+            installBusy = false
         }
     }
 
