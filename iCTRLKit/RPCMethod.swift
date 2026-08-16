@@ -260,12 +260,13 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "find_and_tap",
-            description: "Like tap_element, but always uses the native XCUIElement.tap() (no synthesized-event shortcut). Slower — the OS's real touch pipeline may take a few hundred ms and blocks until the tap settles — but works on SwiftUI List/ForEach rows that ignore the synthesized fastTap path. Use when tap_element silently no-ops (the target visually doesn't change). Same match semantics: element_id may be a label OR identifier; pair with match:'contains' for partial substring matching.",
+            description: "Locate an element by label/identifier and tap it in one call. Default is a synthesized tap at the element's center (fast, ~1s). Call `wait` 1-2s after any navigation (back/tab-switch/page open) before using this: mid-transition, every locate step runs 5-30x slower and matches mid-animation geometry, so the same call that takes ~1s settled can take 10s+ and still succeed — do NOT blindly retry a timeout (the tap may have landed; check /logs). IMPORTANT: on SwiftUI List/ForEach rows a synthesized tap can report success yet never land — if the tap visibly does nothing, retry with fast:false, which drives the native XCUIElement.tap() pipeline (slower, waits for quiescence, but resolves the element at hit time). Same match semantics: element_id may be a label OR identifier; pair with match:'contains' for partial substring matching.",
             params: [
                 RPCParamDef(name: "element_id", type: "string", required: true, description: "Accessibility label or identifier (see page_source)"),
                 RPCParamDef(name: "match", type: "string", required: false, description: "'exact' (default) or 'contains' (substring)"),
                 RPCParamDef(name: "element_type", type: "string", required: false, description: "Restrict to type: button/textfield/label/image/cell/switch/icon"),
                 RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Target this app; omit for the bound/foreground app"),
+                RPCParamDef(name: "fast", type: "boolean", required: false, description: "false = native XCUIElement.tap() — the reliable path for SwiftUI Lists where a synthesized tap silently no-ops. Default true (synthesized)."),
             ],
             returns: "{message, matched, frame:{x,y,w,h}}"
         ),
@@ -318,7 +319,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.8.0"
+    static let serverVersion = "1.16.0"
 
     /// Server capability/protocol version. v1 = encrypted-envelope auth over /pair +
     /// /rpc. Bump when the wire capabilities change so clients can auto-detect.
@@ -583,8 +584,10 @@ struct RPCMethodRegistry {
         <p><strong>⚠️ Coordinates use POINTS, not pixels.</strong></p>
         <p style="margin-top:6px;color:#6e6e73;font-size:14px">
         Screenshots come back in <em>pixels</em>; <code>tap</code>/<code>swipe</code>/<code>drag</code> take <em>points</em>.
-        Convert: <code>point = pixel / scale</code>. Get <code>scale</code> and the valid range
-        (<code>point_width</code> × <code>point_height</code>) from <code>device_info</code>.
+        Convert: <code>point = pixel / scale</code>, taking <code>scale</code> from the
+        <em>screenshot response</em> — not <code>device_info.screen_scale</code>, which is the
+        panel ratio (3) while a screenshot is downscaled to 2 by default.
+        The valid tap range (<code>point_width</code> × <code>point_height</code>) comes from either.
         </p>
         <p style="margin-top:6px;color:#6e6e73;font-size:14px">
         Recommended flow: <code>device_info</code> → <code>resolve_app</code>/<code>launch_app</code> → <code>page_source</code> → tap frame center → verify.

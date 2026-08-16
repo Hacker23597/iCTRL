@@ -1,7 +1,7 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
-skill_version: "1.7.2"
+skill_version: "1.16.0"
 ---
 
 # iCTRL — Control an iPhone over HTTP
@@ -45,7 +45,7 @@ Both speak the identical protocol against the same token store — pick by what 
 
 ## Version check — glance at this on your first `device_info`
 
-This document is **skill_version 1.7.2** (see the frontmatter). Every `device_info` response carries the device's own `skill_version` (same value as `server_version`) plus a `skill_update_hint`.
+This document is **skill_version 1.16.0** (see the frontmatter). Every `device_info` response carries the device's own `skill_version` (same value as `server_version`) plus a `skill_update_hint`.
 
 **This is advisory — a version gap is not an error, and most gaps need no action.** Your installed copy is a snapshot from whenever it was fetched; the device's copy always matches the running build. Use semver to decide whether the difference could actually affect you:
 
@@ -189,9 +189,21 @@ When a call returns success, it worked. Don't repeat it "to be safe."
 6. page_source                     → read the result directly (wait ~1s + re-read ONLY if still loading)
 ```
 
+## Read the `hint` field
+
+Most responses carry a **`hint`** string. It is written for you at call time and knows things this document cannot: which limits were applied to *that* response, whether a result is trustworthy, and what to do next when it isn't. **Read it and decide whether it applies** — it is advisory, not an order, but ignoring it is how automations reach confident wrong conclusions.
+
+`hint` is the single field for this. (`message` describes what happened; `skill_update_hint` is only about version drift.)
+
+It matters most when a result is **negative or suspiciously empty** — that is exactly when a hint tells you the result may be an API limitation rather than a fact about the device.
+
 ## Opening apps & jumping back
 
 - **Open an app**: `resolve_app{text:"<name>"}` → `launch_app{bundle_id}`. `launch_app` opens the app's home; use `open_url` when you know a deep link to a specific screen.
+- **Never conclude "the app isn't installed" from a lookup.** `resolve_app` reads a static name→bundle_id catalog and says nothing about *this* device; `list_apps` goes through a private API that newer iOS versions may refuse, returning an **empty list on a phone full of apps**. Both failure modes are silent. To actually decide:
+  1. **`launch_app{bundle_id}`** — the real test. Success proves it's installed; an error means genuinely absent.
+  2. **Ask iOS** — open the home screen, swipe down from mid-screen for Spotlight, type the app's *name*, read the result. Spotlight indexes every installed app regardless of API restrictions, and it works by name, which is what the user gave you anyway.
+  3. Only after one of those should you report the app as missing.
 - **`open_url{url:"scheme://…"}`** — iCTRL can open ANY iOS URL scheme / deep link, not just app launches. Use it to jump straight to a feature, open a web/universal link, or trigger another app's action.
 - **Return to the calling app when the task is done**: after finishing the automation, you can hand control back by opening the caller's URL scheme, e.g. `open_url{url:"<caller-scheme>://"}`. This brings that app to the foreground — a clean way to "return" once you've read/done what you needed on the target app. (If you were invoked with a specific return/callback scheme, use that.)
 
@@ -231,11 +243,14 @@ After `launch_app`/`activate_app`, that app is the **sticky target**.
 
 ## Coordinates
 
-`tap`/`swipe`/`drag`/`type(x,y)` use **POINTS**, not pixels. `page_source` frames are already in points. Screenshots are **pixels** → `point = pixel / scale`. Get `scale` and the valid range from `device_info`.
+`tap`/`swipe`/`drag`/`type(x,y)` use **POINTS**, not pixels. `page_source` frames are already in points. Screenshots are **pixels** → `point = pixel / scale`.
+
+**Use the `scale` from the screenshot response, NOT the one from `device_info`.** They are different numbers: `device_info.screen_scale` is the panel's native ratio (3 on a recent iPhone), while a screenshot defaults to `scale: 2` and is downscaled to match. On a 1206×2622 device that yields an 804×1748 image — dividing by 3 instead of 2 puts the tap ~200pt off, which is the difference between hitting a button and hitting whatever sits above it. Every screenshot response carries `pixel_width/height`, `point_width/height` and its own `scale`; both bundled clients print all three next to the saved file.
 
 ## Timeouts & reliability
 
-- Use generous `/rpc` client timeouts (≥ 30s, ideally 60–120s): `/rpc` drives a real device; a cold launch or heavy page takes seconds. A generous timeout is not a reason to *wait* that long — see the timing table above for what each call normally costs. The server itself gives up on a UI call after 6s and replies, so a request pending far beyond that is a transport problem, not a slow device.
+- Use generous `/rpc` client timeouts (≥ 30s, ideally 60–120s): `/rpc` drives a real device; a cold launch or heavy page takes seconds. A generous timeout is not a reason to *wait* that long — see the timing table above for what each call normally costs. The server itself gives up on a UI call after 6s and replies (15s for the locate-driven ones: `page_source`, `find_and_tap`, `tap_element`), so a request pending far beyond that is a transport problem, not a slow device.
+- **Never locate mid-transition — `wait` 1–2s after ANY navigation** (back, tab switch, opening a page), not just after app launch. While a transition animates, every element query runs 5–30x slower (measured: the same screen answered in 169ms settled vs 6.5s mid-animation) and the tree exposes mid-animation geometry — a skeleton of the page with elements at coordinates they are only passing through, so a match can aim a tap at a spot the control has already left. One `wait` beats a slow, wrong read. Corollary: if a locate that is normally fast suddenly takes seconds, the screen probably wasn't settled — re-read rather than trusting the coordinates.
 - **A client timeout ≠ failure.** The device keeps executing. Before retrying, `GET /logs` and look for `⏱ ✓ <method>` — if present, it already succeeded and retrying would DOUBLE the action (e.g. a tap fires twice).
 - **Cheap recovery** if the service drops: reuse the cached key (`~/.ictrl/token.json`) and `bundle_id` (don't `resolve_app` again); re-`/pair` only if a call actually returns 401; if you know a deep link back (`open_url`), use it instead of re-navigating from the app's home screen.
 - **Cellular vs Wi-Fi.** On Wi-Fi the device's LAN address is remotely reachable. On **cellular/mobile data** the address is a public/CGNAT one that's **reachable on-device only** — the server still runs and localhost/on-device clients work, but a LAN peer can't connect, and that's expected (the server won't self-check or raise a "Local Network" prompt on cellular). If you're driving iCTRL from another host, use Wi-Fi; from on-device (e.g. the same phone) it works on any network.

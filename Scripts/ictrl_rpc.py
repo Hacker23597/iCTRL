@@ -288,8 +288,18 @@ def main() -> int:
         blob = base64.b64decode(result["data"])
         with open(args.path, "wb") as fh:
             fh.write(blob)
+        # Print the point-space and scale too, not just the pixel size. A caller
+        # looking at the saved image only sees its pixel dimensions, and guessing
+        # the divisor from device_scale is wrong whenever the shot was
+        # downscaled: a 1206x2622 screen saved at scale 2 is an 804x1748 file, so
+        # dividing by 3 puts a tap ~200pt off target.
+        px_w = int(result.get("pixel_width", 0))
+        px_h = int(result.get("pixel_height", 0))
+        pt_w = int(result.get("point_width", 0))
+        pt_h = int(result.get("point_height", 0))
+        sc = result.get("scale", 0)
         print(f"{args.path}  {len(blob):,} B  {result.get('format')}  "
-              f"{int(result.get('pixel_width', 0))}x{int(result.get('pixel_height', 0))}px  "
+              f"{px_w}x{px_h}px  ->  {pt_w}x{pt_h}pt  (scale {sc}: tap_x = px/{sc}, tap_y = py/{sc})  "
               f"{(time.time() - t0) * 1000:.0f}ms end-to-end")
     else:
         out = call(args.host, args.method, json.loads(args.params))

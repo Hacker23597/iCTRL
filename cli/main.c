@@ -564,6 +564,22 @@ static void usage(void) {
         "Env: ICTRL_HOST overrides the default host.\n");
 }
 
+/// Pulls a top-level numeric field out of a JSON response. Enough for the few
+/// scalars `shot` reports; not a general parser (nested objects are ignored).
+/// Returns -1 when the key is absent.
+static double json_num(const char *json, const char *key) {
+    char needle[64];
+    snprintf(needle, sizeof needle, "\"%s\"", key);
+    const char *p = strstr(json, needle);
+    if (!p) return -1;
+    p = strchr(p + strlen(needle), ':');
+    if (!p) return -1;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+    if (*p != '-' && *p != '+' && *p != '.' && (*p < '0' || *p > '9')) return -1;
+    return atof(p);
+}
+
 /// `shot` — screenshot straight to a file, decoding the base64 for the caller.
 static int do_shot(const char *hostport, const char *path, int argc, char **argv) {
     const char *fmt = "jpeg";
@@ -633,7 +649,22 @@ static int do_shot(const char *hostport, const char *path, int argc, char **argv
     if (!f) die("cannot write %s: %s", path, strerror(errno));
     fwrite(img, 1, imglen, f);
     fclose(f);
-    fprintf(stderr, "%s  %zu bytes\n", path, imglen);
+    // Report the coordinate spaces alongside the file. Seeing only the pixel
+    // size invites deriving the divisor from device_scale, which is wrong once
+    // the shot is downscaled: a 1206x2622 screen saved at scale 2 is an 804x1748
+    // file, and dividing by 3 lands a tap ~200pt away from the target.
+    double px_w = json_num((const char *)json.data, "pixel_width");
+    double px_h = json_num((const char *)json.data, "pixel_height");
+    double pt_w = json_num((const char *)json.data, "point_width");
+    double pt_h = json_num((const char *)json.data, "point_height");
+    double sc   = json_num((const char *)json.data, "scale");
+    if (sc > 0) {
+        fprintf(stderr, "%s  %zu bytes  %.0fx%.0fpx  ->  %.0fx%.0fpt"
+                        "  (scale %g: tap_x = px/%g, tap_y = py/%g)\n",
+                path, imglen, px_w, px_h, pt_w, pt_h, sc, sc, sc);
+    } else {
+        fprintf(stderr, "%s  %zu bytes\n", path, imglen);
+    }
     free(img);
     buf_free(&json);
     return 0;
