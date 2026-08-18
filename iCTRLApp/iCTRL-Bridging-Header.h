@@ -10,3 +10,7 @@
 //
 
 #import "AltSign.h"
+
+// Signs the `.xctest` plugin and loose dylibs that ldid's own bundle recursion
+// skips — the difference between a runner that installs and one that launches.
+#import "NestedBundleSigner.h"

@@ -334,6 +334,26 @@ final class AppSigner: ObservableObject {
                 }
             }
         }
+
+        // ldid recurses into `.framework` and `.appex` bundles only, so a
+        // `.xctest` plugin and a loose dylib come out hashed into the parent's
+        // CodeResources but without signatures of their own. The app installs
+        // either way; an XCUITest runner built that way dies at launch, because
+        // testmanagerd validates the plugin's own signature and dyld refuses a
+        // dylib with no cdhash. This is the same work the Makefile does with
+        // two extra `codesign` calls, on a device where codesign doesn't exist.
+        let nested = NestedBundleSigner.nestedBinaries(at: appURL)
+        guard !nested.isEmpty else { return }
+
+        ictrlLog("Signing \(nested.count) nested binaries ldid skipped")
+        guard let p12 = certificate.p12Data() else {
+            throw SigningError.local("The certificate couldn't be exported to sign the runner's plugin.")
+        }
+        try NestedBundleSigner.signNestedBundles(at: appURL, p12Data: p12, password: nil)
+
+        // Verify rather than assume: a half-signed bundle installs cleanly and
+        // then fails at launch, where the error names none of this.
+        try NestedBundleSigner.verifySigned(at: appURL)
     }
 
     // MARK: - Helpers
