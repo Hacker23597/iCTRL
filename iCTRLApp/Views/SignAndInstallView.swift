@@ -29,7 +29,9 @@ struct SignAndInstallView: View {
     @State private var appleID = ""
     @State private var password = ""
     @State private var verificationCode = ""
-    @State private var anisetteServer = AnisetteClient.configuredServer?.absoluteString ?? ""
+    @State private var anisetteServer = AnisetteClient.configuredServer?.absoluteString
+        ?? AnisetteClient.fallbackServer.address
+    @State private var anisetteServers: [AnisetteClient.Server] = [AnisetteClient.fallbackServer]
     @State private var installPhase: IPAInstaller.Phase = .idle
     @State private var busy = false
     @State private var errorMessage: String?
@@ -66,14 +68,32 @@ struct SignAndInstallView: View {
 
     private var anisetteSection: some View {
         Section {
-            TextField("https://…", text: $anisetteServer)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .keyboardType(.URL)
+            Picker("Server", selection: $anisetteServer) {
+                ForEach(anisetteServers) { server in
+                    Text(server.name).tag(server.address)
+                }
+                // Keeps a hand-typed address selectable instead of silently
+                // reverting to a listed one.
+                if !anisetteServers.contains(where: { $0.address == anisetteServer }) {
+                    Text("Custom").tag(anisetteServer)
+                }
+            }
+            .pickerStyle(.menu)
+
+            DisclosureGroup("Use a different server") {
+                TextField("https://…", text: $anisetteServer)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                    .font(.footnote)
+            }
         } header: {
             Text("Anisette server")
         } footer: {
-            Text("Apple requires a device fingerprint to accept a sign-in, and iOS won't let apps generate one — so this comes from a server you choose. It sees the fingerprint your Apple ID logs in under; pick one you trust, or run your own.")
+            Text("Apple requires a device fingerprint to accept a sign-in, and iOS can't generate one — so it comes from a server. This list is the one SideStore publishes; most entries are run by individuals, and whichever you pick sees the fingerprint your Apple ID logs in under. Point it at your own if you'd rather.")
+        }
+        .task {
+            anisetteServers = await AnisetteClient.fetchServerList()
         }
     }
 

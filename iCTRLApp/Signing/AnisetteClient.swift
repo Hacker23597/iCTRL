@@ -122,20 +122,80 @@ enum AnisetteClient {
 
     // MARK: - Server selection
 
-    /// The chosen provider, remembered between launches.
+    /// A provider the user can pick.
+    struct Server: Codable, Equatable, Identifiable {
+        var name: String
+        var address: String
+        var id: String { address }
+    }
+
+    /// Where SideStore publishes the community server list, and the default this
+    /// falls back to.
     ///
-    /// No value ships as a default. iCTRL shouldn't quietly route someone's
-    /// Apple ID login through a server they never chose.
+    /// Using SideStore's list is the pragmatic choice — these are the servers
+    /// that exist, they are already the ones SideStore users authenticate
+    /// through, and the list is maintained. It is still a third party holding
+    /// the fingerprint your Apple ID logs in under, so the choice stays visible
+    /// and changeable rather than being hidden behind a constant.
+    static let serverListURL = URL(string: "https://servers.sidestore.io/servers.json")!
+
+    /// Used until the list loads or if it can't be reached. SideStore's own
+    /// server rather than a community one: it's the likeliest to be up, and
+    /// picking someone's personal server as a silent default would be worse.
+    static let fallbackServer = Server(name: "SideStore", address: "https://ani.sidestore.io")
+
     private static let serverKey = "anisetteServerURL"
 
+    /// The chosen provider. Defaults to `fallbackServer` so signing works out of
+    /// the box; the UI shows which one is in use and lets it be changed.
     static var configuredServer: URL? {
         get {
-            guard let s = UserDefaults.standard.string(forKey: serverKey) else { return nil }
-            return URL(string: s)
+            if let s = UserDefaults.standard.string(forKey: serverKey), let url = URL(string: s) {
+                return url
+            }
+            return URL(string: fallbackServer.address)
         }
         set {
             UserDefaults.standard.set(newValue?.absoluteString, forKey: serverKey)
         }
+    }
+
+    /// True once the user has picked deliberately, so the UI can say whether it
+    /// is using a default or their choice.
+    static var hasExplicitServer: Bool {
+        UserDefaults.standard.string(forKey: serverKey) != nil
+    }
+
+    /// Fetches the published server list.
+    ///
+    /// Failure is not fatal — `fallbackServer` still works — so this returns
+    /// what it has rather than throwing the whole signing run away.
+    static func fetchServerList() async -> [Server] {
+        var request = URLRequest(url: serverListURL)
+        request.timeoutInterval = 20
+        request.setValue("iCTRL", forHTTPHeaderField: "User-Agent")
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entries = root["servers"] as? [[String: Any]]
+        else {
+            ictrlLog("Couldn't fetch the anisette server list; using \(fallbackServer.name)")
+            return [fallbackServer]
+        }
+
+        let servers = entries.compactMap { entry -> Server? in
+            guard let name = entry["name"] as? String,
+                  let address = entry["address"] as? String,
+                  // Plain-HTTP entries appear in the list; sending a login
+                  // fingerprint over one is worse than the choice being smaller.
+                  address.hasPrefix("https://")
+            else { return nil }
+            return Server(name: name, address: address)
+        }
+
+        ictrlLog("Fetched \(servers.count) anisette servers")
+        return servers.isEmpty ? [fallbackServer] : servers
     }
 
     static func fetchFromConfiguredServer() async throws -> ALTAnisetteData {
