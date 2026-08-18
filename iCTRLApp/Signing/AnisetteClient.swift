@@ -59,7 +59,11 @@ enum AnisetteClient {
     private static func defaultValue(for key: String) -> String? {
         switch key {
         case "deviceDescription":
-            return "<MacBookPro13,2> <Mac OS X;10.14.6;18G103> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>"
+            // Matches what the reference servers report. The OS version here is
+            // part of what Apple checks, so a stale one is not harmless — this
+            // tracks the value real servers send rather than an older string
+            // that happens to parse.
+            return "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>"
         case "date":
             return ISO8601DateFormatter().string(from: Date())
         case "locale":
@@ -97,13 +101,23 @@ enum AnisetteClient {
         // wrapper key doesn't read as "nothing here".
         let body = (raw["result"] as? [String: Any]) ?? raw
 
+        // Matched case-insensitively because servers are not consistent about
+        // it — the reference implementation sends `X-MMe-Client-Info` next to
+        // `X-Mme-Device-Id`, capitalised differently in the same response. An
+        // exact-match lookup silently misses and falls back to a default, which
+        // is far worse than failing: Apple rejects the login with -22411, an
+        // error naming nothing about the header that was wrong.
+        var lowercased: [String: Any] = [:]
+        for (key, value) in body { lowercased[key.lowercased()] = value }
+
         var normalized: [String: String] = [:]
         var missing: [String] = []
         for (key, names) in aliases {
-            if let value = names.compactMap({ body[$0] }).first {
+            if let value = names.compactMap({ lowercased[$0.lowercased()] }).first {
                 normalized[key] = "\(value)"
             } else if let fallback = defaultValue(for: key) {
                 normalized[key] = fallback
+                ictrlLog("⚠️ anisette server omitted \(names[0]); using a default")
             } else {
                 missing.append(key)
             }
@@ -116,7 +130,27 @@ enum AnisetteClient {
             throw AnisetteError.malformed("AltSign rejected the fields")
         }
 
-        ictrlLog("Anisette fetched — machineID \(normalized["machineID"]?.prefix(8) ?? "?")…")
+        // Log what we're about to authenticate with. Apple's rejection (-22411)
+        // names nothing about which field it disliked, so the only way to tell a
+        // stale value from a missing one is to see what was sent — and the two
+        // failures that already cost a round of debugging here (a defaulted
+        // client-info, an out-of-date OS version inside it) are both visible in
+        // these lines and invisible in the error.
+        //
+        // The fingerprint fields are truncated: they identify the device to
+        // Apple, and a log gets shared.
+        ictrlLog("""
+        Anisette from \(server.host ?? "?"):
+          machineID   \(normalized["machineID"]?.prefix(10) ?? "?")… (\(normalized["machineID"]?.count ?? 0) chars)
+          otp         \(normalized["oneTimePassword"]?.prefix(10) ?? "?")…
+          localUserID \(normalized["localUserID"]?.prefix(10) ?? "?")…
+          routingInfo \(normalized["routingInfo"] ?? "?")
+          deviceID    \(normalized["deviceUniqueIdentifier"] ?? "?")
+          serial      \(normalized["deviceSerialNumber"] ?? "?")
+          clientInfo  \(normalized["deviceDescription"] ?? "?")
+          locale/tz   \(normalized["locale"] ?? "?") / \(normalized["timeZone"] ?? "?")
+          time        \(normalized["date"] ?? "?")
+        """)
         return anisette
     }
 

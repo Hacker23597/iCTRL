@@ -268,7 +268,16 @@ final class AppSigner: ObservableObject {
     private func authenticate(appleID: String,
                               password: String,
                               anisette: ALTAnisetteData) async throws -> (ALTAccount, ALTAppleAPISession) {
-        try await withCheckedThrowingContinuation { continuation in
+        // Apple's rejection doesn't say which input it disliked, so record the
+        // ones that can be wrong without looking wrong. The Apple ID is logged
+        // as a domain only — enough to spot the wrong account, not enough to
+        // identify it if the log is shared.
+        let domain = appleID.split(separator: "@").last.map(String.init) ?? "?"
+        ictrlLog("Authenticating with GSA — account …@\(domain), "
+                 + "anisette machineID \(anisette.machineID.prefix(10))…, "
+                 + "client \(anisette.deviceDescription)")
+
+        return try await withCheckedThrowingContinuation { continuation in
             ALTAppleAPI.shared.authenticate(
                 appleID: appleID,
                 password: password,
@@ -509,8 +518,27 @@ final class AppSigner: ObservableObject {
 
     /// Turns an AltSign/Apple error into something worth showing.
     private static func wrap(_ error: Error?, fallback: String) -> Error {
-        guard let error else { return SigningError.apple(fallback) }
-        let message = (error as NSError).localizedDescription
+        guard let error else {
+            ictrlLog("❌ \(fallback) — Apple returned no error object")
+            return SigningError.apple(fallback)
+        }
+        let ns = error as NSError
+
+        // The user-facing message is Apple's sentence, which is often vague
+        // ("This action cannot be completed at this time"). The domain, code and
+        // userInfo are what actually identify the problem, so they go to the log
+        // even though they'd be noise in the UI.
+        var detail = "domain=\(ns.domain) code=\(ns.code)"
+        for (key, value) in ns.userInfo where !(value is NSError) {
+            detail += "\n    \(key): \(value)"
+        }
+        ictrlLog("❌ \(fallback)\n  \(detail)")
+
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            ictrlLog("  underlying: domain=\(underlying.domain) code=\(underlying.code) \(underlying.localizedDescription)")
+        }
+
+        let message = ns.localizedDescription
         return SigningError.apple(message.isEmpty ? fallback : message)
     }
 }
