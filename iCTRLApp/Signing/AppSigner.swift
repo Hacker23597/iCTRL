@@ -110,6 +110,11 @@ final class AppSigner: ObservableObject {
                                                             password: password,
                                                             anisette: anisette)
 
+            // Keep the session so the next signing run can skip the password
+            // prompt. Only the token pair is kept, never the password — see
+            // AppleIDSession for why that trade is deliberate.
+            AppleIDSession.save(appleID: appleID, adsid: session.dsid, xcodeToken: session.authToken)
+
             phase = .fetchingTeam
             let team = try await fetchPreferredTeam(account: account, session: session)
 
@@ -138,6 +143,124 @@ final class AppSigner: ObservableObject {
             phase = .failed(message)
             throw error
         }
+    }
+
+    /// Signs using the stored session, without asking for a password.
+    ///
+    /// Anisette is still required — a session is presented alongside a fresh
+    /// fingerprint, not instead of one — so this saves the password prompt and
+    /// the GSA handshake, not the anisette server. Throws if there is no stored
+    /// session or Apple no longer accepts it, and the caller falls back to a
+    /// full sign-in.
+    func signAppWithStoredSession(at appURL: URL) async throws {
+        guard let stored = AppleIDSession.load() else {
+            throw SigningError.local("No saved session — sign in with your Apple ID.")
+        }
+
+        do {
+            let anisette = try await AnisetteClient.fetchFromConfiguredServer()
+            let session = ALTAppleAPISession(dsid: stored.adsid,
+                                             authToken: stored.xcodeToken,
+                                             anisetteData: anisette)
+
+            phase = .fetchingTeam
+            // fetchTeams only reads the account's identifier, and the session
+            // already carries the authenticated identity — so this stands in for
+            // the ALTAccount the login would otherwise have returned.
+            guard let account = ALTAccount(responseDictionary: [
+                "appleId": stored.appleID,
+                "dsid": stored.adsid,
+            ]) else {
+                throw SigningError.local("Couldn't restore the saved session.")
+            }
+            let team = try await fetchPreferredTeam(account: account, session: session)
+
+            phase = .registeringDevice
+            let device = try await registerThisDevice(team: team, session: session)
+
+            phase = .preparingCertificate
+            let certificate = try await obtainCertificate(team: team, session: session, appleID: stored.appleID)
+
+            phase = .preparingProfile
+            let bundleID = try bundleIdentifier(of: appURL)
+            let profile = try await obtainProfile(bundleID: bundleID,
+                                                  appName: appURL.deletingPathExtension().lastPathComponent,
+                                                  team: team,
+                                                  device: device,
+                                                  session: session)
+
+            phase = .signing
+            try await sign(appURL: appURL, team: team, certificate: certificate, profile: profile)
+
+            phase = .done(bundleID)
+            ictrlLog("✅ Signed \(bundleID) using the saved session")
+        } catch {
+            // A rejected token is expected eventually and shouldn't leave a dead
+            // session behind to be retried forever.
+            AppleIDSession.clear()
+            let message = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            ictrlLog("Saved session didn't work (\(message)); a full sign-in is needed")
+            phase = .failed(message)
+            throw error
+        }
+    }
+
+    /// Re-signs a package with an imported certificate, contacting nobody.
+    ///
+    /// This is the paid-account path: no Apple ID, no password, no anisette
+    /// server. It works because it reuses the `embedded.mobileprovision` already
+    /// inside the package rather than requesting a new one — which is also its
+    /// limit. It can renew a package whose profile still covers this device and
+    /// bundle ID; it cannot sign an app that has never been provisioned, since
+    /// registering a bundle ID and issuing a profile both require the portal.
+    ///
+    /// Refusing up front matters: a package signed without a matching profile
+    /// installs and then fails to launch, reported as something unrelated.
+    func resignWithImportedCertificate(at appURL: URL) async throws {
+        guard let stored = ImportedCertificate.load() else {
+            throw SigningError.local("No certificate has been imported.")
+        }
+        if stored.isExpired {
+            throw SigningError.local("The imported certificate has expired. Import a current one.")
+        }
+
+        let profileURL = appURL.appendingPathComponent("embedded.mobileprovision")
+        guard FileManager.default.fileExists(atPath: profileURL.path) else {
+            throw SigningError.local(
+                "This package has no provisioning profile, so an imported certificate isn't enough to sign it — "
+                + "registering its bundle identifier needs an Apple ID.")
+        }
+        guard let profileData = try? Data(contentsOf: profileURL),
+              let profile = ALTProvisioningProfile(data: profileData)
+        else {
+            throw SigningError.local("This package's provisioning profile couldn't be read.")
+        }
+        if profile.expirationDate < Date() {
+            throw SigningError.local(
+                "This package's provisioning profile expired on \(profile.expirationDate). "
+                + "Renewing it needs an Apple ID.")
+        }
+
+        guard let certificate = ALTCertificate(p12Data: stored.p12Data, password: stored.password) else {
+            throw SigningError.local("The imported certificate couldn't be opened.")
+        }
+
+        // ALTSigner wants a team; the profile already names the right one, so
+        // this reuses it rather than asking Apple who we are.
+        guard let account = ALTAccount(responseDictionary: ["appleId": "", "dsid": ""]) else {
+            throw SigningError.local("Couldn't prepare the signing team.")
+        }
+        let team = ALTTeam(name: stored.commonName,
+                           identifier: profile.teamIdentifier,
+                           type: .unknown,
+                           account: account)
+
+        phase = .signing
+        try await sign(appURL: appURL, team: team, certificate: certificate, profile: profile)
+
+        let bundleID = try bundleIdentifier(of: appURL)
+        phase = .done(bundleID)
+        ictrlLog("✅ Re-signed \(bundleID) with the imported certificate — no Apple ID needed")
     }
 
     // MARK: - Steps

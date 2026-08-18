@@ -11,6 +11,13 @@
 
 #import "AltSign.h"
 
+// AltSign's model objects have no public initialisers — they are built from
+// Apple's JSON. Reconstructing a session from stored credentials, or naming the
+// team a provisioning profile already identifies, needs to make one without a
+// network round trip, so this pulls in the internal initialiser. Private to
+// AltSign's umbrella, but we compile it from source, so it is ours to import.
+#import "ALTModel+Internal.h"
+
 // Signs the `.xctest` plugin and loose dylibs that ldid's own bundle recursion
 // skips — the difference between a runner that installs and one that launches.
 #import "NestedBundleSigner.h"
