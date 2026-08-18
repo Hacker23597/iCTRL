@@ -1,9 +1,16 @@
 diff --git a/AltSign/Apple API/ALTAppleAPI+Authentication.m b/AltSign/Apple API/ALTAppleAPI+Authentication.m
-index 7a45975..ab885e2 100644
+index 7a45975..e129a2c 100644
 --- a/AltSign/Apple API/ALTAppleAPI+Authentication.m	
 +++ b/AltSign/Apple API/ALTAppleAPI+Authentication.m	
-@@ -26,7 +26,7 @@
+@@ -24,9 +24,14 @@
+ #import <corecrypto/ccaes.h>
+ #import <corecrypto/ccpad.h>
  
++// Set by iCTRL so authentication failures reach the app's exportable log.
++// Apple funnels every leg of the handshake through one error path, so without
++// this the log cannot say which request was rejected.
++void (^ALTAuthDiagnosticHandler)(NSString *) = NULL;
++
  static const char ALTHexCharacters[] = "0123456789abcdef";
  
 -struct ccrng_state *ccDRBGGetRngState(void);
@@ -11,7 +18,7 @@ index 7a45975..ab885e2 100644
  
  void ALTDigestUpdateString(const struct ccdigest_info *di_info, struct ccdigest_ctx *di_ctx, NSString *string)
  {
-@@ -229,7 +229,7 @@ - (void)authenticateWithAppleID:(NSString *)appleID
+@@ -229,7 +234,7 @@ - (void)authenticateWithAppleID:(NSString *)appleID
      
      size_t A_size = ccsrp_exchange_size(srp_ctx);
      char *A_bytes = (char *)malloc(A_size);
@@ -20,7 +27,7 @@ index 7a45975..ab885e2 100644
      
      NSData *A_data = [NSData dataWithBytes:A_bytes length:A_size];
      
-@@ -550,7 +550,7 @@ - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsT
+@@ -550,7 +555,7 @@ - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsT
          @"Accept": @"text/x-xml-plist",
          @"Accept-Language": @"en-us",
          @"X-Apple-App-Info": @"com.apple.gs.xcode.auth",
@@ -29,6 +36,31 @@ index 7a45975..ab885e2 100644
          @"X-Apple-Identity-Token": encodedIdentityToken,
          @"X-Apple-I-MD-M": anisetteData.machineID,
          @"X-Apple-I-MD": anisetteData.oneTimePassword,
+@@ -745,9 +750,23 @@ - (void)sendAuthenticationRequestWithParameters:(NSDictionary *)requestDictionar
+             {
+                 NSString *errorDescription = status[@"em"];
+                 NSString *localizedDescription = [NSString stringWithFormat:@"%@ (%@)", errorDescription, @(errorCode)];
+-                
++
+                 error = [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorUnknown userInfo:@{NSLocalizedDescriptionKey: localizedDescription}];
+             }
++
++            // Every leg of the handshake funnels through here, so the error
++            // alone can't say which one failed — "init", "complete" and the
++            // token fetch all surface identically. `o` names the operation and
++            // the full Status carries whatever else Apple chose to say.
++            //
++            // Reported through a hook rather than NSLog so it reaches the log
++            // file the user can export; NSLog output only lives in the device
++            // console, which is exactly what isn't available when diagnosing
++            // this remotely.
++            if (ALTAuthDiagnosticHandler != NULL) {
++                ALTAuthDiagnosticHandler([NSString stringWithFormat:@"GSA rejected o=%@ ec=%@ Status=%@",
++                                          requestDictionary[@"o"] ?: @"(token-fetch)", @(errorCode), status]);
++            }
+             
+             completionHandler(nil, error);
+         }
 diff --git a/AltSign/Apple API/ALTAppleAPI.m b/AltSign/Apple API/ALTAppleAPI.m
 index 8febecb..89e5ba6 100644
 --- a/AltSign/Apple API/ALTAppleAPI.m	

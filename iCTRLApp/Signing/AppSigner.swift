@@ -272,6 +272,14 @@ final class AppSigner: ObservableObject {
         // ones that can be wrong without looking wrong. The Apple ID is logged
         // as a domain only — enough to spot the wrong account, not enough to
         // identify it if the log is shared.
+        // Apple rejects each leg of the handshake through the same error path,
+        // so the message alone can't say which one failed. This routes AltSign's
+        // view of the rejection — including which operation it was — into the
+        // log the user can export.
+        ALTAuthDiagnosticHandler = { message in
+            ictrlLog("  [GSA] \(message ?? "")")
+        }
+
         let domain = appleID.split(separator: "@").last.map(String.init) ?? "?"
         ictrlLog("Authenticating with GSA — account …@\(domain), "
                  + "anisette machineID \(anisette.machineID.prefix(10))…, "

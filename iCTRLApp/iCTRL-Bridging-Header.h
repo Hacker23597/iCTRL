@@ -18,6 +18,11 @@
 // AltSign's umbrella, but we compile it from source, so it is ours to import.
 #import "ALTModel+Internal.h"
 
+// Set by AppSigner so GSA rejections reach the exportable log. Apple funnels
+// every leg of the handshake through one error path, so without this the log
+// can't say which request was refused.
+extern void (^ALTAuthDiagnosticHandler)(NSString *);
+
 // Signs the `.xctest` plugin and loose dylibs that ldid's own bundle recursion
 // skips — the difference between a runner that installs and one that launches.
 #import "NestedBundleSigner.h"

@@ -24,8 +24,23 @@ struct SettingsView: View {
     @State private var installBusy = false
     @State private var installPhase: IPAInstaller.Phase = .idle
     @State private var anisetteReport: AnisetteProbe.Report?
-    @State private var pendingSignURL: PickedIPA?
-    @State private var showPackagePicker = false
+    /// Which sheet the install section is showing, if any.
+    ///
+    /// A single piece of state driving a single `.sheet`: SwiftUI honours only
+    /// one sheet modifier per view, so two of them silently fight.
+    enum InstallSheet: Identifiable {
+        case packagePicker
+        case signAndInstall(PickedIPA)
+
+        var id: String {
+            switch self {
+            case .packagePicker: return "picker"
+            case .signAndInstall(let picked): return "sign-\(picked.id)"
+            }
+        }
+    }
+
+    @State private var activeSheet: InstallSheet?
     /// Defaults to the runner shipped inside this app — the package almost
     /// everyone wants, already matched to this build.
     @State private var selectedPackage: SelectedPackage? = BundledRunner.url.map { .bundled($0) }
@@ -268,7 +283,7 @@ struct SettingsView: View {
                     }
                 }
                 Spacer()
-                Button("Change") { showPackagePicker = true }
+                Button("Change") { activeSheet = .packagePicker }
                     .buttonStyle(.bordered)
                     .disabled(installBusy)
             }
@@ -283,7 +298,7 @@ struct SettingsView: View {
 
             Button {
                 guard let package = selectedPackage else { return }
-                pendingSignURL = PickedIPA(url: package.url)
+                activeSheet = .signAndInstall(PickedIPA(url: package.url))
             } label: {
                 Label("Sign with my Apple ID, then install…", systemImage: "signature")
             }
@@ -333,12 +348,18 @@ struct SettingsView: View {
         } footer: {
             Text("Sideloads a package onto this device. Signing re-signs it with a certificate Apple issues to your own Apple ID — on a free account, apps signed this way stop launching after seven days.")
         }
-        .sheet(item: $pendingSignURL) { pending in
-            SignAndInstallView(ipaURL: pending.url)
-        }
-        .sheet(isPresented: $showPackagePicker) {
-            PackagePickerView { package in
-                selectedPackage = package
+        // One sheet modifier, not two. Stacking `.sheet` on the same view makes
+        // SwiftUI honour only the last one, and presenting through the other
+        // dismisses immediately — which is why the first tap on "Sign with my
+        // Apple ID" opened and closed, while the second worked.
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .signAndInstall(let picked):
+                SignAndInstallView(ipaURL: picked.url)
+            case .packagePicker:
+                PackagePickerView { package in
+                    selectedPackage = package
+                }
             }
         }
     }
