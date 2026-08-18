@@ -1,8 +1,8 @@
 diff --git a/AltSign/Apple API/ALTAppleAPI+Authentication.m b/AltSign/Apple API/ALTAppleAPI+Authentication.m
-index 7a45975..a6f4e09 100644
+index 7a45975..1e99e89 100644
 --- a/AltSign/Apple API/ALTAppleAPI+Authentication.m	
 +++ b/AltSign/Apple API/ALTAppleAPI+Authentication.m	
-@@ -24,9 +24,14 @@
+@@ -24,9 +24,22 @@
  #import <corecrypto/ccaes.h>
  #import <corecrypto/ccpad.h>
  
@@ -11,6 +11,14 @@ index 7a45975..a6f4e09 100644
 +// this the log cannot say which request was rejected.
 +void (^ALTAuthDiagnosticHandler)(NSString *) = NULL;
 +
++
++// Apple rejects locale identifiers carrying extension tags, and modern iOS
++// returns them ("en_US@rg=hkzzzz"). Everything that sends a locale to Apple
++// goes through here.
++static NSString *ALTSanitizedLocale(NSLocale *locale) {
++    return [locale.localeIdentifier componentsSeparatedByString:@"@"].firstObject ?: @"en_US";
++}
++
  static const char ALTHexCharacters[] = "0123456789abcdef";
  
 -struct ccrng_state *ccDRBGGetRngState(void);
@@ -18,7 +26,38 @@ index 7a45975..a6f4e09 100644
  
  void ALTDigestUpdateString(const struct ccdigest_info *di_info, struct ccdigest_ctx *di_ctx, NSString *string)
  {
-@@ -229,7 +234,7 @@ - (void)authenticateWithAppleID:(NSString *)appleID
+@@ -191,16 +204,27 @@ - (void)authenticateWithAppleID:(NSString *)appleID
+             verificationHandler:(void (^)(void (^ _Nonnull)(NSString * _Nullable)))verificationHandler
+               completionHandler:(void (^)(ALTAccount * _Nullable, ALTAppleAPISession * _Nullable, NSError * _Nullable))completionHandler
+ {
++    // Locale and time zone come from the anisette data, not from the device.
++    //
++    // Upstream reads NSLocale.currentLocale/NSTimeZone.localTimeZone here,
++    // which contradicts the fingerprint: the anisette server generated its
++    // machine ID against its own locale and clock, and Apple sees a client
++    // claiming one identity while presenting another's fingerprint. The
++    // identifier is also truncated at "@" — modern iOS returns forms like
++    // "en_US@rg=hkzzzz", and Apple does not accept the extension tags.
++    NSString *sanitizedLocale = ALTSanitizedLocale(anisetteData.locale);
++    NSString *anisetteTimeZone = anisetteData.timeZone.abbreviation ?: @"UTC";
++
+     NSMutableDictionary *clientDictionary = [@{
+         @"bootstrap": @YES,
+         @"icscrec": @YES,
+-        @"loc": NSLocale.currentLocale.localeIdentifier,
++        @"loc": sanitizedLocale,
+         @"pbe": @NO,
+         @"prkgen": @YES,
+         @"svct": @"iCloud",
+         @"X-Apple-I-Client-Time": [self.dateFormatter stringFromDate:anisetteData.date],
+-        @"X-Apple-Locale": NSLocale.currentLocale.localeIdentifier,
+-        @"X-Apple-I-TimeZone": NSTimeZone.localTimeZone.abbreviation,
++        @"X-Apple-Locale": sanitizedLocale,
++        @"X-Apple-I-TimeZone": anisetteTimeZone,
+         @"X-Apple-I-MD": anisetteData.oneTimePassword,
+         @"X-Apple-I-MD-LU": anisetteData.localUserID,
+         @"X-Apple-I-MD-M": anisetteData.machineID,
+@@ -229,7 +253,7 @@ - (void)authenticateWithAppleID:(NSString *)appleID
      
      size_t A_size = ccsrp_exchange_size(srp_ctx);
      char *A_bytes = (char *)malloc(A_size);
@@ -27,7 +66,7 @@ index 7a45975..a6f4e09 100644
      
      NSData *A_data = [NSData dataWithBytes:A_bytes length:A_size];
      
-@@ -406,9 +411,45 @@ - (void)authenticateWithAppleID:(NSString *)appleID
+@@ -406,9 +430,45 @@ - (void)authenticateWithAppleID:(NSString *)appleID
              }
              
              NSDictionary *statusDictionary = responseDictionary[@"Status"];
@@ -75,7 +114,7 @@ index 7a45975..a6f4e09 100644
              {
                  // Handle Two-Factor
                  
-@@ -532,6 +573,128 @@ - (void)fetchAuthTokenWithParameters:(NSDictionary *)parameters sk:(NSData *)sk
+@@ -532,6 +592,128 @@ - (void)fetchAuthTokenWithParameters:(NSDictionary *)parameters sk:(NSData *)sk
      }];
  }
  
@@ -116,7 +155,7 @@ index 7a45975..a6f4e09 100644
 +        @"X-Mme-Device-Id": anisetteData.deviceUniqueIdentifier,
 +        @"X-MMe-Client-Info": anisetteData.deviceDescription,
 +        @"X-Apple-I-Client-Time": [self.dateFormatter stringFromDate:anisetteData.date],
-+        @"X-Apple-Locale": anisetteData.locale.localeIdentifier,
++        @"X-Apple-Locale": ALTSanitizedLocale(anisetteData.locale),
 +        @"X-Apple-I-TimeZone": anisetteData.timeZone.abbreviation
 +    };
 +
@@ -204,7 +243,7 @@ index 7a45975..a6f4e09 100644
  - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsToken anisetteData:(ALTAnisetteData *)anisetteData
                  verificationHandler:(nonnull void (^)(void (^ _Nonnull)(NSString * _Nonnull)))verificationHandler
                    completionHandler:(void (^)(BOOL success, NSError *error))completionHandler
-@@ -550,7 +713,7 @@ - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsT
+@@ -550,7 +732,7 @@ - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsT
          @"Accept": @"text/x-xml-plist",
          @"Accept-Language": @"en-us",
          @"X-Apple-App-Info": @"com.apple.gs.xcode.auth",
@@ -213,7 +252,16 @@ index 7a45975..a6f4e09 100644
          @"X-Apple-Identity-Token": encodedIdentityToken,
          @"X-Apple-I-MD-M": anisetteData.machineID,
          @"X-Apple-I-MD": anisetteData.oneTimePassword,
-@@ -745,9 +908,23 @@ - (void)sendAuthenticationRequestWithParameters:(NSDictionary *)requestDictionar
+@@ -559,7 +741,7 @@ - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsT
+         @"X-Mme-Device-Id": anisetteData.deviceUniqueIdentifier,
+         @"X-MMe-Client-Info": anisetteData.deviceDescription,
+         @"X-Apple-I-Client-Time": [self.dateFormatter stringFromDate:anisetteData.date],
+-        @"X-Apple-Locale": anisetteData.locale.localeIdentifier,
++        @"X-Apple-Locale": ALTSanitizedLocale(anisetteData.locale),
+         @"X-Apple-I-TimeZone": anisetteData.timeZone.abbreviation
+     };
+     
+@@ -745,9 +927,23 @@ - (void)sendAuthenticationRequestWithParameters:(NSDictionary *)requestDictionar
              {
                  NSString *errorDescription = status[@"em"];
                  NSString *localizedDescription = [NSString stringWithFormat:@"%@ (%@)", errorDescription, @(errorCode)];
@@ -239,10 +287,25 @@ index 7a45975..a6f4e09 100644
              completionHandler(nil, error);
          }
 diff --git a/AltSign/Apple API/ALTAppleAPI.m b/AltSign/Apple API/ALTAppleAPI.m
-index 8febecb..89e5ba6 100644
+index 8febecb..0ffe261 100644
 --- a/AltSign/Apple API/ALTAppleAPI.m	
 +++ b/AltSign/Apple API/ALTAppleAPI.m	
-@@ -692,7 +692,7 @@ - (void)sendRequestWithURL:(NSURL *)requestURL additionalParameters:(nullable NS
+@@ -24,6 +24,14 @@
+ 
+ NS_ASSUME_NONNULL_END
+ 
++
++// Apple rejects locale identifiers carrying extension tags, and modern iOS
++// returns them ("en_US@rg=hkzzzz"). Everything that sends a locale to Apple
++// goes through here.
++static NSString *ALTSanitizedLocale(NSLocale *locale) {
++    return [locale.localeIdentifier componentsSeparatedByString:@"@"].firstObject ?: @"en_US";
++}
++
+ @implementation ALTAppleAPI
+ 
+ + (instancetype)sharedAPI
+@@ -692,7 +700,7 @@ - (void)sendRequestWithURL:(NSURL *)requestURL additionalParameters:(nullable NS
          @"Accept": @"text/x-xml-plist",
          @"Accept-Language": @"en-us",
          @"X-Apple-App-Info": @"com.apple.gs.xcode.auth",
@@ -251,7 +314,18 @@ index 8febecb..89e5ba6 100644
          @"X-Apple-I-Identity-Id": session.dsid,
          @"X-Apple-GS-Token": session.authToken,
          @"X-Apple-I-MD-M": session.anisetteData.machineID,
-@@ -768,7 +768,7 @@ - (void)sendServicesRequest:(NSURLRequest *)originalRequest additionalParameters
+@@ -702,8 +710,8 @@ - (void)sendRequestWithURL:(NSURL *)requestURL additionalParameters:(nullable NS
+         @"X-Mme-Device-Id": session.anisetteData.deviceUniqueIdentifier,
+         @"X-MMe-Client-Info": session.anisetteData.deviceDescription,
+         @"X-Apple-I-Client-Time": [self.dateFormatter stringFromDate:session.anisetteData.date],
+-        @"X-Apple-Locale": session.anisetteData.locale.localeIdentifier,
+-        @"X-Apple-I-Locale": session.anisetteData.locale.localeIdentifier,
++        @"X-Apple-Locale": ALTSanitizedLocale(session.anisetteData.locale),
++        @"X-Apple-I-Locale": ALTSanitizedLocale(session.anisetteData.locale),
+         @"X-Apple-I-TimeZone": session.anisetteData.timeZone.abbreviation
+     };
+     
+@@ -768,7 +776,7 @@ - (void)sendServicesRequest:(NSURLRequest *)originalRequest additionalParameters
          @"Accept": @"application/vnd.api+json",
          @"Accept-Language": @"en-us",
          @"X-Apple-App-Info": @"com.apple.gs.xcode.auth",
@@ -260,3 +334,12 @@ index 8febecb..89e5ba6 100644
          @"X-HTTP-Method-Override": HTTPMethodOverride,
          @"X-Apple-I-Identity-Id": session.dsid,
          @"X-Apple-GS-Token": session.authToken,
+@@ -779,7 +787,7 @@ - (void)sendServicesRequest:(NSURLRequest *)originalRequest additionalParameters
+         @"X-Mme-Device-Id": session.anisetteData.deviceUniqueIdentifier,
+         @"X-MMe-Client-Info": session.anisetteData.deviceDescription,
+         @"X-Apple-I-Client-Time": [self.dateFormatter stringFromDate:session.anisetteData.date],
+-        @"X-Apple-Locale": session.anisetteData.locale.localeIdentifier,
++        @"X-Apple-Locale": ALTSanitizedLocale(session.anisetteData.locale),
+         @"X-Apple-I-TimeZone": session.anisetteData.timeZone.abbreviation
+     };
+     
