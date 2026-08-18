@@ -1,0 +1,35 @@
+diff --git a/AltSign/Apple API/ALTAppleAPI+Authentication.m b/AltSign/Apple API/ALTAppleAPI+Authentication.m
+index 7a45975..6836d2f 100644
+--- a/AltSign/Apple API/ALTAppleAPI+Authentication.m	
++++ b/AltSign/Apple API/ALTAppleAPI+Authentication.m	
+@@ -550,7 +550,7 @@ - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsT
+         @"Accept": @"text/x-xml-plist",
+         @"Accept-Language": @"en-us",
+         @"X-Apple-App-Info": @"com.apple.gs.xcode.auth",
+-        @"X-Xcode-Version": @"11.2 (11B41)",
++        @"X-Xcode-Version": @"26.0 (26A242)",
+         @"X-Apple-Identity-Token": encodedIdentityToken,
+         @"X-Apple-I-MD-M": anisetteData.machineID,
+         @"X-Apple-I-MD": anisetteData.oneTimePassword,
+diff --git a/AltSign/Apple API/ALTAppleAPI.m b/AltSign/Apple API/ALTAppleAPI.m
+index 8febecb..89e5ba6 100644
+--- a/AltSign/Apple API/ALTAppleAPI.m	
++++ b/AltSign/Apple API/ALTAppleAPI.m	
+@@ -692,7 +692,7 @@ - (void)sendRequestWithURL:(NSURL *)requestURL additionalParameters:(nullable NS
+         @"Accept": @"text/x-xml-plist",
+         @"Accept-Language": @"en-us",
+         @"X-Apple-App-Info": @"com.apple.gs.xcode.auth",
+-        @"X-Xcode-Version": @"11.2 (11B41)",
++        @"X-Xcode-Version": @"26.0 (26A242)",
+         @"X-Apple-I-Identity-Id": session.dsid,
+         @"X-Apple-GS-Token": session.authToken,
+         @"X-Apple-I-MD-M": session.anisetteData.machineID,
+@@ -768,7 +768,7 @@ - (void)sendServicesRequest:(NSURLRequest *)originalRequest additionalParameters
+         @"Accept": @"application/vnd.api+json",
+         @"Accept-Language": @"en-us",
+         @"X-Apple-App-Info": @"com.apple.gs.xcode.auth",
+-        @"X-Xcode-Version": @"11.2 (11B41)",
++        @"X-Xcode-Version": @"26.0 (26A242)",
+         @"X-HTTP-Method-Override": HTTPMethodOverride,
+         @"X-Apple-I-Identity-Id": session.dsid,
+         @"X-Apple-GS-Token": session.authToken,
