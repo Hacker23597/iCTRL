@@ -1,5 +1,5 @@
 diff --git a/AltSign/Apple API/ALTAppleAPI+Authentication.m b/AltSign/Apple API/ALTAppleAPI+Authentication.m
-index 7a45975..e129a2c 100644
+index 7a45975..a6f4e09 100644
 --- a/AltSign/Apple API/ALTAppleAPI+Authentication.m	
 +++ b/AltSign/Apple API/ALTAppleAPI+Authentication.m	
 @@ -24,9 +24,14 @@
@@ -27,7 +27,184 @@ index 7a45975..e129a2c 100644
      
      NSData *A_data = [NSData dataWithBytes:A_bytes length:A_size];
      
-@@ -550,7 +555,7 @@ - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsT
+@@ -406,9 +411,45 @@ - (void)authenticateWithAppleID:(NSString *)appleID
+             }
+             
+             NSDictionary *statusDictionary = responseDictionary[@"Status"];
+-            
++
+             NSString *authType = statusDictionary[@"au"];
+-            if ([authType isEqualToString:@"trustedDeviceSecondaryAuth"])
++
++            // Only "trustedDeviceSecondaryAuth" is handled below. Apple uses
++            // other values here (SMS-based flows, and a "secondaryAuth" that
++            // asks for a code without a trusted device), and an unhandled one
++            // falls through to the token fetch — which then answers 401,
++            // reported as -22411 with no mention of two-factor. Logging the
++            // value distinguishes "no 2FA required" from "a 2FA mode we don't
++            // implement".
++            if (ALTAuthDiagnosticHandler != NULL) {
++                ALTAuthDiagnosticHandler([NSString stringWithFormat:@"handshake complete, au=%@ Status=%@",
++                                          authType ?: @"(none)", statusDictionary]);
++            }
++
++            if ([authType isEqualToString:@"secondaryAuth"])
++            {
++                // No trusted device on the account, so Apple wants an SMS code.
++                // Without this branch the flow falls through to the token fetch
++                // and comes back 401.
++                if (verificationHandler != nil)
++                {
++                    [self requestSMSTwoFactorCodeForDSID:adsid idmsToken:idmsToken anisetteData:anisetteData verificationHandler:verificationHandler completionHandler:^(BOOL success, NSError *error) {
++                        if (success)
++                        {
++                            [self authenticateWithAppleID:appleID password:password anisetteData:anisetteData verificationHandler:verificationHandler completionHandler:completionHandler];
++                        }
++                        else
++                        {
++                            completionHandler(nil, nil, error);
++                        }
++                    }];
++                }
++                else
++                {
++                    completionHandler(nil, nil, [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorRequiresTwoFactorAuthentication userInfo:nil]);
++                }
++            }
++            else if ([authType isEqualToString:@"trustedDeviceSecondaryAuth"])
+             {
+                 // Handle Two-Factor
+                 
+@@ -532,6 +573,128 @@ - (void)fetchAuthTokenWithParameters:(NSDictionary *)parameters sk:(NSData *)sk
+     }];
+ }
+ 
++// SMS-based two-factor, which upstream AltSign does not implement.
++//
++// Apple signals the mode in Status["au"]. Upstream handles only
++// "trustedDeviceSecondaryAuth"; an account without a trusted device gets
++// "secondaryAuth" instead, falls through to the token fetch, and Apple answers
++// 401 — surfaced as -22411 "This action cannot be completed at this time",
++// which never mentions two-factor. That is the failure this fixes.
++//
++// The flow mirrors SideStore's: ask Apple to text a code to the first phone
++// number on the account, then post the code back. A correct code comes back
++// with an X-Apple-PE-Token header; its absence is how a wrong code is detected,
++// since the status stays 200 either way.
++- (void)requestSMSTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsToken anisetteData:(ALTAnisetteData *)anisetteData
++                   verificationHandler:(nonnull void (^)(void (^ _Nonnull)(NSString * _Nullable)))verificationHandler
++                     completionHandler:(void (^)(BOOL success, NSError *error))completionHandler
++{
++    NSURL *requestURL = [NSURL URLWithString:@"https://gsa.apple.com/auth/verify/phone/put?mode=sms"];
++    NSURL *verifyURL = [NSURL URLWithString:@"https://gsa.apple.com/auth/verify/phone/securitycode?referrer=/auth/verify/phone/put"];
++
++    NSString *identityToken = [NSString stringWithFormat:@"%@:%@", dsid, idmsToken];
++    NSString *encodedIdentityToken = [[identityToken dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
++
++    NSDictionary<NSString *, NSString *> *httpHeaders = @{
++        @"Content-Type": @"text/x-xml-plist",
++        @"User-Agent": @"Xcode",
++        @"Accept": @"text/x-xml-plist",
++        @"Accept-Language": @"en-us",
++        @"X-Apple-App-Info": @"com.apple.gs.xcode.auth",
++        @"X-Xcode-Version": @"26.0 (26A242)",
++        @"X-Apple-Identity-Token": encodedIdentityToken,
++        @"X-Apple-I-MD-M": anisetteData.machineID,
++        @"X-Apple-I-MD": anisetteData.oneTimePassword,
++        @"X-Apple-I-MD-LU": anisetteData.localUserID,
++        @"X-Apple-I-MD-RINFO": [@(anisetteData.routingInfo) description],
++        @"X-Mme-Device-Id": anisetteData.deviceUniqueIdentifier,
++        @"X-MMe-Client-Info": anisetteData.deviceDescription,
++        @"X-Apple-I-Client-Time": [self.dateFormatter stringFromDate:anisetteData.date],
++        @"X-Apple-Locale": anisetteData.locale.localeIdentifier,
++        @"X-Apple-I-TimeZone": anisetteData.timeZone.abbreviation
++    };
++
++    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:requestURL];
++    request.HTTPMethod = @"POST";
++    [httpHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
++        [request setValue:value forHTTPHeaderField:key];
++    }];
++
++    // "1" is the first phone number registered to the account. Apple indexes
++    // them from one, and an account in this mode always has at least one.
++    NSError *serializationError = nil;
++    NSDictionary *body = @{ @"serverInfo": @{ @"phoneNumber.id": @"1" } };
++    request.HTTPBody = [NSPropertyListSerialization dataWithPropertyList:body format:NSPropertyListXMLFormat_v1_0 options:0 error:&serializationError];
++    if (request.HTTPBody == nil)
++    {
++        completionHandler(NO, serializationError);
++        return;
++    }
++
++    NSURLSessionDataTask *requestCodeTask = [self.session dataTaskWithRequest:request completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
++        if (error != nil)
++        {
++            completionHandler(NO, error);
++            return;
++        }
++
++        if (ALTAuthDiagnosticHandler != NULL) {
++            ALTAuthDiagnosticHandler([NSString stringWithFormat:@"SMS code requested, status=%@",
++                                      @([(NSHTTPURLResponse *)response statusCode])]);
++        }
++
++        void (^responseHandler)(NSString *) = ^(NSString *_Nullable verificationCode) {
++            if (verificationCode == nil)
++            {
++                completionHandler(NO, [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorRequiresTwoFactorAuthentication userInfo:nil]);
++                return;
++            }
++
++            NSMutableURLRequest *verifyRequest = [NSMutableURLRequest requestWithURL:verifyURL];
++            verifyRequest.HTTPMethod = @"POST";
++            [httpHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
++                [verifyRequest setValue:value forHTTPHeaderField:key];
++            }];
++
++            NSError *verifySerializationError = nil;
++            NSDictionary *verifyBody = @{
++                @"securityCode.code": verificationCode,
++                @"serverInfo": @{ @"mode": @"sms", @"phoneNumber.id": @"1" }
++            };
++            verifyRequest.HTTPBody = [NSPropertyListSerialization dataWithPropertyList:verifyBody format:NSPropertyListXMLFormat_v1_0 options:0 error:&verifySerializationError];
++            if (verifyRequest.HTTPBody == nil)
++            {
++                completionHandler(NO, verifySerializationError);
++                return;
++            }
++
++            NSURLSessionDataTask *verifyCodeTask = [self.session dataTaskWithRequest:verifyRequest completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
++                if (error != nil)
++                {
++                    completionHandler(NO, error);
++                    return;
++                }
++
++                NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
++                BOOL accepted = (httpResponse.statusCode == 200 && httpResponse.allHeaderFields[@"X-Apple-PE-Token"] != nil);
++                if (!accepted)
++                {
++                    completionHandler(NO, [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorIncorrectVerificationCode userInfo:nil]);
++                    return;
++                }
++
++                completionHandler(YES, nil);
++            }];
++
++            [verifyCodeTask resume];
++        };
++
++        verificationHandler(responseHandler);
++    }];
++
++    [requestCodeTask resume];
++}
++
+ - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsToken anisetteData:(ALTAnisetteData *)anisetteData
+                 verificationHandler:(nonnull void (^)(void (^ _Nonnull)(NSString * _Nonnull)))verificationHandler
+                   completionHandler:(void (^)(BOOL success, NSError *error))completionHandler
+@@ -550,7 +713,7 @@ - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsT
          @"Accept": @"text/x-xml-plist",
          @"Accept-Language": @"en-us",
          @"X-Apple-App-Info": @"com.apple.gs.xcode.auth",
@@ -36,7 +213,7 @@ index 7a45975..e129a2c 100644
          @"X-Apple-Identity-Token": encodedIdentityToken,
          @"X-Apple-I-MD-M": anisetteData.machineID,
          @"X-Apple-I-MD": anisetteData.oneTimePassword,
-@@ -745,9 +750,23 @@ - (void)sendAuthenticationRequestWithParameters:(NSDictionary *)requestDictionar
+@@ -745,9 +908,23 @@ - (void)sendAuthenticationRequestWithParameters:(NSDictionary *)requestDictionar
              {
                  NSString *errorDescription = status[@"em"];
                  NSString *localizedDescription = [NSString stringWithFormat:@"%@ (%@)", errorDescription, @(errorCode)];
