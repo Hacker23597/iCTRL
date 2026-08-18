@@ -24,23 +24,7 @@ struct SettingsView: View {
     @State private var installBusy = false
     @State private var installPhase: IPAInstaller.Phase = .idle
     @State private var anisetteReport: AnisetteProbe.Report?
-    /// Which sheet the install section is showing, if any.
-    ///
-    /// A single piece of state driving a single `.sheet`: SwiftUI honours only
-    /// one sheet modifier per view, so two of them silently fight.
-    enum InstallSheet: Identifiable {
-        case packagePicker
-        case signAndInstall(PickedIPA)
-
-        var id: String {
-            switch self {
-            case .packagePicker: return "picker"
-            case .signAndInstall(let picked): return "sign-\(picked.id)"
-            }
-        }
-    }
-
-    @State private var activeSheet: InstallSheet?
+    @State private var showPackagePicker = false
     /// Defaults to the runner shipped inside this app — the package almost
     /// everyone wants, already matched to this build.
     @State private var selectedPackage: SelectedPackage? = BundledRunner.url.map { .bundled($0) }
@@ -254,10 +238,13 @@ struct SettingsView: View {
     }
 
     /// Installs an .ipa onto this device over the same tunnel the DDI mount
-    /// uses — the transport half of self-signing, built and shipped first so
-    /// the "can we install at all over RSD?" question is answered before any
-    /// Apple ID / re-signing machinery exists. The picker accepts any .ipa, so
-    /// this is usable on its own for sideloading an already-signed package.
+    /// uses.
+    ///
+    /// The package must already be signed for this device. Signing it here was
+    /// tried and removed: it needs an Apple ID, a third-party anisette server,
+    /// and a signer that handles the runner's .xctest — which the available
+    /// on-device options do not. Sign with a desktop tool and install the
+    /// result here.
     private var installSection: some View {
         Section {
             if !ddi.isMounted {
@@ -283,7 +270,7 @@ struct SettingsView: View {
                     }
                 }
                 Spacer()
-                Button("Change") { activeSheet = .packagePicker }
+                Button("Change") { showPackagePicker = true }
                     .buttonStyle(.bordered)
                     .disabled(installBusy)
             }
@@ -293,14 +280,6 @@ struct SettingsView: View {
                 startInstall(package)
             } label: {
                 Label("Install", systemImage: "square.and.arrow.down")
-            }
-            .disabled(!installable || installBusy || selectedPackage == nil)
-
-            Button {
-                guard let package = selectedPackage else { return }
-                activeSheet = .signAndInstall(PickedIPA(url: package.url))
-            } label: {
-                Label("Sign with my Apple ID, then install…", systemImage: "signature")
             }
             .disabled(!installable || installBusy || selectedPackage == nil)
 
@@ -346,20 +325,11 @@ struct SettingsView: View {
         } header: {
             Text("Install an app")
         } footer: {
-            Text("Sideloads a package onto this device. Signing re-signs it with a certificate Apple issues to your own Apple ID — on a free account, apps signed this way stop launching after seven days.")
+            Text("Sideloads a package onto this device. It must already be signed for this device — iCTRL installs, it doesn't sign.")
         }
-        // One sheet modifier, not two. Stacking `.sheet` on the same view makes
-        // SwiftUI honour only the last one, and presenting through the other
-        // dismisses immediately — which is why the first tap on "Sign with my
-        // Apple ID" opened and closed, while the second worked.
-        .sheet(item: $activeSheet) { sheet in
-            switch sheet {
-            case .signAndInstall(let picked):
-                SignAndInstallView(ipaURL: picked.url)
-            case .packagePicker:
-                PackagePickerView { package in
-                    selectedPackage = package
-                }
+        .sheet(isPresented: $showPackagePicker) {
+            PackagePickerView { package in
+                selectedPackage = package
             }
         }
     }

@@ -21,39 +21,6 @@ targets:
       # the user sees in a notification matches the one in the app.
       - path: iCTRLUITests/Localized.swift
 
-      # AltSign (MIT) and ldid (AGPL) — Apple ID auth, developer-portal
-      # operations, and Mach-O code signing. Compiled from source rather than
-      # linked as a package: upstream ships no Package.swift, only a podspec,
-      # and the SideStore fork that does carries no license at all. The file
-      # selection below mirrors that podspec's subspecs; see NOTICE.md.
-      - path: Dependencies/AltSign/AltSign
-        excludes:
-          # AltSign's own framework Info.plist. Copied as a resource it lands
-          # at the bundle root and overwrites the app's, stripping
-          # CFBundleIdentifier and CFBundleExecutable — the bundle then builds
-          # fine and is rejected at install as "not a valid bundle".
-          - "Info.plist"
-      # ldid.cpp is deliberately absent: AltSign's alt_ldid.cpp `#include`s it
-      # textually, so compiling it as its own unit duplicates every ldid symbol.
-      - path: Dependencies/AltSign/Dependencies/ldid/lookup2.c
-      # libplist is likewise absent — the IDevice xcframework already links a
-      # copy, and building a second one duplicates all 91 plist_* symbols.
-      # ldid reaches the FFI's copy through the header search path below.
-      - path: Dependencies/AltSign/Dependencies/minizip
-        includes:
-          - "*.c"
-          - "*.h"
-        excludes:
-          # Windows I/O, and the two command-line drivers with their own main().
-          - "iowin32.*"
-          - "minizip.c"
-          - "miniunz.c"
-      - path: Dependencies/AltSign/Dependencies/corecrypto
-        includes:
-          - "*.h"
-          - "*.m"
-        excludes:
-          - "ccperf.h"
     dependencies:
       # idevice (MIT) — the lockdown/RSD/image-mounter client that does the
       # actual DDI mount. Fetched by Scripts/fetch-idevice.sh rather than
@@ -61,46 +28,9 @@ targets:
       # in the repo tree, so SPM cannot resolve it by URL.
       - framework: Frameworks/IDevice.xcframework
         embed: false
-      # OpenSSL, prebuilt for iOS and vendored by AltSign. Used for the CSR and
-      # the PKCS#12 the certificate comes back in. Referenced by path (with
-      # LIBRARY_SEARCH_PATHS below) rather than as an `sdk:` dependency, which
-      # emits -lcrypto without telling the linker where to look.
-      - framework: Dependencies/AltSign/Dependencies/OpenSSL/ios/lib/libcrypto.a
-        embed: false
-      - framework: Dependencies/AltSign/Dependencies/OpenSSL/ios/lib/libssl.a
-        embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.openminis.ictrl
-        # AltSign is Objective-C/C++; the app is Swift.
-        SWIFT_OBJC_BRIDGING_HEADER: iCTRLApp/iCTRL-Bridging-Header.h
-        CLANG_CXX_LANGUAGE_STANDARD: "c++11"
-        HEADER_SEARCH_PATHS:
-          - $(inherited)
-          # Flat directory of symlinks that makes AltSign's own
-          # `#import <AltSign/X.h>` resolve; built by the pre-build script
-          # below, the same shape CocoaPods synthesizes.
-          - $(SRCROOT)/build/altsign-headers
-          - $(SRCROOT)/Dependencies/AltSign
-          - $(SRCROOT)/Dependencies/AltSign/AltSign/ldid
-          - $(SRCROOT)/Dependencies/AltSign/Dependencies
-          - $(SRCROOT)/Dependencies/AltSign/Dependencies/ldid
-          - $(SRCROOT)/Dependencies/AltSign/Dependencies/ldid/libplist/include
-          - $(SRCROOT)/Dependencies/AltSign/Dependencies/ldid/libplist/src
-          - $(SRCROOT)/Dependencies/AltSign/Dependencies/ldid/libplist/libcnary/include
-          - $(SRCROOT)/Dependencies/AltSign/Dependencies/OpenSSL/ios/include
-        # corecrypto's headers use transparent unions, which clang rejects under
-        # the strictness this target otherwise builds with.
-        LIBRARY_SEARCH_PATHS:
-          - $(inherited)
-          - $(SRCROOT)/Dependencies/AltSign/Dependencies/OpenSSL/ios/lib
-        OTHER_CFLAGS:
-          - $(inherited)
-          - -DCORECRYPTO_DONOT_USE_TRANSPARENT_UNION=1
-        # ldid predates several tightenings; these are its own warnings, not
-        # ours, and failing the build on them would mean patching a vendored
-        # dependency we deliberately track unmodified.
-        GCC_WARN_INHIBIT_ALL_WARNINGS: YES
         GENERATE_INFOPLIST_FILE: YES
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: 1
@@ -117,13 +47,6 @@ targets:
         # iOS denies UIApplication.open() for these schemes with no error, which
         # would break the Start button and the StikDebug shortcut.
         INFOPLIST_FILE: iCTRLApp/Info.plist
-    preBuildScripts:
-      # AltSign's headers `#import <AltSign/X.h>` while the files themselves sit
-      # in subdirectories; this builds the flat directory that makes those
-      # resolve. Runs every build so it can't go stale against the submodule.
-      - name: "Link AltSign headers"
-        script: '"$SRCROOT/Scripts/link-altsign-headers.sh"'
-        basedOnDependencyAnalysis: false
 
   iCTRLUITests:
     type: bundle.ui-testing
