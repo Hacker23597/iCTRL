@@ -1,7 +1,25 @@
 diff --git a/AltSign/Apple API/ALTAppleAPI+Authentication.m b/AltSign/Apple API/ALTAppleAPI+Authentication.m
-index 7a45975..6836d2f 100644
+index 7a45975..ab885e2 100644
 --- a/AltSign/Apple API/ALTAppleAPI+Authentication.m	
 +++ b/AltSign/Apple API/ALTAppleAPI+Authentication.m	
+@@ -26,7 +26,7 @@
+ 
+ static const char ALTHexCharacters[] = "0123456789abcdef";
+ 
+-struct ccrng_state *ccDRBGGetRngState(void);
++// ccDRBGGetRngState() was removed from libcorecrypto; ccrng(NULL) replaces it.
+ 
+ void ALTDigestUpdateString(const struct ccdigest_info *di_info, struct ccdigest_ctx *di_ctx, NSString *string)
+ {
+@@ -229,7 +229,7 @@ - (void)authenticateWithAppleID:(NSString *)appleID
+     
+     size_t A_size = ccsrp_exchange_size(srp_ctx);
+     char *A_bytes = (char *)malloc(A_size);
+-    ccsrp_client_start_authentication(srp_ctx, ccDRBGGetRngState(), A_bytes);
++    ccsrp_client_start_authentication(srp_ctx, ccrng(NULL), A_bytes);
+     
+     NSData *A_data = [NSData dataWithBytes:A_bytes length:A_size];
+     
 @@ -550,7 +550,7 @@ - (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsT
          @"Accept": @"text/x-xml-plist",
          @"Accept-Language": @"en-us",
