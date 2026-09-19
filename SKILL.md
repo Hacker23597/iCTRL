@@ -1,7 +1,7 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
-skill_version: "1.16.0"
+skill_version: "1.20.0"
 ---
 
 # iCTRL — Control an iPhone over HTTP
@@ -45,7 +45,7 @@ Both speak the identical protocol against the same token store — pick by what 
 
 ## Version check — glance at this on your first `device_info`
 
-This document is **skill_version 1.16.0** (see the frontmatter). Every `device_info` response carries the device's own `skill_version` (same value as `server_version`) plus a `skill_update_hint`.
+This document is **skill_version 1.20.0** (see the frontmatter). Every `device_info` response carries the device's own `skill_version` (same value as `server_version`) plus a `skill_update_hint`.
 
 **This is advisory — a version gap is not an error, and most gaps need no action.** Your installed copy is a snapshot from whenever it was fetched; the device's copy always matches the running build. Use semver to decide whether the difference could actually affect you:
 
@@ -181,13 +181,44 @@ When a call returns success, it worked. Don't repeat it "to be safe."
 ## Core workflow
 
 ```
+0. GET /schema                     → every method + its parameters (unauthenticated, ~150ms, once)
 1. device_info                     → learn point_width/point_height/scale (once)
 2. resolve_app{text:"<name>"}      → name → bundle_id (built-in catalog + iTunes fallback)
 3. launch_app{bundle_id}           → opens it, binds it as the sticky target; wait 2-3s (cold render)
 4. find_element{element_id:"<label>"} → get a ref   (or page_source first to learn labels)
 5. tap{ref} / type{text,submit} / page{direction}  → act (no wait; these self-quiesce)
-6. page_source                     → read the result directly (wait ~1s + re-read ONLY if still loading)
+6. page_source{visible_only:true, max_children:50}  → read the result (see "under a second" below)
 ```
+
+Step 6 defaults matter: plain `page_source` on a chat list or feed can take
+seconds and still come back without the rows you can see. `visible_only` +
+`max_children:50` measured p50 416ms / p90 593ms across 8 apps and never lost
+visible content. If the result looks sparser than the screen, call `screen_text`.
+
+**Step 0 is worth the one round trip.** Parameter names are not uniform across methods —
+`find_element` wants `element_id`, `resolve_app` wants `text`, `tap` wants `x`/`y` — and a guessed
+name costs a full failed call to discover. `/schema` lists all of them at once and needs no auth.
+
+### Parameter quick reference
+
+The names that are most often guessed wrong. `/schema` remains the authority.
+
+| Method | Required | Useful optional |
+|---|---|---|
+| `find_element` | `element_id` (label **or** accessibility id) | `element_type`, `match:"contains"`, `bundle_id` |
+| `scroll_to_element` | `element_id` | `element_type`, `match`, `direction`, `distance`, `bundle_id` |
+| `tap` / `double_tap` / `long_press` | `x`+`y` **or** `ref` | `duration` (long_press) |
+| `type` | `text` | `submit`, `clear` |
+| `resolve_app` | `text` | — |
+| `launch_app` / `activate_app` / `terminate_app` | `bundle_id` | — |
+| `open_url` | `url` | — |
+| `screenshot` | — | `scale`, `format`, `quality`, `bundle_id` |
+| `page_source` | — | `bundle_id`, `max_depth`, `filter` |
+| `swipe` | — | `direction`, `distance`, `velocity`, `x`, `y` |
+| `page` | — | `direction`, `distance` |
+
+Naming traps: the method is **`type`**, not `type_text`. **`element_type` alone never selects an
+element** — it only filters, so `element_id` must accompany it.
 
 ## Read the `hint` field
 
@@ -209,6 +240,18 @@ It matters most when a result is **negative or suspiciously empty** — that is 
 
 ## Locating elements — pick by situation
 
+> **Web pages are invisible to the accessibility tree — read this before automating a browser.**
+> In Safari (or any browser / in-app web view), `page_source` returns **browser chrome only**: a
+> few dozen anonymous `Other` nodes, the status bar, the toolbar. Links, buttons and text *inside
+> the page do not appear at all*, so `find_element` can never match them. Concretely: a page with
+> five app rows returned 42 nodes, none of them page content, while a native app on the same device
+> returned 162 fully-labelled nodes.
+> **Do not** reach for `scroll_to_element` or `match:"contains"` — they cannot fix this.
+> **Do this instead:** `screenshot` → locate the target visually → convert pixel→point by dividing
+> by the `scale` field *from that same screenshot response* → `tap{x,y}`.
+> Native alerts (including the system "…想要安装…" install sheet) are a different matter: those ARE
+> in the tree, so `find_element` works normally for them even while Safari is in front.
+
 - **Known on-screen label** → `find_element{element_id:"<label>"}` → `tap{ref}`. Fastest. Skip page_source.
 - **Off-screen (needs scrolling)** → `scroll_to_element{element_id:"<label>"}` — scrolls and returns the ref in one call. Don't hand-roll swipe loops.
 - **App exposes accessibility ids** (`identifier:` in page_source) → use that id as `element_id` — the most stable key.
@@ -220,7 +263,7 @@ It matters most when a result is **negative or suspiciously empty** — that is 
 
 1. `launch_app`, wait 2–3s once (cold render).
 2. Find the search ENTRY (by its visible label, whatever the app's language). It is often a **Button/StaticText that opens a separate search page** rather than a real input — check `is_text_input`: false means it's an entry, not the field itself. `find_element{element_id:"<label>"}` → `tap{ref}` — no wait after.
-3. Locate the REAL input: `find_element{element_type:"textfield"}`, confirm `is_text_input:true`, `tap{ref}` to focus (keyboard comes up with the tap).
+3. Locate the REAL input: `find_element{element_id:"<its placeholder text>", element_type:"textfield", match:"contains"}`, confirm `is_text_input:true`, `tap{ref}` to focus (keyboard comes up with the tap). **`element_id` is always required** — `element_type` only narrows the search, it cannot select an element on its own.
 4. `type{text:"…", submit:true}` — `submit` appends Return/Search so the field's action fires.
 5. Read results with `page_source` directly.
 - **TRUST the result — do NOT re-type the same text.** If `type` returns success (no error/warning), the text WENT IN. Only re-type when `type` itself returns a "no keyboard/focus" **warning**. A common false-failure trap: after `type{submit}` you read `page_source` and see the OLD content (the search page/results haven't updated yet, or you read a stale home-screen search bar) — that is NOT proof the type failed. Wait ~1s and re-read, or check the results, before ever re-typing. Re-typing the same query is almost always wrong and just doubles the work.
@@ -259,8 +302,80 @@ After `launch_app`/`activate_app`, that app is the **sticky target**.
 
 - `filter` — return only matching nodes + ancestors: `{label:"<substr>"}`, `{type:"button"}`, or `{text:"<substr>"}`. Also the cheapest way to harvest repeated values (filter by a common substring).
 - `max_depth` — cap tree depth. WARNING: labels live near the LEAVES, so a shallow depth (3–4) returns structure with NO useful labels — use it only to preview layout, not to find an element.
-- `max_elements` — cap node count (default 500, hard cap 2000). If hit, the response is `truncated:true` — narrow with `filter` instead of raising this.
+- `max_elements` — cap node count (default 2000, hard cap 4000). If hit, the response is `truncated:true` — narrow with `filter` or `visible_only` instead of raising this.
+- `visible_only:true` — **return only what is on screen right now**, plus the ancestor path of each visible node. See below; this is the fix for long lists.
 - To LOCATE a control, prefer `find_element{element_id:"<label>"}` (add `element_type:"button"/"textfield"/…` to disambiguate) → it returns a stable `ref` you then `tap{ref}`. Off-screen → `scroll_to_element{element_id}` returns the ref after scrolling. A `ref` beats coordinates (survives scroll/animation).
+
+### Reading the visible screen in under a second
+
+Measured across 8 apps (WeChat, X, JD, RED, Settings, Spotify, App Store, GitHub)
+at 1–8 pages of scroll:
+
+| Approach | p50 | p90 | ever >1s |
+|---|---|---|---|
+| `visible_only` | 494ms | 1354ms | yes (X) |
+| **`visible_only` + `max_children:50`** | **416ms** | **593ms** | **no** |
+| `screen_text` (OCR, fast) | 508ms | 551ms | no |
+| `screen_text` (OCR, accurate) | 701ms | 919ms | no |
+
+**Default to `page_source{visible_only:true, max_children:50}`.** It was the
+fastest option and never exceeded 1s. Verified it loses nothing: at 6–8 pages deep
+in RED/GitHub/JD it returned exactly the same visible labels as the unbounded
+read, at half the time — the rows `max_children` drops are offscreen ones
+`visible_only` would discard anyway.
+
+**Reach for `screen_text` when the tree comes back thin.** On recycling lists the
+accessibility tree can be missing most of what you can see — measured on the same
+screens, OCR found ~5x more text than the tree did:
+
+| App | texts via tree | via OCR |
+|---|---|---|
+| WeChat (6 pages in) | 6 | **35** |
+| X (3 pages in) | 8 | **45** |
+| RED | 30 | **80** |
+| Settings / Spotify / GitHub / JD | 20–69 | similar or fewer |
+
+So: normal apps → the tree is as good or better (and gives you `ref`s). Chat
+lists and feeds → the tree may return almost nothing while OCR reads the screen
+fine. A `viewport_warning` in the response tells you when you are in that case.
+
+### `visible_only` — reading long / infinitely-scrolling lists
+
+A recycling list (chat list, feed, timeline) keeps far more rows in the
+accessibility tree than are on screen. Measured on this device:
+
+| App | Nodes | On screen | Offscreen |
+|---|---|---|---|
+| WeChat chat list | 1500 (truncated) | 130 | **91%** |
+| X timeline | 769 | 104 | **86%** |
+| JD home | 744 | 606 | 19% |
+
+Those offscreen rows are real rows with real labels — WeChat's sit anywhere from
+y = -9115 to y = +13204 — and they **consume the element budget before the
+visible ones are reached**, which is why such a page comes back `truncated:true`
+while still missing what you can actually see.
+
+`page_source{visible_only:true}` keeps only nodes intersecting the screen rect
+(plus their ancestors, so it is still a tree). On the WeChat list that is
+1500 → 130 nodes and 115 KB → 9 KB, and it no longer truncates.
+
+**What it is NOT:** a way to read the whole list. It is a snapshot of the current
+viewport. **To see more, scroll and read again** — `page{direction:"down"}` then
+`page_source{visible_only:true}`, repeating until you find what you need. To jump
+straight to a known item, prefer `scroll_to_element{element_id:"<label>"}`.
+
+**Use the full tree (omit the flag) when** you are looking for something just
+offscreen, or reasoning about list length/position — `scroll_to_element` needs
+the uncelled tree to know which way to scroll. That is why this is opt-in.
+
+**Performance caveat.** `visible_only` cuts the payload and the element budget,
+but **not the traversal**. A container's frame does not bound its children in a
+recycling list (measured: 89% of parent/child pairs violate containment — WeChat's
+Table reports exactly the screen rect while its cells live thousands of points
+away), so every node must still be visited to learn where it is. Expect a large
+drop in bytes and a modest one in time. On a very long list the call can still be
+slow; combine with `filter` or `max_depth` if it is, and remember an app that has
+been scrolled for a long time accumulates rows — relaunching it drops them.
 
 ## Safety
 
@@ -268,6 +383,10 @@ When operating real shopping/payment apps, stop at the cart/checkout — do NOT 
 
 ## Diagnostics
 
+- **Check `device_info.system` first when something looks wrong.** Besides thermal/CPU/memory/disk/battery it reports:
+  - `screen_locked` — a locked screen is why a screenshot came back black and taps changed nothing. Call `unlock` rather than retrying the tap.
+  - `foreground_app` — which app your actions are actually hitting. A surprising value here explains most "the element isn't there" reports.
+  - `foreground_is_browser` — present and true when the foreground app is a browser, i.e. page content will NOT appear in `page_source` (see *Locating elements*).
 - `GET /logs` — recent in-memory logs (incl. `⏱ ✓ <method> <ms>` timings).
 - `GET /logs/files` — list persisted daily log files (survive crashes/restarts).
 - `GET /logs/history?date=YYYY-MM-DD` — read a persisted day's log (recover logs from before a crash).
