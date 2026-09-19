@@ -49,10 +49,33 @@
 
 + (nullable NSString *)currentBundleID {
     @try {
-        Class clientClass = NSClassFromString(@"XCAXClient_iOS");
-        if (!clientClass) { return nil; }
+        // +sharedClient is gone on newer iOS: XCAXClient_iOS exposes no class
+        // methods at all there, so the old call threw "unrecognized selector",
+        // was swallowed below, and this returned nil — which surfaced as
+        // foreground_app:null and a stream of bogus "app is in the background"
+        // errors even with the app plainly on screen. Reach the client the way
+        // XCUIElementQuery does (device -> accessibilityInterface) and keep
+        // +sharedClient only as the legacy fallback.
+        id client = nil;
+        @try {
+            Class deviceClass = NSClassFromString(@"XCUIDevice");
+            SEL sharedSel = NSSelectorFromString(@"sharedDevice");
+            if ([deviceClass respondsToSelector:sharedSel]) {
+                id device = [deviceClass performSelector:sharedSel];
+                SEL ifaceSel = NSSelectorFromString(@"accessibilityInterface");
+                if ([device respondsToSelector:ifaceSel]) {
+                    client = [device performSelector:ifaceSel];
+                }
+            }
+        } @catch (__unused NSException *e) {}
 
-        id client = [clientClass performSelector:@selector(sharedClient)];
+        if (!client) {
+            Class clientClass = NSClassFromString(@"XCAXClient_iOS");
+            if (!clientClass) { return nil; }
+            SEL sharedClientSel = NSSelectorFromString(@"sharedClient");
+            if (![clientClass respondsToSelector:sharedClientSel]) { return nil; }
+            client = [clientClass performSelector:sharedClientSel];
+        }
         if (!client) { return nil; }
 
         // activeApplications: first element is the frontmost app.
@@ -571,10 +594,37 @@ static NSString *ICTRLTypeName(NSInteger t) {
     }
 }
 
-static void ICTRLRenderNode(id node, NSInteger depth, NSInteger maxDepth,
+/// Viewport for `visibleOnly` culling. CGRectNull disables it.
+///
+/// Why this is a per-node test and not subtree pruning: in a recycling list a
+/// container's frame does NOT bound its children. WeChat's chat Table reports
+/// exactly the screen rect {{0,0},{402,874}} while its cells live at y=-3659
+/// through y=+5225 — measured 89% of parent/child pairs violate containment. So
+/// an offscreen parent may hold visible children and vice versa; the only sound
+/// approach is to test every node and keep walking regardless.
+static NSMutableString *ICTRLBuildLine(NSInteger depth, NSInteger type, NSString *label,
+                                       NSString *value, NSString *ident, CGRect frame) {
+    NSMutableString *line = [NSMutableString string];
+    for (NSInteger i = 0; i < depth; i++) { [line appendString:@"  "]; }
+    [line appendString:ICTRLTypeName(type)];
+    if (label.length) { [line appendFormat:@", label: '%@'", label]; }
+    if (value.length) { [line appendFormat:@", value: '%@'", value]; }
+    if (ident.length) { [line appendFormat:@", id: '%@'", ident]; }
+    [line appendFormat:@", {{%d, %d}, {%d, %d}}",
+        (int)frame.origin.x, (int)frame.origin.y, (int)frame.size.width, (int)frame.size.height];
+    return line;
+}
+
+static BOOL ICTRLRectVisible(CGRect f, CGRect viewport) {
+    if (CGRectIsNull(viewport)) { return YES; }
+    if (f.size.width <= 0 || f.size.height <= 0) { return NO; }   // zero-size: no hit target
+    return CGRectIntersectsRect(f, viewport);
+}
+
+static BOOL ICTRLRenderNode(id node, NSInteger depth, NSInteger maxDepth,
                             NSInteger maxElements, NSMutableArray *lines,
-                            NSInteger *count, BOOL *truncated) {
-    if (!node || *count >= maxElements) { if (*count >= maxElements) { *truncated = YES; } return; }
+                            NSInteger *count, BOOL *truncated, CGRect viewport) {
+    if (!node || *count >= maxElements) { if (*count >= maxElements) { *truncated = YES; } return NO; }
     @try {
         NSString *label = nil, *ident = nil, *value = nil;
         SEL s;
@@ -603,29 +653,71 @@ static void ICTRLRenderNode(id node, NSInteger depth, NSInteger maxDepth,
             [inv getReturnValue:&frame];
         }
 
-        NSMutableString *line = [NSMutableString string];
-        for (NSInteger i = 0; i < depth; i++) { [line appendString:@"  "]; }
-        [line appendString:ICTRLTypeName(type)];
-        if (label.length) { [line appendFormat:@", label: '%@'", label]; }
-        if (value.length) { [line appendFormat:@", value: '%@'", value]; }
-        if (ident.length) { [line appendFormat:@", id: '%@'", ident]; }
-        [line appendFormat:@", {{%d, %d}, {%d, %d}}",
-            (int)frame.origin.x, (int)frame.origin.y, (int)frame.size.width, (int)frame.size.height];
-        [lines addObject:line];
-        (*count)++;
+        BOOL selfVisible = ICTRLRectVisible(frame, viewport);
+        BOOL culling = !CGRectIsNull(viewport);
 
-        if (depth >= maxDepth) { return; }
-        s = NSSelectorFromString(@"children");
-        if ([node respondsToSelector:s]) {
-            id kids = [node performSelector:s];
-            if ([kids isKindOfClass:[NSArray class]]) {
-                for (id k in (NSArray *)kids) {
-                    if (*count >= maxElements) { *truncated = YES; break; }
-                    ICTRLRenderNode(k, depth + 1, maxDepth, maxElements, lines, count, truncated);
+        // Build the line ONLY when it can still be emitted. On a recycling list
+        // this is most of the win: WeChat walks 1500 nodes of which ~1370 are
+        // offscreen, and each skipped node saves an NSMutableString alloc plus
+        // four -appendFormat: calls. An invisible node can still be needed as the
+        // ancestor of a visible one, so defer rather than decide now.
+        NSMutableString *line = nil;
+        NSUInteger slot = NSNotFound;
+        if (!culling) {
+            line = ICTRLBuildLine(depth, type, label, value, ident, frame);
+            [lines addObject:line];
+            (*count)++;
+        } else if (selfVisible) {
+            line = ICTRLBuildLine(depth, type, label, value, ident, frame);
+            slot = lines.count;
+            [lines addObject:[NSNull null]];   // resolved below
+        } else {
+            // Not visible: reserve a slot but build nothing. If a descendant
+            // turns out visible we build the line then (see below).
+            slot = lines.count;
+            [lines addObject:[NSNull null]];
+        }
+
+        BOOL keptAnything = selfVisible;
+        if (depth < maxDepth) {
+            s = NSSelectorFromString(@"children");
+            if ([node respondsToSelector:s]) {
+                id kids = [node performSelector:s];
+                if ([kids isKindOfClass:[NSArray class]]) {
+                    for (id k in (NSArray *)kids) {
+                        if (*count >= maxElements) { *truncated = YES; break; }
+                        // Always recurse: an offscreen container can hold visible
+                        // children (see ICTRLRectVisible). Pruning here is what a
+                        // naive implementation gets wrong.
+                        if (ICTRLRenderNode(k, depth + 1, maxDepth, maxElements,
+                                            lines, count, truncated, viewport)) {
+                            keptAnything = YES;
+                        }
+                    }
                 }
             }
         }
+
+        if (culling) {
+            if (keptAnything) {
+                // An invisible ancestor of a visible node skipped its line build
+                // above — do it now, once, only for the few that survive.
+                if (!line) { line = ICTRLBuildLine(depth, type, label, value, ident, frame); }
+                lines[slot] = line;
+                // Budget counts only what is actually returned, so the element
+                // cap now bounds VISIBLE content rather than being exhausted by
+                // thousands of recycled offscreen rows.
+                (*count)++;
+            }
+            // Dropped nodes keep their NSNull placeholder rather than being
+            // removed here: an ancestor higher up the stack is still holding a
+            // `slot` index into this same array, and removing would shift every
+            // later element and corrupt those. All placeholders are stripped
+            // once at the end (see renderBoundedSnapshot).
+        }
+        return culling ? keptAnything : YES;
     } @catch (__unused NSException *e) {}
+    return NO;
 }
 
 + (nullable NSString *)renderBoundedSnapshot:(id)root
@@ -633,12 +725,25 @@ static void ICTRLRenderNode(id node, NSInteger depth, NSInteger maxDepth,
                                  maxElements:(NSInteger)maxElements
                                  nodesWritten:(NSInteger *)outCount
                                     truncated:(BOOL *)outTruncated {
+    return [self renderBoundedSnapshot:root maxDepth:maxDepth maxElements:maxElements
+                           visibleRect:CGRectNull nodesWritten:outCount truncated:outTruncated];
+}
+
++ (nullable NSString *)renderBoundedSnapshot:(id)root
+                                    maxDepth:(NSInteger)maxDepth
+                                 maxElements:(NSInteger)maxElements
+                                 visibleRect:(CGRect)visibleRect
+                                 nodesWritten:(NSInteger *)outCount
+                                    truncated:(BOOL *)outTruncated {
     if (!root) { return nil; }
     NSMutableArray *lines = [NSMutableArray array];
     NSInteger count = 0; BOOL trunc = NO;
-    ICTRLRenderNode(root, 0, maxDepth, maxElements, lines, &count, &trunc);
+    ICTRLRenderNode(root, 0, maxDepth, maxElements, lines, &count, &trunc, visibleRect);
     if (outCount) { *outCount = count; }
     if (outTruncated) { *outTruncated = trunc; }
+    if (!CGRectIsNull(visibleRect)) {
+        [lines removeObjectIdenticalTo:[NSNull null]];   // drop culled placeholders
+    }
     return [lines componentsJoinedByString:@"\n"];
 }
 
@@ -649,6 +754,103 @@ static NSString *ICTRLProbeSelectorName = nil;
 
 + (void)setProbeSelectorName:(nullable NSString *)name {
     ICTRLProbeSelectorName = [name copy];
+}
+
+/// Pure class-metadata introspection: what snapshot parameters does THIS XCTest
+/// build accept, and what snapshot-ish entry points exist?
+///
+/// Deliberately separate from benchmarkSnapshotForBundleID: it takes no snapshot
+/// and touches no live element. Mixing the two is what repeatedly hung the AX
+/// connection — any call that fetches can wedge the channel, and then the
+/// introspection results are lost with it. This only reads class metadata, so it
+/// cannot hang and always returns.
+///
+/// The question it exists to answer: is there a RECT/viewport parameter? Every
+/// knob we have today trims what is RETURNED, but ~85% of page_source is the
+/// fetch, so only a fetch-time filter can actually make it faster.
++ (NSDictionary *)snapshotAPICapabilities {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    @try {
+        // Guessing class names failed (none of the *RequestParameters spellings
+        // exist on this build), so enumerate the whole runtime instead and keep
+        // anything that looks like snapshot parameters. This is how we find the
+        // real class rather than assuming its name.
+        NSMutableArray *candidates = [NSMutableArray array];
+        @try {
+            unsigned int total = 0;
+            Class *all = objc_copyClassList(&total);
+            for (unsigned int i = 0; i < total; i++) {
+                NSString *nm = NSStringFromClass(all[i]);
+                NSString *low = nm.lowercaseString;
+                if (([low containsString:@"snapshot"] || [low containsString:@"axsettings"])
+                    && ([low containsString:@"param"] || [low containsString:@"request"]
+                        || [low containsString:@"option"] || [low containsString:@"setting"])) {
+                    [candidates addObject:nm];
+                }
+            }
+            if (all) { free(all); }
+            [candidates sortUsingSelector:@selector(compare:)];
+            out[@"candidate_classes"] = [candidates componentsJoinedByString:@","];
+        } @catch (NSException *e) { out[@"classlist_exception"] = e.reason ?: @"?"; }
+
+        for (NSString *cls in candidates) {
+            Class c = NSClassFromString(cls);
+            if (!c) { continue; }
+            unsigned int pn = 0;
+            objc_property_t *props = class_copyPropertyList(c, &pn);
+            NSMutableArray *names = [NSMutableArray array];
+            for (unsigned int i = 0; i < pn; i++) {
+                [names addObject:@(property_getName(props[i]))];
+            }
+            if (props) { free(props); }
+            if (names.count) {
+                out[[@"props_" stringByAppendingString:cls]] =
+                    [names componentsJoinedByString:@","];
+            }
+            // Class methods too — defaultParameters and friends name the keys
+            // XCTest itself passes.
+            unsigned int mn = 0;
+            Method *ms = class_copyMethodList(object_getClass(c), &mn);
+            NSMutableArray *cms = [NSMutableArray array];
+            for (unsigned int i = 0; i < mn; i++) {
+                [cms addObject:NSStringFromSelector(method_getName(ms[i]))];
+            }
+            if (ms) { free(ms); }
+            if (cms.count) {
+                out[[@"classmethods_" stringByAppendingString:cls]] =
+                    [cms componentsJoinedByString:@","];
+            }
+        }
+        // Snapshot-related selectors on the AX client class. Reading the CLASS's
+        // method list needs no instance, so nothing can block.
+        for (NSString *cls in @[@"XCAXClient_iOS", @"XCUIApplication", @"XCUIElementQuery"]) {
+            Class c = NSClassFromString(cls);
+            if (!c) { continue; }
+            unsigned int mn = 0;
+            Method *ms = class_copyMethodList(c, &mn);
+            NSMutableArray *hits = [NSMutableArray array];
+            for (unsigned int i = 0; i < mn; i++) {
+                NSString *nm = NSStringFromSelector(method_getName(ms[i]));
+                NSString *low = nm.lowercaseString;
+                if ([low containsString:@"snapshot"] || [low containsString:@"visib"]
+                    || [low containsString:@"rect"] || [low containsString:@"viewport"]
+                    || [low containsString:@"bounds"] || [low containsString:@"hittable"]) {
+                    // Include the type encoding: it reveals whether a method takes
+                    // a CGRect ({CGRect={CGPoint=dd}{CGSize=dd}}), which is what a
+                    // fetch-time viewport filter would look like.
+                    const char *enc = method_getTypeEncoding(ms[i]);
+                    [hits addObject:enc ? [NSString stringWithFormat:@"%@ %s", nm, enc] : nm];
+                }
+            }
+            if (ms) { free(ms); }
+            [hits sortUsingSelector:@selector(compare:)];
+            if (hits.count) {
+                out[[@"methods_" stringByAppendingString:cls]] =
+                    [hits componentsJoinedByString:@","];
+            }
+        }
+    } @catch (NSException *e) { out[@"exception"] = e.reason ?: @"?"; }
+    return out;
 }
 
 + (nullable NSDictionary *)benchmarkSnapshotForBundleID:(NSString *)bundleId
@@ -662,9 +864,11 @@ static NSString *ICTRLProbeSelectorName = nil;
         if (!app) { return nil; }
 
         // --- Variant A: the path page_source uses today (no server-side limit).
-        // Skippable: on a deep tree it costs seconds and would blow the RPC
-        // watchdog before the cheap variant is even measured, which is what a
-        // depth sweep needs to isolate.
+        // OPT-IN ONLY (pass a positive max_depth). This is an unbounded snapshot:
+        // on a long list it does not merely take seconds, it can hang the AX
+        // connection so hard that only restarting the runner recovers it. A
+        // diagnostic must not be able to kill the service it is measuring, so the
+        // default (negative/absent max_depth) skips it.
         if (maxDepth >= 0) {
             NSDate *t0 = [NSDate date];
             id snapA = nil;
@@ -973,6 +1177,76 @@ static NSString *ICTRLProbeSelectorName = nil;
                 }
             }
         } @catch (NSException *e) { out[@"unwrap_exception"] = e.reason ?: @"?"; }
+
+        // --- Variant C: ask XCTest for its own rendered description instead of
+        // fetching attributes and formatting them ourselves. Appium exposes this
+        // as `mobile: source format=description` and reports it as much faster,
+        // the claim being that the expensive part is resolving per-node
+        // attributes, which this skips entirely.
+        //
+        // ONLY the snapshot's own -debugDescription is safe here. Do NOT call it
+        // on the XCUIApplication: that goes through XCUIElement, which triggers a
+        // fresh UNBOUNDED snapshot and first waits for app quiescence with no
+        // timeout we control. Measured: it hung the AX connection outright on a
+        // 173-node Settings tree (a normal page_source there is 652ms), and the
+        // only recovery was restarting the runner — reset could not clear it.
+        for (NSString *spec in @[@"snapshot:debugDescription"]) {
+            NSArray *parts = [spec componentsSeparatedByString:@":"];
+            id target = snapB;
+            if (!target) { continue; }
+            SEL s = NSSelectorFromString(parts[1]);
+            if (![target respondsToSelector:s]) {
+                out[[@"descr_" stringByAppendingString:spec]] = @"<no selector>";
+                continue;
+            }
+            NSDate *t2 = [NSDate date];
+            NSString *text = nil;
+            @try {
+                id (*fn)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+                id v = fn(target, s);
+                if ([v isKindOfClass:[NSString class]]) { text = v; }
+            } @catch (NSException *e) {
+                out[[@"descr_" stringByAppendingString:spec]] =
+                    [NSString stringWithFormat:@"<throws:%@>", e.name];
+                continue;
+            }
+            NSInteger ms = (NSInteger)([[NSDate date] timeIntervalSinceDate:t2] * 1000);
+            out[[NSString stringWithFormat:@"descr_%@_ms", spec]] = @(ms);
+            out[[NSString stringWithFormat:@"descr_%@_bytes", spec]] = @(text.length);
+            out[[NSString stringWithFormat:@"descr_%@_lines", spec]] =
+                @(text ? [[text componentsSeparatedByString:@"\n"] count] : 0);
+            // A description that carries no labels is useless to us regardless of
+            // speed — the whole point is locating elements by their text.
+            if (text.length) {
+                NSUInteger head = MIN((NSUInteger)400, text.length);
+                out[[NSString stringWithFormat:@"descr_%@_head", spec]] = [text substringToIndex:head];
+            }
+        }
+
+        // --- Variant D: same request as B, but with the MINIMAL attribute set
+        // we actually render (label/value/identifier/frame/elementType/children).
+        // B asks for 14 and XCTest expands that to ~20; if attribute resolution
+        // is what costs the seconds, this should be measurably cheaper on the
+        // very same tree. Isolates "too many attributes" from "too many nodes".
+        @try {
+            NSArray *minimal = @[@"XC_kAXXCAttributeLabel", @"XC_kAXXCAttributeValue",
+                                 @"XC_kAXXCAttributeIdentifier", @"XC_kAXXCAttributeFrame",
+                                 @"XC_kAXXCAttributeElementType", @"XC_kAXXCAttributeChildren"];
+            NSDate *t3 = [NSDate date];
+            NSError *err = nil;
+            id (*fn)(id, SEL, id, id, id, NSError **) =
+                (id (*)(id, SEL, id, id, id, NSError **))objc_msgSend;
+            id snapD = fn(client, reqSel, axElement, minimal, params, &err);
+            out[@"minattr_ms"] = @((NSInteger)([[NSDate date] timeIntervalSinceDate:t3] * 1000));
+            out[@"minattr_count"] = @(minimal.count);
+            if (err) { out[@"minattr_error"] = err.localizedDescription ?: @"?"; }
+            SEL rootSel2 = NSSelectorFromString(@"rootElementSnapshot");
+            if ([snapD respondsToSelector:rootSel2]) {
+                id r2 = [snapD performSelector:rootSel2];
+                out[@"minattr_nodes"] = @(ICTRLCountSnapshotNodes(r2, 0));
+                out[@"minattr_labelled"] = @(ICTRLCountLabelledNodes(r2, 0));
+            }
+        } @catch (NSException *e) { out[@"minattr_exception"] = e.reason ?: @"?"; }
     } @catch (NSException *e) {
         out[@"fatal"] = e.reason ?: @"?";
     }

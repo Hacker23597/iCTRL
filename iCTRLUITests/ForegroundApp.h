@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>   // CGRect in renderBoundedSnapshot:visibleRect:
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -126,6 +127,28 @@ NS_ASSUME_NONNULL_BEGIN
                                  maxElements:(NSInteger)maxElements
                                  nodesWritten:(NSInteger *)outCount
                                     truncated:(BOOL *)outTruncated;
+
+/// As above, but emits only nodes intersecting `visibleRect` (plus the ancestor
+/// path of each, so the result is still a tree). Pass CGRectNull for no culling.
+///
+/// On a recycling list this is the difference between a usable tree and a
+/// useless one: WeChat's chat list returns 1500 nodes of which ~91% sit
+/// offscreen (measured y from -9115 to +13204), and those exhaust maxElements
+/// before the visible rows are reached. Culling during the walk — rather than
+/// afterwards — means the element budget bounds VISIBLE content.
+///
+/// Note this cannot prune subtrees: a container's frame does not bound its
+/// children in a recycling list, so every node is still visited.
++ (nullable NSString *)renderBoundedSnapshot:(id)root
+                                    maxDepth:(NSInteger)maxDepth
+                                 maxElements:(NSInteger)maxElements
+                                 visibleRect:(CGRect)visibleRect
+                                 nodesWritten:(NSInteger *)outCount
+                                    truncated:(BOOL *)outTruncated;
+
+/// What the snapshot API on THIS XCTest build accepts — class metadata only, no
+/// snapshot taken, so it cannot hang the accessibility channel.
++ (NSDictionary *)snapshotAPICapabilities;
 
 /// Selects the single snapshot property `benchmarkSnapshotForBundleID:` samples.
 /// Undocumented getters can crash the process outright (SIGBUS, which @catch
