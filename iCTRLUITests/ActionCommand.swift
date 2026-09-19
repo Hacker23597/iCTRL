@@ -33,6 +33,8 @@ struct ActionCommand {
     var filterLabel: String?
     var filterText: String?
     var includeOverlays: Bool?
+    var visibleOnly: Bool?
+    var maxChildren: Int?
     // screenshot encoding
     var format: String?
     var quality: Double?
@@ -68,6 +70,8 @@ struct ActionCommand {
 
         self.maxDepth = params?["max_depth"]?.intValue
         self.maxElements = params?["max_elements"]?.intValue
+        self.visibleOnly = params?["visible_only"]?.boolValue
+        self.maxChildren = params?["max_children"]?.intValue
         // filter can be a nested object {type,label,text} or top-level keys.
         let filter = params?["filter"]?.objectValue
         self.filterType = filter?["type"]?.stringValue ?? params?["filter_type"]?.stringValue

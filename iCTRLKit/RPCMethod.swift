@@ -42,14 +42,26 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "page_source",
-            description: "Inspect the current UI: returns the accessibility/view hierarchy as text (element types, labels, identifiers, frames in POINTS). Use it to UNDERSTAND layout — NOT as your locate-and-tap loop. To act on a control you already know by label, do NOT read its frame and tap x,y; call find_element{element_id:<label>} → tap{ref} (a ref survives scroll/animation, needs no coordinate math, and no re-read to re-derive coords). Reserve coordinate taps for elements with no usable label. On rich pages the full tree is large and the first call after a launch can be slow while the UI settles — scope it: filter returns only matching nodes+ancestors (also great for HARVESTING repeated data — filter by a substring common to the values you want), max_elements caps the count. 500-node hard cap by default (truncated:true when hit). Use screenshot only when an element is missing here or you need visual detail.",
+            description: "Inspect the current UI: returns the accessibility/view hierarchy as text (element types, labels, identifiers, frames in POINTS). Use it to UNDERSTAND layout — NOT as your locate-and-tap loop. To act on a control you already know by label, do NOT read its frame and tap x,y; call find_element{element_id:<label>} → tap{ref} (a ref survives scroll/animation, needs no coordinate math, and no re-read to re-derive coords). Reserve coordinate taps for elements with no usable label. On rich pages the full tree is large and the first call after a launch can be slow while the UI settles — scope it: filter returns only matching nodes+ancestors (also great for HARVESTING repeated data — filter by a substring common to the values you want), max_elements caps the count. 2000-node cap by default (truncated:true when hit); on a long recycling list pass visible_only:true to return just the on-screen rows. Use screenshot only when an element is missing here or you need visual detail.",
             params: [
                 RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Inspect this app's tree; omit for the detected foreground app"),
                 RPCParamDef(name: "filter", type: "object", required: false, description: "Return only matching nodes + their ancestors. {label:'<substring>'} (label/value substring, case-insensitive), {type:'button'} (element type), or {text:'<substring>'} (label+value+id substring). Also the cheapest way to HARVEST repeated data — filter by a substring common to the values you want, far easier than parsing the whole tree."),
                 RPCParamDef(name: "max_depth", type: "number", required: false, description: "Max tree depth. WARNING: labels/tappable controls live near the LEAVES, so a shallow depth (3-4) returns structure with NO useful labels and you'll have to re-fetch — a wasted call. Use max_depth ONLY to preview overall layout; to FIND an element use filter or find_element instead."),
-                RPCParamDef(name: "max_elements", type: "number", required: false, description: "Max nodes to return (default 500, hard cap 2000). If hit, response is truncated:true"),
+                RPCParamDef(name: "max_elements", type: "number", required: false, description: "Max nodes to RETURN (default 2000, hard cap 4000). If hit, response is truncated:true. NOTE this does not make the call faster: it trims after the tree is already fetched (measured: 20 vs 2000 both cost the same fetch time). To cut the TIME use max_depth or max_children, the only two limits the accessibility server applies while walking."),
+                RPCParamDef(name: "max_children", type: "number", required: false, description: "Max children per node the accessibility server will walk (default 1000, cap 5000). One of only two knobs that bound the FETCH itself — the expensive phase (on a chat list, fetch is ~99% of the call). Lower it on wide recycling lists where thousands of offscreen rows hang off one container."),
+                RPCParamDef(name: "visible_only", type: "boolean", required: false, description: "Return ONLY nodes intersecting the screen, plus their ancestor path. Use on long/infinitely-scrolling lists (chat lists, feeds, timelines): such a list keeps far more rows in the tree than are on screen — measured 91% offscreen on a WeChat chat list — and those offscreen rows exhaust max_elements before the visible ones are reached, so the response truncates while still missing what you can see. This returns the CURRENT VIEWPORT only: to see more, scroll (page{direction:'down'}) and read again, or use scroll_to_element to jump to a known item. Omit it when you need to reason about content just offscreen — scroll_to_element needs the full tree. Cuts payload and node count sharply; cuts TIME only modestly, since a container's frame doesn't bound its children in a recycling list so every node is still visited."),
             ],
-            returns: "{source: text tree, truncated, total_returned, filtered?, coordinate_space:'points', hint}. Includes visible overlay windows (fixed bottom/floating bars) automatically."
+            returns: "{source: the tree as text, truncated, total_returned, max_children_used, timing:{fetch_ms,render_ms}, coordinate_space:'points', hint}. Includes visible overlay windows automatically. AUTOMATIC OCR FALLBACK: when the accessibility tree returns NO on-screen content (common on chat lists and feeds), the response also carries ocr_items[] — same keys as find_element, each tagged source:'ocr', tap via tap{x:center_x,y:center_y} — plus ocr_count, ocr_timing and ocr_reason explaining why. viewport_warning / sparse_hint flag a tree that is present but suspect."
+        ),
+        RPCMethodDef(
+            name: "screen_text",
+            description: "OCR the screen with Vision and return text boxes in the SAME shape find_element uses (x/y/width/height/center_x/center_y/label), so a hit feeds straight into tap{x:center_x,y:center_y}. FALLBACK for one specific failure: a long recycling list whose on-screen rows never reach the accessibility tree — measured on a scrolled WeChat chat list, every page_source variant returned ZERO on-screen rows because the element budget is spent on offscreen ones. Screenshots bypass the accessibility channel entirely, so this still works there. Limits: no `ref` (coordinates go stale on scroll — tap immediately), no identifier, element_type is always 'OCRText' so you cannot tell a button from a label, and it only sees RENDERED TEXT (icon-only buttons and images are invisible). Prefer find_element whenever the tree has the element.",
+            params: [
+                RPCParamDef(name: "element_id", type: "string", required: false, description: "Only return results containing this substring (case-insensitive). Omit for every text box on screen."),
+                RPCParamDef(name: "match", type: "string", required: false, description: "'fast' uses Vision's fast recognition level (lower accuracy, quicker); default is accurate."),
+                RPCParamDef(name: "scale", type: "number", required: false, description: "Minimum confidence 0..1 (default 0.3). Raise to drop shaky reads."),
+            ],
+            returns: "{count, items:[{label, confidence, x, y, width, height, center_x, center_y, element_type:'OCRText', is_text_input, exists}], coordinate_space:'points', timing:{screenshot_ms, ocr_ms}, hint}"
         ),
         RPCMethodDef(
             name: "reset",
@@ -319,7 +331,17 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.17.0"
+    static let serverVersion = "1.20.0"
+
+    /// When this binary was built, as "YYYY-MM-DD HH:MM".
+    ///
+    /// `serverVersion` alone cannot tell two builds apart — bumping it is a
+    /// manual step and gets forgotten, so a freshly installed runner can report
+    /// the same version as the one it replaced. That ambiguity has already cost
+    /// real debugging time: a change looked "not deployed" when the actual
+    /// question was which binary was loaded. This is stamped by
+    /// Scripts/stamp-build.sh on every build, so it always differs.
+    static let buildTimestamp = BuildStamp.value
 
     /// Server capability/protocol version. v1 = encrypted-envelope auth over /pair +
     /// /rpc. Bump when the wire capabilities change so clients can auto-detect.
@@ -334,6 +356,7 @@ struct RPCMethodRegistry {
         "video_stream",        // GET /stream (H.264-in-MPEG-TS live screen)
         "remote_ui",           // GET /remote (browser control page)
         "page_source_filter",  // page_source{filter:{...}}
+        "visible_only",        // page_source{visible_only:true} — viewport culling for long lists
         "max_depth",           // page_source{max_depth}
         "find_element_ref",    // find_element → ref; tap{ref}
         "scroll_to_element",   // scroll_to_element → ref
@@ -346,7 +369,8 @@ struct RPCMethodRegistry {
         "screenshot_jpeg",     // screenshot{format:'jpeg'|'png', quality} — jpeg is the default
         "reset",               // reset RPC (recover from a dropped accessibility connection)
         "nonui_lane",          // config/reset/logs answer while UI calls are blocked
-        "system_metrics",      // device_info.system — thermal/cpu/memory/disk/battery
+        "system_metrics",      // device_info.system — thermal/cpu/memory/disk/battery/screen_locked/foreground_app
+        "screen_text",         // Vision OCR fallback when the AX tree has no on-screen rows
         "cli_binary",          // GET /skill/clients/cli — static aarch64-musl client
     ]
 
@@ -354,6 +378,9 @@ struct RPCMethodRegistry {
         [
             "protocol": "JSON-RPC 2.0",
             "server_version": serverVersion,
+            // Which BINARY this is. serverVersion is bumped by hand and so can be
+            // identical across two different builds; this never is.
+            "build": buildTimestamp,
             // Capability version — clients negotiate against this.
             "protocol_version": protocolVersion,
             // Feature-detection tags (same list device_info returns, so a client

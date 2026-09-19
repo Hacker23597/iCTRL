@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import Vision
 
 extension XCUIElement {
     /// `exists`, without the ability to kill the runner.
@@ -136,6 +137,34 @@ class ActionHandler {
         }
         return lastForegroundBundleId
     }
+
+    /// Browsers render their page into a web view that XCUITest does not walk:
+    /// the accessibility tree stops at the browser chrome, so page_source returns
+    /// a few dozen anonymous `Other` nodes and NO page content. Element lookups
+    /// therefore always miss, and the generic "try scroll/contains" advice sends
+    /// the caller in circles. Detect it so the error can say what actually works
+    /// (screenshot + tap by coordinate) instead.
+    private static let webViewHostBundleIds: Set<String> = [
+        "com.apple.mobilesafari",
+        "com.google.chrome.ios",
+        "com.microsoft.msedge",
+        "org.mozilla.ios.Firefox",
+        "com.apple.SafariViewService",
+    ]
+
+    private func foregroundIsWebViewHost() -> Bool {
+        guard let bid = resolveForegroundBundleId() else { return false }
+        return Self.webViewHostBundleIds.contains(bid)
+    }
+
+    /// Appended to lookup failures in a browser — the one piece of advice that
+    /// actually recovers the situation.
+    private static let webViewAdvice =
+        " ⚠️ The foreground app is a BROWSER: web page content is NOT exposed to the " +
+        "accessibility tree, so find_element/page_source can never see links, buttons or text in the page " +
+        "(page_source returns only browser chrome). Do NOT retry with scroll_to_element or match:'contains' — " +
+        "they cannot help here. Next: call screenshot, read the target's position off the image, convert " +
+        "pixel→point by dividing by the `scale` field in that same screenshot response, then tap{x,y}."
 
     /// The sticky target app: the last one opened via launch_app/activate_app.
     /// nil until the caller opens an app, after which every action binds here
@@ -377,6 +406,12 @@ class ActionHandler {
             return unlock()
         case "is_locked":
             return isLocked()
+        case "snapshot_api":
+            var out: [String: JSONValue] = [:]
+            for (k, v) in ForegroundApp.snapshotAPICapabilities() {
+                out[String(describing: k)] = .string(String(describing: v))
+            }
+            return (out, nil)
         case "reset":
             return reset()
         case "snapshot_bench":
@@ -399,6 +434,8 @@ class ActionHandler {
             return scrollToElement(cmd)
         case "find_element":
             return findElementInfo(cmd)
+        case "screen_text", "ocr":
+            return screenText(cmd)
         case "tap_element":
             return tapElement(cmd)
         case "find_and_tap":
@@ -408,8 +445,41 @@ class ActionHandler {
         case "wait":
             return wait(cmd)
         default:
-            return (nil, .methodNotFound)
+            return (nil, Self.unknownMethodError(method))
         }
+    }
+
+    /// Every dispatchable method name, including aliases — the source of truth for
+    /// "did you mean" suggestions. Keep in sync with the switch above.
+    private static let knownMethods: [String] = [
+        "activate_app", "clear_text", "device_info", "double_tap", "drag", "snapshot_api",
+        "find_and_tap", "find_element", "home", "installed_apps", "is_locked",
+        "launch_app", "list_apps", "lock", "long_press", "open", "open_url",
+        "page", "page_down", "page_source", "page_up", "reset", "resolve_app",
+        "screenshot", "scroll", "scroll_to", "scroll_to_element", "search_app",
+        "search_apps", "snapshot_bench", "swipe", "tap", "tap_element",
+        "screen_text", "ocr", "terminate_app", "type", "ui_tree", "unlock", "view_tree", "wait",
+    ]
+
+    /// Unknown method → name the closest matches and point at /schema, so a caller
+    /// that guessed (`type_text` for `type`) recovers on the next call instead of
+    /// guessing again.
+    private static func unknownMethodError(_ attempted: String) -> JSONRPCError {
+        let want = attempted.lowercased()
+        // Cheap similarity: shared prefix, or one name containing the other —
+        // enough to catch the realistic near-misses without a full edit distance.
+        let suggestions = knownMethods.filter { known in
+            known.contains(want) || want.contains(known)
+                || known.prefix(4) == want.prefix(4)
+        }.prefix(4)
+
+        var message = "Method '\(attempted)' does not exist."
+        if !suggestions.isEmpty {
+            message += " Did you mean: \(suggestions.joined(separator: ", "))?"
+        }
+        message += " Next: GET /schema (unauthenticated) for the full method list with parameters" +
+            " — one call, and it prevents further guessing."
+        return JSONRPCError(code: -32601, message: message, data: nil)
     }
 
     // MARK: - Device
@@ -494,6 +564,18 @@ class ActionHandler {
 
         out.merge(diskMetrics()) { a, _ in a }
         out.merge(batteryMetrics()) { a, _ in a }
+
+        // Screen/app state. Without these a caller that gets a black screenshot or
+        // a tap that "worked" but changed nothing has no way to tell a locked
+        // device from a broken one, and no way to know which app it is actually
+        // driving — both cost a round of blind guessing to diagnose.
+        out["screen_locked"] = .bool(LockStateMonitor.shared().isLocked)
+        if let fg = resolveForegroundBundleId() {
+            out["foreground_app"] = .string(fg)
+            if Self.webViewHostBundleIds.contains(fg) {
+                out["foreground_is_browser"] = .bool(true)
+            }
+        }
         return out
     }
 
@@ -622,6 +704,10 @@ class ActionHandler {
             // this server supports from a single device_info call (no /schema fetch
             // needed for feature detection).
             "server_version": .string(RPCMethodRegistry.serverVersion),
+            // Build identity. Two installs can share a server_version (the bump
+            // is manual), so this is what tells you whether the binary you just
+            // deployed is the one answering.
+            "build": .string(RPCMethodRegistry.buildTimestamp),
             "protocol_version": .int(RPCMethodRegistry.protocolVersion),
             "capabilities": .array(RPCMethodRegistry.capabilityTags.map { .string($0) }),
             // Lets a caller holding an older copy of the manual notice it. An
@@ -1152,7 +1238,9 @@ class ActionHandler {
         let target: XCUIApplication = bid.map { XCUIApplication(bundleIdentifier: $0) } ?? app
         if target.keyboards.count > 0 { return nil }
         return "Could not confirm a focused text field / visible keyboard (detection can't see all keyboards). " +
-            "If the text didn't appear, tap a real textfield first (find_element{element_type:\"textfield\"} → tap{ref}), wait ~1s, then type again. A home-screen 'search bar' is often a button that opens a separate search page."
+            "VERIFY BEFORE RETRYING — screenshot and check whether the text landed; typing again would enter it twice. " +
+            "If it did NOT land, tap a real textfield first (find_element{element_id:\"<placeholder text>\", element_type:\"textfield\", match:\"contains\"} → tap{ref}), wait ~1s, then type again. " +
+            "A home-screen 'search bar' is often a button that opens a separate search page."
     }
 
     private func typeText(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
@@ -1274,7 +1362,7 @@ class ActionHandler {
         if !keyboardConfirmed {
             out["warning"] = .string(
                 "Could not confirm a focused text field / visible keyboard. If the field wasn't cleared, " +
-                "tap a real textfield first (find_element{element_type:\"textfield\"} → tap{ref}), then clear_text again.")
+                "tap a real textfield first (find_element{element_id:\"<placeholder text>\", element_type:\"textfield\", match:\"contains\"} → tap{ref}), then clear_text again.")
         }
         return (out, nil)
     }
@@ -1494,7 +1582,14 @@ class ActionHandler {
     /// name. Params: text (query, required), country (default cn), limit (default 5).
     private func resolveApp(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let term = cmd.text, !term.isEmpty else {
-            return (nil, JSONRPCError(code: -32602, message: "resolve_app requires 'text' (the app name / keyword to resolve to a bundle_id)", data: nil))
+            return (nil, JSONRPCError(
+                code: -32602,
+                message: "resolve_app requires 'text' (the app name / keyword to look up). " +
+                    "NOTE: this SEARCHES THE APP STORE — it does not list what is installed on this device, " +
+                    "so it must NOT be used to verify an install (it happily returns a different version than the one installed). " +
+                    "Next: to check an installed app use list_apps; to search the store retry as resolve_app{text:\"<name>\"}. " +
+                    "Full parameter list: GET /schema.",
+                data: nil))
         }
         let country = cmd.country ?? "cn"
         let limit = min(max(Int(cmd.distance ?? 5), 1), 25)
@@ -1741,7 +1836,11 @@ class ActionHandler {
         // element_id names the single property to sample off a node; reading
         // several undocumented getters in one pass hard-crashed the runner.
         ForegroundApp.setProbeSelectorName(cmd.elementId)
-        let depth = cmd.maxDepth ?? 8
+        // Negative depth = "use |depth| but SKIP the unbounded baseline". That
+        // baseline is an unlimited snapshot which can hang the accessibility
+        // connection badly enough that only restarting the runner recovers it,
+        // so it must be asked for explicitly (positive max_depth), never default.
+        let depth = cmd.maxDepth ?? -8
         guard let raw = ForegroundApp.benchmarkSnapshot(forBundleID: bundleId, maxDepth: depth) else {
             return (nil, .serverError("snapshot_bench unavailable: private XCTest API missing on this build."))
         }
@@ -1785,7 +1884,7 @@ class ActionHandler {
         // Raised with max_children: a timeline page already returned ~370 nodes
         // under the old 100-child cap, so leaving this at 500 would just move the
         // truncation from one limit to the other.
-        let maxElements = min(cmd.maxElements ?? 1500, 4000)
+        let maxElements = min(cmd.maxElements ?? 2000, 4000)
         let filter = SnapshotFilter(type: cmd.filterType, label: cmd.filterLabel, text: cmd.filterText)
 
         // Snapshot roots to render. We take the single application.snapshot()
@@ -1817,30 +1916,150 @@ class ActionHandler {
         // them while this path didn't. With the same attrs both read full text.
         // Verify snapshot_path:"bounded" appears in responses; a silent fall
         // back to "full" is how a future private-API shift will present.
+        // Phase timings: the two costs here are very different in nature — the
+        // AX round trip into the target app (fetch) vs. walking the returned
+        // tree and building strings (render). A single total can't tell you
+        // which one a slow page is paying for, and they have opposite fixes.
+        var fetchMs = 0.0
+        var renderMs = 0.0
+        var childrenUsed = 0
+        var ladderSteps: [String] = []
+        var ocrFallback: (items: [JSONValue], shotMs: Double, ocrMs: Double)?
         let boundedEnabled = true
-        if boundedEnabled, !filter.active, let bid = inspectedBundleId,
-           let bounded = ForegroundApp.boundedSnapshot(
-                forBundleID: bid,
-                maxDepth: maxDepth == Int.max ? Self.defaultMaxDepth : maxDepth,
-                maxChildren: Self.maxChildrenPerNode) {
+        let fetchStart = nowMonotonic
+
+        // maxChildren is one of only TWO knobs the AX server honours at fetch
+        // time (the other is maxDepth). Measured: max_elements does NOT bound the
+        // fetch — 20 vs 2000 both cost ~90ms, because it truncates after the tree
+        // is already materialised. On a wide recycling list, capping children is
+        // the only way to stop the server walking thousands of cells at all.
+        //
+        // An explicit max_children pins the value (one fetch, no ladder) so the
+        // parameter stays predictable for callers doing their own tuning.
+        let pinnedChildren = cmd.maxChildren.map { max(1, min($0, 5000)) }
+
+        /// One bounded fetch + render at a given child cap.
+        func attempt(_ children: Int) -> (body: String, nodes: Int, truncated: Bool)? {
+            guard let bid = inspectedBundleId,
+                  let bounded = ForegroundApp.boundedSnapshot(
+                    forBundleID: bid,
+                    maxDepth: maxDepth == Int.max ? Self.defaultMaxDepth : maxDepth,
+                    maxChildren: children)
+            else { return nil }
             var n = 0
             var t: ObjCBool = false
-            // Acceptance: a sizeable tree with NO labels at all is the known
-            // bad-fetch signature (wrong attribute domain → shape without
-            // content), not a plausible real screen. Falling back to the full
-            // snapshot there costs seconds; shipping a content-free tree costs
-            // the caller a wrong "this page is empty" conclusion.
-            if let text = ForegroundApp.renderBoundedSnapshot(
+            let viewport = cmd.visibleOnly == true
+                ? CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height)
+                : CGRect.null
+            guard let text = ForegroundApp.renderBoundedSnapshot(
                     bounded,
                     maxDepth: maxDepth == Int.max ? Self.defaultMaxDepth : maxDepth,
                     maxElements: maxElements,
+                    visibleRect: viewport,
                     nodesWritten: &n,
-                    truncated: &t), n > 1,
-               n < 40 || text.contains("label:") {
-                boundedBody = text
-                boundedCount = n
-                boundedTruncated = t.boolValue
-                usedBoundedSnapshot = true
+                    truncated: &t) else { return nil }
+            return (text, n, t.boolValue)
+        }
+
+        if boundedEnabled, inspectedBundleId != nil {
+            var chosen: (body: String, nodes: Int, truncated: Bool)?
+            var usedChildren = 0
+
+            if let pinned = pinnedChildren {
+                chosen = attempt(pinned)
+                usedChildren = pinned
+            } else {
+                // Climb only while the probe says list content stops ABOVE the
+                // viewport AND the container still has more to give.
+                // Start cheap: measured p50 416ms / p90 593ms across 8 apps, and
+                // on every app whose list behaves normally this is also COMPLETE
+                // (verified at 6-8 pages of scroll in RED/GitHub/JD: identical
+                // visible labels to an unbounded read, half the time).
+                if let first = attempt(Self.childrenLadder[0]) {
+                    chosen = first
+                    usedChildren = Self.childrenLadder[0]
+                    let coverage = visibleLabelledCoverage(first.body)
+                    ladderSteps.append(String(format: "50:%.0f%%", coverage * 100))
+
+                    // Escalate when the tree barely describes the content area. A
+                    // ratio rather than a node count: count thresholds encode
+                    // assumptions about screen size and row density that break on
+                    // the next device or app, while a fraction of the content band
+                    // means the same thing everywhere.
+                    //
+                    // The bar is deliberately LOW. Measured coverages:
+                    //   WeChat scrolled  0%  — tree had only nav/tab furniture
+                    //   Telegram        11%  — genuinely missing rows
+                    //   RED (小红书)     26%  — tree was COMPLETE; every title,
+                    //                          author and like count was present.
+                    //                          It reads low only because its cards
+                    //                          are mostly images, so text covers
+                    //                          little area.
+                    //   GitHub 92%, App Store 100%, Spotify 89%, X 100%
+                    // A 50% bar fired on RED and cost ~400ms of OCR for nothing.
+                    // 15% separates the real failures (0-11%) from sparse-but-fine
+                    // layouts (26%+) on everything measured.
+                    if coverage < 0.15 {
+                        // Run the wider fetch and the OCR CONCURRENTLY: serially
+                        // they are ~1.2s + ~0.7s, which blows the 1s budget on
+                        // exactly the screens that need help most.
+                        //
+                        // Only the screen CAPTURE is main-thread bound (XCUIScreen,
+                        // like every other UI call here); Vision itself is pure
+                        // image work. So grab the frame first — cheap, ~106ms —
+                        // then let recognition run on a background queue while the
+                        // accessibility server walks the bigger tree.
+                        // Run OCR INLINE, not on another queue waited on from here.
+                        //
+                        // The earlier "parallel" version deadlocked the runner: a
+                        // page_source is delivered via DispatchQueue.main.sync, so
+                        // blocking that main thread on a semaphore while Vision
+                        // worked on a background queue left nothing to service work
+                        // Vision itself hops to the main queue for. One page_source
+                        // on a scrolled WeChat list was enough to kill the HTTP
+                        // layer outright — socket still accepting, no responses,
+                        // recoverable only by restarting the runner.
+                        //
+                        // Inline costs ~260ms and cannot deadlock. The theoretical
+                        // saving from overlapping it with the wider fetch was ~260ms;
+                        // not worth a whole-server hang.
+                        //
+                        // The wider fetch is also skipped here: measured on exactly
+                        // this case it ALSO returns zero on-screen rows, so its
+                        // ~1.2s bought nothing. OCR is what actually reads the
+                        // screen (tree 6 texts vs OCR 35).
+                        ladderSteps.append("500:skipped(ocr)")
+                        ocrFallback = runOCR(query: nil, fast: false, minConfidence: 0.3)
+                    }
+                }
+            }
+
+            childrenUsed = usedChildren
+            fetchMs = (nowMonotonic - fetchStart) * 1000
+            if let got = chosen {
+                let renderStart = nowMonotonic
+                // Acceptance: a sizeable tree with NO labels at all is the known
+                // bad-fetch signature (wrong attribute domain → shape without
+                // content), not a plausible real screen. Falling back to the full
+                // snapshot there costs seconds; shipping a content-free tree
+                // costs the caller a wrong "this page is empty" conclusion.
+                //
+                // Judged on the RAW fetch: a filter legitimately reduces the tree
+                // to a handful of nodes, and judging the filtered text would read
+                // that as the bad-fetch signature and fall back for no reason.
+                if got.nodes > 1, got.nodes < 40 || got.body.contains("label:") {
+                    if filter.active {
+                        let (filtered, matches) = Self.filterRenderedTree(got.body, filter: filter)
+                        boundedBody = filtered
+                        boundedCount = matches
+                    } else {
+                        boundedBody = got.body
+                        boundedCount = got.nodes
+                    }
+                    boundedTruncated = got.truncated
+                    usedBoundedSnapshot = true
+                }
+                renderMs = (nowMonotonic - renderStart) * 1000
             }
         }
 
@@ -1893,9 +2112,14 @@ class ActionHandler {
         // Track element frames already emitted so overlapping window/app snapshots
         // don't duplicate the same nodes.
         var seenFrames = Set<String>()
+        let cullViewport = cmd.visibleOnly == true
+            ? CGRect(x: 0, y: 0, width: screen.width, height: screen.height)
+            : CGRect.null
         for root in roots {
             renderSnapshotInto(root, depth: 0, maxDepth: maxDepth, maxElements: maxElements,
-                               filter: filter, lines: &lines, localCount: &localCount,
+                               filter: filter,
+                               cullToViewport: cmd.visibleOnly == true, viewportRect: cullViewport,
+                               lines: &lines, localCount: &localCount,
                                globalCount: &count, truncated: &truncated, seenFrames: &seenFrames)
             if count >= maxElements { break }
         }
@@ -1912,6 +2136,9 @@ class ActionHandler {
             "back to screenshot + coordinate tap."
         if truncated {
             hint = "⚠️ Tree truncated at \(count) nodes (page has more). Narrow the query: " +
+                (cmd.visibleOnly == true ? "" :
+                    "pass visible_only:true to return ONLY what is on screen (on a long/recycling list most nodes are " +
+                    "offscreen rows that eat the budget before the visible ones are reached — scroll and re-read to see more), or ") +
                 "pass filter:{label:\"…\"} or filter:{type:\"button\"} to return only matching nodes (with their ancestor path), " +
                 "or max_depth:3-4 for just the top structure. " + hint
         } else if filter.active {
@@ -1924,7 +2151,8 @@ class ActionHandler {
         // page and conclude an element is absent when it was merely cut off.
         let usedDefaults = cmd.maxDepth == nil && cmd.maxElements == nil
         let depthLabel = maxDepth == Int.max ? "unlimited" : String(maxDepth)
-        let limits = "Limits on THIS response: max_depth=\(depthLabel), max_children=\(Self.maxChildrenPerNode), " +
+        let effectiveMaxChildren = cmd.maxChildren.map { max(1, min($0, 5000)) } ?? Self.maxChildrenPerNode
+        let limits = "Limits on THIS response: max_depth=\(depthLabel), max_children=\(effectiveMaxChildren), " +
             "max_elements=\(maxElements)\(usedDefaults ? " (defaults)" : " (as requested)"). " +
             "Deeper or wider reads are available — pass max_depth / max_elements — but cost scales with the " +
             "number of nodes actually walked: on a feed that has been scrolled for a while, offscreen rows " +
@@ -1944,10 +2172,116 @@ class ActionHandler {
             // private API shifts again, and the only symptom would be the old
             // multi-second timings — so make it observable.
             "snapshot_path": .string(usedBoundedSnapshot ? "bounded" : "full"),
+            // Where the time actually went. fetch_ms is the AX round trip into
+            // the target app; render_ms is walking that tree and building the
+            // text. They have different fixes — a slow fetch means the app's
+            // hierarchy is huge (cap depth/children, or relaunch to drop
+            // accumulated rows), a slow render means too many nodes are being
+            // written out (filter, or visible_only).
+            "timing": .object([
+                "fetch_ms": .int(Int(fetchMs.rounded())),
+                "render_ms": .int(Int(renderMs.rounded())),
+            ]),
+            "max_children_used": .int(childrenUsed),
+            // Always reported, not just when the fallback fires: without it there
+            // is no way to tell "the trigger decided the tree was fine" from "the
+            // trigger never ran", which is exactly the ambiguity that hid a bug here.
+            "ax_coverage": .double((visibleLabelledCoverage(body) * 100).rounded() / 100),
+            // Which channel produced the tree. NOT named "source": that key is
+            // already the tree TEXT in this same dictionary, and a duplicate key
+            // in a Swift dictionary literal is a runtime trap — it crashed the
+            // runner outright (EXC_BREAKPOINT in Dictionary.init(dictionaryLiteral:))
+            // on the first page_source after the tag was added.
+            "source_channel": .string("ax"),
         ]
+        if usedBoundedSnapshot {
+            iCTRLUITests.logBuffer.append(
+                "🌲 page_source fetch=\(Int(fetchMs.rounded()))ms render=\(Int(renderMs.rounded()))ms "
+                + "nodes=\(count)\(boundedTruncated ? " TRUNCATED" : "")"
+                + " mc=\(childrenUsed)\(ladderSteps.count > 1 ? "[\(ladderSteps.joined(separator: " "))]" : "")"
+                + (cmd.visibleOnly == true ? " visible_only" : "")
+                + (filter.active ? " filtered" : ""))
+        }
+
+        // The one failure mode this whole path can still hit, and the only one
+        // that is silent: a long list whose rows are ALL above the viewport in
+        // the returned tree. Measured on a scrolled WeChat chat list — the 2000
+        // element cap is consumed by offscreen rows before the visible ones are
+        // reached, so the caller gets a healthy-looking tree with zero on-screen
+        // rows, `truncated` false, and no error. Say so explicitly, because the
+        // natural (wrong) conclusion is "the screen is empty".
+        if usedBoundedSnapshot, cmd.visibleOnly != true,
+           let probe = Self.underFetchProbe(body, requested: childrenUsed),
+           probe.lastBottom < 0 {
+            let rowsShort = probe.rowHeight > 0 ? abs(probe.lastBottom) / probe.rowHeight : 0
+            result["viewport_warning"] = .string(
+                "The list rows in this tree all sit ABOVE the screen (lowest row ends "
+                + "\(abs(probe.lastBottom))pt above the top"
+                + (rowsShort > 0 ? ", roughly \(rowsShort) rows short" : "") + "). "
+                + "The rows you can actually see were not reached"
+                + (probe.saturated
+                    ? " — the container returned everything it has, so raising max_children will NOT help; "
+                      + "the element cap is what ran out. Raise max_elements, or pass visible_only:true "
+                      + "(it keeps on-screen rows within the same budget)."
+                    : " — raise max_children.")
+                + " Do NOT conclude the screen is empty from this tree."
+                + " Fastest recovery: screen_text — it OCRs the screenshot, which does not go"
+                + " through the accessibility channel at all. Measured on this exact case it read"
+                + " ~5x more on-screen text than the tree, in ~700ms.")
+        }
+
+        // Same advice, one step earlier: a tree that is technically fine but
+        // nearly empty on a page the user can see content on. Measured: a
+        // scrolled WeChat list yields 6 visible labels via the tree vs 35 via
+        // OCR. Without this a caller reasonably concludes the screen is bare.
+        if usedBoundedSnapshot, result["viewport_warning"] == nil, count > 0 {
+            let visibleLabeled = body.split(separator: "\n").filter {
+                $0.contains(", label: '") || $0.contains(", value: '")
+            }.count
+            if visibleLabeled < 10, count > 50 {
+                result["sparse_hint"] = .string(
+                    "Only \(visibleLabeled) labelled nodes here despite \(count) nodes total — typical of a "
+                    + "recycling list that keeps its rows out of the accessibility tree. If the screen looks "
+                    + "fuller than this, call screen_text (OCR of the screenshot, ~700ms, bypasses accessibility).")
+            }
+        }
+        // OCR fallback: only present when the accessibility tree came back with
+        // nothing on screen. Same item shape as find_element/screen_text, each
+        // tagged source:"ocr", so it can be used directly — tap{x:center_x,
+        // y:center_y} — without a second code path.
+        if let ocr = ocrFallback {
+            result["ocr_items"] = .array(ocr.items)
+            result["ocr_count"] = .int(ocr.items.count)
+            result["ocr_timing"] = .object([
+                "screenshot_ms": .int(Int(ocr.shotMs.rounded())),
+                "ocr_ms": .int(Int(ocr.ocrMs.rounded())),
+            ])
+            let axCoverage = visibleLabelledCoverage(body)
+            result["ocr_reason"] = .string(
+                axCoverage < 0.05
+                ? "The accessibility tree returned NO on-screen content, so the screen was read by OCR instead. "
+                  + "Use ocr_items (coordinates are in points; tap{x:center_x,y:center_y}). "
+                  + "They carry no `ref` and go stale on scroll, so act on them immediately."
+                : "The tree covers only \(Int(axCoverage * 100))% of the content area — below the 15% bar, so the "
+                  + "screen was ALSO read by OCR. Compare the two: the tree has real types and refs, OCR has "
+                  + "labelled on-screen nodes, which is what the tree above describes. OCR is included as a "
+                  + "cross-check — prefer the tree items, they have real types and support refs.")
+        }
         if filter.active { result["filtered"] = .bool(true) }
         if let bid = inspectedBundleId {
             result["bundle_id"] = .string(bid)
+            // Say it up front, while the caller is still deciding how to locate
+            // things — otherwise they burn a find_element round trip discovering
+            // the page simply isn't in this tree.
+            if Self.webViewHostBundleIds.contains(bid) {
+                result["warning"] = .string(
+                    "This is a BROWSER. The tree below is browser chrome ONLY — web page content " +
+                    "(links, buttons, text inside the page) is not exposed to the accessibility tree and is absent here. " +
+                    "Do not expect find_element to match anything in the page. " +
+                    "To act on the page: screenshot → locate the target visually → divide pixel coords by that " +
+                    "response's `scale` → tap{x,y}."
+                )
+            }
         } else {
             result["bundle_id"] = .string("com.apple.springboard")
             result["warning"] = .string(
@@ -1967,7 +2301,7 @@ class ActionHandler {
     /// 100 cut every page of a scrolled X timeline (8 of 9 reads came back
     /// truncated), because a feed keeps hundreds of rendered rows under one
     /// container. 500 clears that; the cost is bounded by max_elements anyway.
-    static let maxChildrenPerNode = 500
+    static let maxChildrenPerNode = 1000
 
     private struct SnapshotFilter {
         let type: String?       // element type name substring (e.g. "button")
@@ -1993,6 +2327,261 @@ class ActionHandler {
             }
             return true
         }
+
+        /// Same predicate, against one ALREADY-RENDERED line from the bounded
+        /// fetch. The bounded path is ~2x faster than the protocol walk but hands
+        /// back text, not snapshots — so a filter used to disable it entirely and
+        /// pay full price to return FEWER nodes. Matching the rendered line keeps
+        /// the fast path.
+        ///
+        /// Line shape (see ICTRLRenderNode): `<indent>Type, label: '…', value: '…', id: '…', {{x, y}, {w, h}}`
+        /// Only the type name is positional; the rest are optional named parts.
+        func matchesRenderedLine(_ line: String) -> Bool {
+            let trimmed = line.drop { $0 == " " }
+            let typeName = trimmed.prefix { $0 != "," }.lowercased()
+            if let t = type, !typeName.contains(t.lowercased()) { return false }
+
+            // Field extraction must not fall back to the whole line: a `type`
+            // filter would then match the frame digits, and a `label` filter
+            // would match an id it was never meant to see.
+            func field(_ name: String) -> String {
+                guard let r = line.range(of: ", \(name): '") else { return "" }
+                let rest = line[r.upperBound...]
+                guard let end = rest.range(of: "'") else { return "" }
+                return String(rest[..<end.lowerBound])
+            }
+            let label = field("label")
+            let value = field("value")
+            let ident = field("id")
+
+            if let l = self.label {
+                if !(label + " " + value).lowercased().contains(l.lowercased()) { return false }
+            }
+            if let tx = self.text {
+                if !(label + " " + value + " " + ident).lowercased().contains(tx.lowercased()) { return false }
+            }
+            return true
+        }
+    }
+
+    /// Escalation ladder for the adaptive `max_children` fetch.
+    ///
+    /// Starts small because the measured distribution is strongly BIMODAL: across
+    /// 20 apps x 2 screens, 38 of 40 samples had at most 36 direct children in
+    /// their largest scrollable container (median 10) — WeChat's chat list was the
+    /// lone outlier at 392. So a small first fetch satisfies almost everything,
+    /// and only the outliers pay for a second round.
+    ///
+    /// The jumps are large because there is NO caching on the accessibility side:
+    /// measured, fetching mc=400 costs the same (~600ms) whether or not mc=800
+    /// was just fetched, and ascending/descending sweeps are symmetric. A refetch
+    /// is therefore paid in full, which rules out cautious doubling — few, big
+    /// steps beat many small ones.
+    private static let childrenLadder = [50, 500, 1000, 2000]
+
+    /// How many LABELLED nodes in this rendered tree actually intersect the
+    /// screen — i.e. how much of it a caller could act on.
+    ///
+    /// This is the escalation trigger. Node count alone is useless here: a
+    /// scrolled chat list happily returns 2000 nodes with zero on-screen rows,
+    /// which reads as success everywhere except this measure.
+    private func visibleLabelledCount(_ body: String) -> Int {
+        let w = pointSize.width, h = pointSize.height
+        // Chrome bands: the nav/status area and the tab bar. Their labels are
+        // ALWAYS present (app title, search, tab names) whether or not any real
+        // content came back, so counting them hides the exact failure this
+        // measure exists to catch. Measured on a scrolled WeChat list: 8 visible
+        // labels, every one chrome (微信/搜索/快捷操作/标签页栏/通讯录/发现),
+        // zero conversations — while OCR read 34 texts including 10 real rows.
+        //
+        // The bounds are READ FROM THE TREE, not hardcoded: they differ per
+        // device (screen height, presence of a home indicator) and per app
+        // (measured: WeChat nav 62..106 + tab 780..873; RED tab 796..874 and no
+        // nav bar at all). A fixed inset would be wrong on the next device or
+        // the next app, and wrong silently.
+        var topChrome = 0.0
+        var bottomChrome = h
+        for line in body.split(separator: "\n") {
+            let t = line.drop { $0 == " " }
+            let isNav = t.hasPrefix("NavigationBar,") || t.hasPrefix("StatusBar,")
+            let isTab = t.hasPrefix("TabBar,")
+            guard isNav || isTab else { continue }
+            guard let r = line.range(of: "{{"),
+                  let end = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { continue }
+            let f = line[r.lowerBound..<end.upperBound]
+                .split(whereSeparator: { !"-0123456789".contains($0) }).compactMap { Double($0) }
+            guard f.count >= 4, f[3] > 0 else { continue }
+            let (top, bottom) = (f[1], f[1] + f[3])
+            // A bar spanning most of the screen is a container mislabelled as
+            // chrome (Settings reports a Toolbar covering 0..874); honouring it
+            // would exclude the whole screen and make this count always zero.
+            guard f[3] < h * 0.4 else { continue }
+            if isNav, bottom > topChrome, top < h * 0.3 { topChrome = bottom }
+            if isTab, top < bottomChrome, bottom > h * 0.7 { bottomChrome = top }
+        }
+        var n = 0
+        for line in body.split(separator: "\n") {
+            guard line.contains(", label: '") || line.contains(", value: '") else { continue }
+            guard let r = line.range(of: "{{"),
+                  let end = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { continue }
+            let nums = line[r.lowerBound..<end.upperBound]
+                .split(whereSeparator: { !"-0123456789".contains($0) }).compactMap { Double($0) }
+            guard nums.count >= 4 else { continue }
+            let (x, y, ww, hh) = (nums[0], nums[1], nums[2], nums[3])
+            guard ww > 0, hh > 0, x < w, y < h, x + ww > 0, y + hh > 0 else { continue }
+            // Count only what sits in the CONTENT band.
+            let mid = y + hh / 2
+            if mid > topChrome, mid < bottomChrome { n += 1 }
+        }
+        return n
+    }
+
+    /// Fraction of the CONTENT area (screen minus nav/tab chrome) covered by
+    /// labelled nodes the caller could act on, 0...1.
+    ///
+    /// This is the fallback trigger, in preference to a node count: a count needs
+    /// a threshold that is really a guess about screen size and list density,
+    /// whereas a ratio is dimensionless and so travels across devices and apps
+    /// unchanged. It also catches the case a count misses — a handful of labels
+    /// that happen to exist while the body of the screen is empty.
+    ///
+    /// Overlapping rects are unioned on a coarse grid rather than summed: chat
+    /// rows stack a cell, its title and its subtitle at the same place, and
+    /// adding those areas up reports >100% coverage on a screen showing nothing.
+    private func visibleLabelledCoverage(_ body: String) -> Double {
+        let w = pointSize.width, h = pointSize.height
+        var topChrome = 0.0
+        var bottomChrome = h
+        for line in body.split(separator: "\n") {
+            let t = line.drop { $0 == " " }
+            let isNav = t.hasPrefix("NavigationBar,") || t.hasPrefix("StatusBar,")
+            let isTab = t.hasPrefix("TabBar,")
+            guard isNav || isTab else { continue }
+            guard let r = line.range(of: "{{"),
+                  let end = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { continue }
+            let f = line[r.lowerBound..<end.upperBound]
+                .split(whereSeparator: { !"-0123456789".contains($0) }).compactMap { Double($0) }
+            guard f.count >= 4, f[3] > 0, f[3] < h * 0.4 else { continue }
+            if isNav, f[1] + f[3] > topChrome, f[1] < h * 0.3 { topChrome = f[1] + f[3] }
+            if isTab, f[1] < bottomChrome, f[1] + f[3] > h * 0.7 { bottomChrome = f[1] }
+        }
+        let contentTop = topChrome, contentBottom = bottomChrome
+        let contentH = max(contentBottom - contentTop, 1)
+
+        // 16x32 occupancy grid over the content band — enough resolution to tell
+        // "a few scattered labels" from "the screen is full", without the cost of
+        // real polygon union.
+        let cols = 16, rows = 32
+        var grid = [Bool](repeating: false, count: cols * rows)
+        for line in body.split(separator: "\n") {
+            guard line.contains(", label: '") || line.contains(", value: '") else { continue }
+            guard let r = line.range(of: "{{"),
+                  let end = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { continue }
+            let f = line[r.lowerBound..<end.upperBound]
+                .split(whereSeparator: { !"-0123456789".contains($0) }).compactMap { Double($0) }
+            guard f.count >= 4, f[2] > 0, f[3] > 0 else { continue }
+            // Skip labelled nodes that span (nearly) the whole screen. They are
+            // containers — an Application/Window element carrying the app's name,
+            // or a full-bleed backdrop — not things a caller can act on. Measured:
+            // a scrolled WeChat list returns `微信` with h=874, and that single
+            // node filled the entire occupancy grid, pinning coverage at 100% and
+            // stopping the OCR fallback from EVER firing, on every app.
+            guard f[2] < w * 0.98 || f[3] < h * 0.8 else { continue }
+            let x0 = max(f[0], 0), y0 = max(f[1], contentTop)
+            let x1 = min(f[0] + f[2], w), y1 = min(f[1] + f[3], contentBottom)
+            guard x1 > x0, y1 > y0 else { continue }
+            let c0 = Int((x0 / w) * Double(cols)), c1 = Int(((x1 / w) * Double(cols)).rounded(.up))
+            let r0 = Int(((y0 - contentTop) / contentH) * Double(rows))
+            let r1 = Int((((y1 - contentTop) / contentH) * Double(rows)).rounded(.up))
+            for rr in max(r0, 0)..<min(max(r1, r0 + 1), rows) {
+                for cc in max(c0, 0)..<min(max(c1, c0 + 1), cols) { grid[rr * cols + cc] = true }
+            }
+        }
+        return Double(grid.filter { $0 }.count) / Double(cols * rows)
+    }
+
+    /// Worst (smallest) bottom edge among the direct children of any scrollable
+    /// container, plus whether that container returned fewer children than asked.
+    ///
+    /// This is the under-fetch signal. It must be computed PER CONTAINER: a global
+    /// "does anything reach the viewport" test always passes, because the nav bar,
+    /// tab bar and window span the screen no matter how little list content came
+    /// back — verified, it reported success even when zero rows were on screen.
+    private static func underFetchProbe(_ body: String, requested: Int)
+        -> (underFetched: Bool, saturated: Bool, lastBottom: Int, rowHeight: Int)? {
+        let lines = body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        func indent(_ s: String) -> Int { s.prefix { $0 == " " }.count / 2 }
+        func frame(_ s: String) -> (x: Int, y: Int, w: Int, h: Int)? {
+            guard let r = s.range(of: "{{"), let end = s.range(of: "}}", range: r.lowerBound..<s.endIndex)
+            else { return nil }
+            let nums = s[r.lowerBound..<end.upperBound]
+                .split(whereSeparator: { !"-0123456789".contains($0) })
+                .compactMap { Int($0) }
+            guard nums.count >= 4 else { return nil }
+            return (nums[0], nums[1], nums[2], nums[3])
+        }
+
+        var result: (Bool, Bool, Int, Int)?
+        for (i, line) in lines.enumerated() {
+            let t = line.drop { $0 == " " }
+            guard t.hasPrefix("Table,") || t.hasPrefix("CollectionView,") || t.hasPrefix("ScrollView,")
+            else { continue }
+            let depth = indent(line)
+            var kids: [(x: Int, y: Int, w: Int, h: Int)] = []
+            var j = i + 1
+            while j < lines.count, indent(lines[j]) > depth {
+                if indent(lines[j]) == depth + 1, let f = frame(lines[j]) { kids.append(f) }
+                j += 1
+            }
+            // Containers with a couple of children are chrome, not a feed.
+            guard kids.count >= 3 else { continue }
+            let lastBottom = kids.map { $0.y + $0.h }.max() ?? 0
+            let heights = kids.map { $0.h }.filter { $0 > 0 }.sorted()
+            let rowH = heights.isEmpty ? 0 : heights[heights.count / 2]
+            // Fewer children than requested means the container is exhausted —
+            // asking for more cannot return more, so the ladder must stop.
+            let saturated = kids.count < requested
+            let under = lastBottom < 0
+            if result == nil || lastBottom < result!.2 {
+                result = (under, saturated, lastBottom, rowH)
+            }
+        }
+        return result
+    }
+
+    /// Apply a filter to bounded-fetch output, preserving the ancestor path of
+    /// every match so the result reads as a tree rather than a flat list — the
+    /// same contract `renderSnapshotInto` provides on the protocol path.
+    private static func filterRenderedTree(_ body: String, filter: SnapshotFilter) -> (text: String, count: Int) {
+        guard filter.active else { return (body, body.isEmpty ? 0 : body.split(separator: "\n").count) }
+        let lines = body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var keep = [Bool](repeating: false, count: lines.count)
+
+        func indent(_ s: String) -> Int { s.prefix { $0 == " " }.count }
+
+        for (i, line) in lines.enumerated() where filter.matchesRenderedLine(line) {
+            keep[i] = true
+            // Walk back up marking each strictly-shallower ancestor, so the
+            // match keeps its context instead of appearing at the root.
+            var need = indent(line)
+            guard need > 0 else { continue }
+            var j = i - 1
+            while j >= 0, need > 0 {
+                let ind = indent(lines[j])
+                if ind < need { keep[j] = true; need = ind }
+                j -= 1
+            }
+        }
+
+        var out: [String] = []
+        var matched = 0
+        for (i, line) in lines.enumerated() where keep[i] {
+            out.append(line)
+            if filter.matchesRenderedLine(line) { matched += 1 }
+        }
+        // Count reports MATCHES, not emitted lines — ancestors are context, and
+        // counting them would inflate "how many buttons are on screen".
+        return (out.joined(separator: "\n"), matched)
     }
 
     /// Recursively render a snapshot subtree into `lines`. When a filter is
@@ -2003,6 +2592,8 @@ class ActionHandler {
     @discardableResult
     private func renderSnapshotInto(_ s: XCUIElementSnapshot, depth: Int, maxDepth: Int,
                                     maxElements: Int, filter: SnapshotFilter,
+                                    cullToViewport: Bool = false,
+                                    viewportRect: CGRect = .null,
                                     lines: inout [String], localCount: inout Int,
                                     globalCount: inout Int, truncated: inout Bool,
                                     seenFrames: inout Set<String>) -> Bool {
@@ -2016,7 +2607,14 @@ class ActionHandler {
         let key = "\(s.elementType.rawValue)|\(Int(f.minX)),\(Int(f.minY)),\(Int(f.width)),\(Int(f.height))|\(s.label)"
         let isDup = seenFrames.contains(key)
 
-        let selfMatches = !filter.active || filter.matches(s)
+        // Mirror the bounded path's viewport culling so visible_only behaves the
+        // same when the fast fetch falls back — otherwise the flag would silently
+        // do nothing exactly on the pages that most need it.
+        let selfVisible = !cullToViewport || {
+            let fr = s.frame
+            return fr.width > 0 && fr.height > 0 && fr.intersects(viewportRect)
+        }()
+        let selfMatches = (!filter.active || filter.matches(s)) && selfVisible
         var childLines: [String] = []
         var descendantMatched = false
 
@@ -2034,6 +2632,7 @@ class ActionHandler {
                 var subCount = 0
                 let kept = renderSnapshotInto(child, depth: depth + 1, maxDepth: maxDepth,
                                               maxElements: maxElements, filter: filter,
+                                              cullToViewport: cullToViewport, viewportRect: viewportRect,
                                               lines: &sub, localCount: &subCount,
                                               globalCount: &globalCount, truncated: &truncated,
                                               seenFrames: &seenFrames)
@@ -2042,7 +2641,11 @@ class ActionHandler {
         }
 
         // Skip emitting a duplicate leaf, but still surface children that are new.
-        let keep = (!filter.active || selfMatches || descendantMatched) && (!isDup || descendantMatched)
+        // With culling on, an invisible node survives only as the ancestor path
+        // of a visible descendant — never on its own.
+        let gate = cullToViewport ? (selfMatches || descendantMatched)
+                                  : (!filter.active || selfMatches || descendantMatched)
+        let keep = gate && (!isDup || descendantMatched)
         guard keep else { return false }
 
         if !isDup {
@@ -2113,7 +2716,13 @@ class ActionHandler {
     /// Uses native XCUIElement scrolling against the foreground app.
     private func scrollToElement(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let query = cmd.elementId, !query.isEmpty else {
-            return (nil, JSONRPCError(code: -32602, message: "scroll_to_element requires 'element_id' (label, value, or accessibility id to find)", data: nil))
+            return (nil, JSONRPCError(
+                code: -32602,
+                message: "scroll_to_element requires 'element_id' (the label, value, or accessibility id to scroll to). " +
+                    "Next: call page_source to read the available labels, then retry as " +
+                    "scroll_to_element{element_id:\"<label>\", match:\"contains\"}. " +
+                    "Full parameter list: GET /schema.",
+                data: nil))
         }
 
         let bundleId = cmd.bundleId ?? resolveForegroundBundleId()
@@ -2196,12 +2805,16 @@ class ActionHandler {
             lastSig = sig
         }
 
+        let scrollBase = "No \(matchMode == "contains" ? "" : "exact ")match for '\(query)'" +
+            (typeFilter.map { " of type '\($0)'" } ?? "") +
+            " after \(actualSwipes) swipes \(direction)" +
+            (reachedEnd ? " (reached the end of scrollable content)" : "")
+        if foregroundIsWebViewHost() {
+            return (nil, JSONRPCError(code: -32602, message: scrollBase + "." + Self.webViewAdvice, data: nil))
+        }
         return (nil, JSONRPCError(
             code: -32602,
-            message: "No \(matchMode == "contains" ? "" : "exact ")match for '\(query)'" +
-                (typeFilter.map { " of type '\($0)'" } ?? "") +
-                " after \(actualSwipes) swipes \(direction)" +
-                (reachedEnd ? " (reached the end of scrollable content)" : "") +
+            message: scrollBase +
                 ". Tips: the label may contain hidden/formatting characters — copy it exactly from page_source, or use match:'contains'. Also try the opposite direction, or add element_type.",
             data: nil
         ))
@@ -2587,19 +3200,212 @@ class ActionHandler {
         return String(String.UnicodeScalarView(stripped)).trimmingCharacters(in: .whitespaces)
     }
 
+    /// OCR the screen and return text boxes in the SAME shape find_element uses.
+    ///
+    /// Exists for one failure mode the accessibility path cannot recover from: a
+    /// long recycling list whose on-screen rows never make it into the tree. On a
+    /// scrolled WeChat chat list every route — default, max_children up to 1000,
+    /// even a saturated container — returned ZERO on-screen cells, because the
+    /// element budget is spent on offscreen rows before the visible ones are
+    /// reached. Screenshots do not go through the accessibility channel at all,
+    /// so they still work when that channel gives nothing useful.
+    ///
+    /// Deliberately mirrors find_element's keys (x/y/width/height/center_x/
+    /// center_y/label/element_type) so a caller can feed a hit straight into
+    /// tap{x,y} without a second code path.
+    ///
+    /// What it CANNOT give you: `ref` (so no scroll/animation-stable handle),
+    /// `identifier`, or the real element type — everything here is typed
+    /// "OCRText". It also only sees rendered text: icon-only buttons and image
+    /// content are invisible to it, which is exactly where accessibility labels
+    /// are most valuable. Treat it as a fallback, not a replacement.
+    /// Convert Vision results into the shared item shape.
+    ///
+    /// Vision's box is normalised with the ORIGIN AT BOTTOM-LEFT while iOS points
+    /// are top-left, so y is flipped here. Getting that wrong is quietly awful:
+    /// every coordinate still looks plausible, but taps land mirrored about the
+    /// middle of the screen.
+    private func ocrItems(from request: VNRecognizeTextRequest, minConfidence: Float) -> [JSONValue] {
+        let frame = pointSize
+        var items: [JSONValue] = []
+        for obs in (request.results ?? []) {
+            guard let top = obs.topCandidates(1).first, top.confidence >= minConfidence else { continue }
+            let b = obs.boundingBox
+            let x = b.minX * frame.width
+            let w = b.width * frame.width
+            let h = b.height * frame.height
+            let y = (1 - b.maxY) * frame.height
+            items.append(.object([
+                "label": .string(top.string),
+                "confidence": .double(Double(top.confidence)),
+                "x": .double(x.rounded()), "y": .double(y.rounded()),
+                "width": .double(w.rounded()), "height": .double(h.rounded()),
+                "center_x": .double((x + w / 2).rounded()),
+                "center_y": .double((y + h / 2).rounded()),
+                "element_type": .string("OCRText"),
+                "source": .string("ocr"),
+                "is_text_input": .bool(false), "exists": .bool(true),
+            ]))
+        }
+        return items
+    }
+
+    /// Run OCR and return the items plus timings. Shared by `screen_text` and by
+    /// page_source's automatic fallback, so both produce identical item shapes.
+    private func runOCR(query: String?, fast: Bool, minConfidence: Float)
+        -> (items: [JSONValue], shotMs: Double, ocrMs: Double)? {
+        let frame = pointSize
+        var image: UIImage?
+        let shotStart = nowMonotonic
+        _ = ObjCException.catching { image = XCUIScreen.main.screenshot().image }
+        let shotMs = (nowMonotonic - shotStart) * 1000
+        guard let cg = image?.cgImage else { return nil }
+
+        let ocrStart = nowMonotonic
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = fast ? .fast : .accurate
+        request.usesLanguageCorrection = false
+        request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+        if let q = query, !q.isEmpty { request.customWords = [q] }
+        let handler = VNImageRequestHandler(cgImage: cg, orientation: .up, options: [:])
+        do { try handler.perform([request]) } catch { return nil }
+        let ocrMs = (nowMonotonic - ocrStart) * 1000
+
+        var items: [JSONValue] = []
+        for obs in (request.results ?? []) {
+            guard let top = obs.topCandidates(1).first, top.confidence >= minConfidence else { continue }
+            // Vision's box is normalised with the ORIGIN AT BOTTOM-LEFT; iOS points
+            // are top-left. Flipping y is what makes these coordinates tappable —
+            // get it wrong and every tap lands mirrored about the middle.
+            let b = obs.boundingBox
+            let x = b.minX * frame.width
+            let w = b.width * frame.width
+            let h = b.height * frame.height
+            let y = (1 - b.maxY) * frame.height
+            if let q = query, !q.isEmpty, !top.string.localizedCaseInsensitiveContains(q) { continue }
+            items.append(.object([
+                "label": .string(top.string),
+                "confidence": .double(Double(top.confidence)),
+                "x": .double(x.rounded()), "y": .double(y.rounded()),
+                "width": .double(w.rounded()), "height": .double(h.rounded()),
+                "center_x": .double((x + w / 2).rounded()),
+                "center_y": .double((y + h / 2).rounded()),
+                "element_type": .string("OCRText"),
+                // Which channel produced this item. Both sources use identical
+                // keys so a caller can merge them into one list and still tap
+                // either, but they are NOT interchangeable: "ax" items carry a
+                // usable element_type and can be re-located by ref, "ocr" items
+                // are screen text at a moment in time and go stale on scroll.
+                "source": .string("ocr"),
+                "is_text_input": .bool(false), "exists": .bool(true),
+            ]))
+        }
+        return (items, shotMs, ocrMs)
+    }
+
+    private func screenText(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+        let frame = pointSize
+        var image: UIImage?
+        let shotStart = nowMonotonic
+        // Same capture as `screenshot`: XCUIScreen never blocks on quiescence,
+        // and crucially does NOT go through the accessibility channel — which is
+        // the whole reason this method can succeed when page_source cannot.
+        _ = ObjCException.catching { image = XCUIScreen.main.screenshot().image }
+        let shotMs = (nowMonotonic - shotStart) * 1000
+        guard let cg = image?.cgImage else {
+            return (nil, .serverError("Could not capture the screen for OCR."))
+        }
+
+        let ocrStart = nowMonotonic
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = (cmd.matchMode == "fast") ? .fast : .accurate
+        request.usesLanguageCorrection = false
+        // Chinese first: the lists this exists for are Chinese apps, and Vision
+        // weights by order. Latin stays in so mixed UI still reads.
+        request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+        if let q = cmd.elementId, !q.isEmpty { request.customWords = [q] }
+
+        let handler = VNImageRequestHandler(cgImage: cg, orientation: .up, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            return (nil, .serverError("OCR failed: \(error.localizedDescription)"))
+        }
+        let ocrMs = (nowMonotonic - ocrStart) * 1000
+
+        let minConf = Float(cmd.scale ?? 0.3)
+        var items: [JSONValue] = []
+        for obs in (request.results ?? []) {
+            guard let top = obs.topCandidates(1).first, top.confidence >= minConf else { continue }
+            // Vision's box is normalised with the ORIGIN AT BOTTOM-LEFT; iOS points
+            // are top-left. Flipping y is what makes these coordinates tappable —
+            // get it wrong and every tap lands mirrored about the middle.
+            let b = obs.boundingBox
+            let x = b.minX * frame.width
+            let w = b.width * frame.width
+            let h = b.height * frame.height
+            let y = (1 - b.maxY) * frame.height
+            if let q = cmd.elementId, !q.isEmpty,
+               !top.string.localizedCaseInsensitiveContains(q) { continue }
+            items.append(.object([
+                "label": .string(top.string),
+                "confidence": .double(Double(top.confidence)),
+                "x": .double(x.rounded()),
+                "y": .double(y.rounded()),
+                "width": .double(w.rounded()),
+                "height": .double(h.rounded()),
+                "center_x": .double((x + w / 2).rounded()),
+                "center_y": .double((y + h / 2).rounded()),
+                "element_type": .string("OCRText"),
+                "source": .string("ocr"),
+                "is_text_input": .bool(false),
+                "exists": .bool(true),
+            ]))
+        }
+
+        return ([
+            "count": .int(items.count),
+            "items": .array(items),
+            "coordinate_space": .string("points"),
+            "timing": .object([
+                "screenshot_ms": .int(Int(shotMs.rounded())),
+                "ocr_ms": .int(Int(ocrMs.rounded())),
+            ]),
+            "hint": .string(
+                "OCR of what is RENDERED on screen — independent of the accessibility tree, "
+                + "so it still works when page_source returns no on-screen rows. "
+                + "Tap a result with tap{x:center_x, y:center_y} (already in points). "
+                + "Limits: no `ref` (coordinates go stale on scroll — act immediately), no identifier, "
+                + "and element_type is always 'OCRText', so you cannot tell a button from a label. "
+                + "Text-only: icon buttons and images are invisible here. "
+                + "Prefer find_element when the accessibility tree has the element."),
+        ], nil)
+    }
+
     private func findElementInfo(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let elementId = cmd.elementId else {
-            return (nil, JSONRPCError(code: -32602, message: "find_element requires 'element_id' (accessibility label or identifier)", data: nil))
+            return (nil, JSONRPCError(
+                code: -32602,
+                message: "find_element requires 'element_id' (the accessibility label or identifier to search for). " +
+                    "'element_type' alone is only a filter and cannot select an element by itself. " +
+                    "Next: call page_source to read the visible labels, then retry as " +
+                    "find_element{element_id:\"<label>\", element_type:\"textfield\", match:\"contains\"}. " +
+                    "Full parameter list: GET /schema.",
+                data: nil))
         }
 
         let matchMode = (cmd.matchMode ?? "exact").lowercased()
         guard let (element, match, index) = locateElement(query: elementId, type: cmd.elementType,
                                                           bundleId: cmd.bundleId, matchMode: matchMode) else {
             if let err = lastLocateError { return (nil, err) }
+            let base = "No element matching label/id '\(elementId)'" +
+                (cmd.elementType.map { " of type '\($0)'" } ?? "")
+            if foregroundIsWebViewHost() {
+                return (nil, JSONRPCError(code: -32602, message: base + "." + Self.webViewAdvice, data: nil))
+            }
             return (nil, JSONRPCError(
                 code: -32602,
-                message: "No element matching label/id '\(elementId)'" +
-                    (cmd.elementType.map { " of type '\($0)'" } ?? "") +
+                message: base +
                     ". It may be off-screen (use scroll_to_element), or the label differs from on-screen text — check page_source. Try match:'contains'.",
                 data: nil
             ))
@@ -2636,7 +3442,7 @@ class ActionHandler {
         // matched a button (the classic "fake search bar" trap).
         if !isTextInput, (element.elementType == .button || element.elementType == .staticText || element.elementType == .other) {
             result["note"] = .string(
-                "This is a \(typeName), NOT a text field. If you're trying to type/search: tap it to open the search page, wait ~1s for it to load and the keyboard to appear, then find_element{element_type:\"textfield\"} to locate the REAL input field before typing."
+                "This is a \(typeName), NOT a text field. If you're trying to type/search: tap it to open the search page, wait ~1s for it to load and the keyboard to appear, then locate the REAL input field with find_element{element_id:\"<its placeholder text>\", element_type:\"textfield\", match:\"contains\"} before typing. (element_id is required — element_type alone only filters.)"
             )
         }
         return (result, nil)

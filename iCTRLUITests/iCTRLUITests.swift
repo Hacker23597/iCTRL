@@ -848,6 +848,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         "config", "reset", "is_locked",
         "resolve_app", "search_app", "search_apps",
         "list_apps", "installed_apps",
+        // Class-metadata introspection only — takes no snapshot, touches no
+        // element. Belongs here precisely because you want to run it WHILE the
+        // UI channel is wedged, to find out what the snapshot API supports.
+        "snapshot_api",
     ]
 
     /// Compact one-line summary of the most useful params for the request log.
