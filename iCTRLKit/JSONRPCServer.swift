@@ -714,7 +714,7 @@ class JSONRPCServer {
             sendAuthError(connection, status: status, code: failure.code, message: failure.message)
             return
         } catch {
-            sendAuthError(connection, status: 401, code: "auth_failed", message: "Authentication failed")
+            sendAuthError(connection, status: 401, code: "auth_failed", message: "Authentication failed — this key is not usable. Re-pair to continue: POST /pair (the device user must tap Allow). Note a key is dropped after 30 days with no successful call, so a long-idle client must re-pair. If instead the clock is off you would get ts_skew, not this.")
             return
         }
 

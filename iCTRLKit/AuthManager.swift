@@ -163,7 +163,10 @@ class AuthManager {
             // Deliberately the SAME code/message as every other pre-MAC
             // rejection: distinct codes here would let an unauthenticated
             // caller enumerate which token ids exist and which are live.
-            throw SecureEnvelope.Failure(code: "auth_failed", message: "Authentication failed")
+            // The shared text may say what to DO (re-pair) but must never say
+            // WHY this particular call failed — "no such token" and "expired"
+            // have to stay indistinguishable from outside.
+            throw SecureEnvelope.Failure(code: "auth_failed", message: "Authentication failed — this key is not usable. Re-pair to continue: POST /pair (the device user must tap Allow). Note a key is dropped after 30 days with no successful call, so a long-idle client must re-pair. If instead the clock is off you would get ts_skew, not this.")
         }
         let now = Date()
         if now.timeIntervalSince(session.lastActiveAt) > Self.inactivityWindow {
@@ -172,7 +175,7 @@ class AuthManager {
             seenNonces.removeValue(forKey: p.tokId)
             lock.unlock()
             persist()
-            throw SecureEnvelope.Failure(code: "auth_failed", message: "Authentication failed")
+            throw SecureEnvelope.Failure(code: "auth_failed", message: "Authentication failed — this key is not usable. Re-pair to continue: POST /pair (the device user must tap Allow). Note a key is dropped after 30 days with no successful call, so a long-idle client must re-pair. If instead the clock is off you would get ts_skew, not this.")
         }
         guard abs(now.timeIntervalSince1970 - Double(p.ts)) <= SecureEnvelope.timestampWindow else {
             // Kept distinct: a client with a skewed clock must be told to fix
@@ -181,7 +184,7 @@ class AuthManager {
             throw SecureEnvelope.Failure(code: "ts_skew", message: "Timestamp outside ±120s window")
         }
         guard let key = session.key else {
-            throw SecureEnvelope.Failure(code: "auth_failed", message: "Authentication failed")
+            throw SecureEnvelope.Failure(code: "auth_failed", message: "Authentication failed — this key is not usable. Re-pair to continue: POST /pair (the device user must tap Allow). Note a key is dropped after 30 days with no successful call, so a long-idle client must re-pair. If instead the clock is off you would get ts_skew, not this.")
         }
 
         let plaintext = try SecureEnvelope.open(p, key: key)
