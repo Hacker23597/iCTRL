@@ -22,6 +22,11 @@ RUNNER_IPA    = iCTRLUITests-Runner.ipa
 # ──────────────────────────────────────────────
 build: Frameworks/IDevice.xcframework
 build:
+	@# Stamp BEFORE xcodebuild, not inside it. As an Xcode pre-build phase the
+	@# generated file is written after the Swift compile has already read it, so
+	@# the binary ships the PREVIOUS stamp — exactly the "is my change deployed?"
+	@# ambiguity this is meant to remove.
+	@./Scripts/stamp-build.sh
 	xcodebuild build-for-testing \
 		-project $(PROJECT) \
 		-derivedDataPath $(DERIVED_DATA) \
