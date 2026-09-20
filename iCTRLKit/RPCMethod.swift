@@ -71,14 +71,14 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "screenshot",
-            description: "Capture a screenshot as base64 JPEG (default) or PNG. SECOND CHOICE after page_source — use when you need visual detail or an element is absent from the view tree. By default captures the WHOLE SCREEN (fast, ~0.4s). Pass bundle_id ONLY if you specifically want just one app's window cropped out (slower; time-bounded with a full-screen fallback). Image is in PIXELS; tap coordinates are in POINTS. Optional 'scale' controls output resolution (default 2, max 3, e.g. 1, 0.5).",
+            description: "Capture a screenshot as base64 JPEG (default) or PNG. SECOND CHOICE, not your default way of seeing the screen — reach for page_source{visible_only:true} first: it is usually faster (~100ms vs ~150ms), far smaller, and gives every element's type, label and exact frame. To ACT on a control, prefer find_element{element_id} → tap{ref}: a ref re-resolves the live element, survives scroll/animation, and avoids the pixel→point conversion that coordinate taps require (a conversion that silently mis-taps when it goes wrong). Use a screenshot when the tree genuinely cannot answer: unlabelled/icon-only controls, visual layout judgements, confirming an action landed, or when page_source returns sparse data (see its ax_coverage / sparse_hint / viewport_warning) — most often a WEB VIEW, whose page content never enters the accessibility tree. Captures the WHOLE SCREEN by default; pass bundle_id only to crop one app's window (slower). Image is in PIXELS, taps are in POINTS. Optional 'scale' (default 2, max 3).",
             params: [
                 RPCParamDef(name: "scale", type: "number", required: false, description: "Output pixels-per-point (default 2, max 3; smaller = faster/less detail, e.g. 1 or 0.5)"),
                 RPCParamDef(name: "bundle_id", type: "string", required: false, description: "Crop to just this app's window (slower, time-bounded). OMIT for the default full-screen capture (fast) — the default is NOT scoped to the launched app."),
                 RPCParamDef(name: "format", type: "string", required: false, description: "'jpeg' (default) or 'png'. JPEG is 5-10x smaller, which cuts BOTH transfer and the client's envelope decryption time — response size dominates a screenshot's end-to-end cost. Use 'png' only when you need lossless output (pixel diffing, OCR on fine text)."),
                 RPCParamDef(name: "quality", type: "number", required: false, description: "JPEG quality 0.1-1.0 (default 0.6). Ignored for PNG. Lower = smaller/faster."),
             ],
-            returns: "Object: {data: base64 image, format:'jpeg'|'png', bytes, quality?, pixel_width, pixel_height, point_width, point_height, scale, scope:'screen'|'app', scoped_to?, hint}"
+            returns: "Object: {data: base64 image, format:'jpeg'|'png', bytes, quality?, pixel_width, pixel_height, point_width, point_height, scale, scope:'screen'|'app', scoped_to?, hint, prefer_instead}. `hint` carries the pixel→point conversion for THIS image; `prefer_instead` says when find_element/page_source would have served you better — read it before tapping from the image."
         ),
         RPCMethodDef(
             name: "tap",
@@ -130,7 +130,7 @@ struct RPCMethodRegistry {
             description: "Scroll by one screenful — like Page Down / Page Up on a keyboard. This is the RECOMMENDED way to read through a long page: it's PRECISE (no momentum/overshoot), so you won't skip content the way swipe with velocity:'fast' does. Use {\"direction\":\"down\"} (default, reveal content below) or {\"direction\":\"up\"}; the aliases page_down / page_up force the direction. After paging, re-read with page_source or screenshot. To jump straight to a known element, prefer scroll_to_element.",
             params: [
                 RPCParamDef(name: "direction", type: "string", required: false, description: "'down' (default, reveal below) or 'up'"),
-                RPCParamDef(name: "distance", type: "number", required: false, description: "Number of screenfuls (default 1; e.g. 0.5 = half a page, 2 = two pages)"),
+                RPCParamDef(name: "distance", type: "number", required: false, description: "Number of screenfuls (default 1; e.g. 0.5 = half a page, 2 = two pages). One screenful travels 70% of the height, leaving ~30% overlap so nothing falls between consecutive reads. Raising this past 1 trades that safety for fewer calls — on a feed, items can then pass between reads with no way to notice."),
             ],
             returns: "{message, screen}"
         ),
@@ -160,7 +160,7 @@ struct RPCMethodRegistry {
             description: "Type text into the focused input field. A text field must already have keyboard focus — tap a real textfield first (see 'searching_and_typing'). Type always runs, but if no keyboard could be confirmed the response includes a 'warning' (keyboard detection can't see all third-party keyboards, so this is advisory, not a failure) — if the text didn't land, re-focus the field and type again. Set clear:true to EMPTY the field before typing (replace its contents); set submit:true to append Return/Search so the field's action (search/go/send) fires. See searching_and_typing guidance for the full search flow.",
             params: [
                 RPCParamDef(name: "text", type: "string", required: true, description: "Text to type (optional if clear:true — then it just empties the field)"),
-                RPCParamDef(name: "clear", type: "boolean", required: false, description: "Empty the field (delete existing text) before typing. Use to REPLACE contents. The field must be focused first."),
+                RPCParamDef(name: "clear", type: "boolean", required: false, description: "Empty the field before typing. Use whenever you are REPLACING contents — typing alone APPENDS, so a search box still holding the last query silently searches the concatenation (measured: '椰子汁' typed into a box holding '黄桃' searched '黄桃椰子汁'). The response carries append_warning when this is detected, but detection needs a readable focused field, so prefer clear:true over relying on it. Field must be focused first."),
                 RPCParamDef(name: "submit", type: "boolean", required: false, description: "Append Return/Search to submit the field (recommended for search boxes)"),
                 RPCParamDef(name: "x", type: "number", required: false, description: "Tap X to focus before typing"),
                 RPCParamDef(name: "y", type: "number", required: false, description: "Tap Y to focus before typing"),
@@ -188,7 +188,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "unlock",
-            description: "Unlock the screen (may fail if passcode is set)",
+            description: "Wake the screen. This presses Home — it does NOT enter a passcode, so on a passcoded device it wakes the display and then fails after ~8s; the user must unlock by hand. It is also not a way to KEEP the screen awake: it only reacts once the device has already locked, by which point UI automation has broken. For a long unattended run, set 自动锁定/Auto-Lock to Never in Settings instead.",
             params: [],
             returns: "{message}"
         ),
@@ -331,7 +331,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.20.0"
+    static let serverVersion = "1.21.0"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///

@@ -1,7 +1,7 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
-skill_version: "1.20.0"
+skill_version: "1.21.0"
 ---
 
 # iCTRL — Control an iPhone over HTTP
@@ -45,7 +45,7 @@ Both speak the identical protocol against the same token store — pick by what 
 
 ## Version check — glance at this on your first `device_info`
 
-This document is **skill_version 1.20.0** (see the frontmatter). Every `device_info` response carries the device's own `skill_version` (same value as `server_version`) plus a `skill_update_hint`.
+This document is **skill_version 1.21.0** (see the frontmatter). Every `device_info` response carries the device's own `skill_version` (same value as `server_version`) plus a `skill_update_hint`.
 
 **This is advisory — a version gap is not an error, and most gaps need no action.** Your installed copy is a snapshot from whenever it was fetched; the device's copy always matches the running build. Use semver to decide whether the difference could actually affect you:
 
@@ -267,12 +267,12 @@ It matters most when a result is **negative or suspiciously empty** — that is 
 4. `type{text:"…", submit:true}` — `submit` appends Return/Search so the field's action fires.
 5. Read results with `page_source` directly.
 - **TRUST the result — do NOT re-type the same text.** If `type` returns success (no error/warning), the text WENT IN. Only re-type when `type` itself returns a "no keyboard/focus" **warning**. A common false-failure trap: after `type{submit}` you read `page_source` and see the OLD content (the search page/results haven't updated yet, or you read a stale home-screen search bar) — that is NOT proof the type failed. Wait ~1s and re-read, or check the results, before ever re-typing. Re-typing the same query is almost always wrong and just doubles the work.
-- Replace existing text: `type{clear:true, text:"…"}` (empties first) or `clear_text`; tap to focus before clearing.
+- **Searching a second time? Use `type{clear:true, text:"…"}`.** Typing APPENDS — a search box still holding the previous query turns "椰子汁" into "黄桃椰子汁" and searches for that, with nothing in the response to say so unless `append_warning` comes back. `clear_text` works too; tap to focus before either.
 - If after `type{submit:true}` the action didn't fire, the field may need its explicit submit/search control tapped instead — `find_element` that control (by its visible label) and `tap{ref}` it, rather than re-typing.
 
 ## Reading long content
 
-- **`page{direction:"down", pages:N}`** — precise one-screen steps, no momentum. This is how you read a feed/detail page predictably.
+- **`page{direction:"down", distance:N}`** — precise steps, no momentum. This is how you read a feed/detail page predictably. Each step moves **70% of the screen**, so consecutive reads overlap by ~30% and an item straddling the boundary is fully visible in one of them. Don't raise `distance` to save calls on a feed: at 1.0 the overlap is already only ~30%, and beyond that items fall between reads unnoticed.
 - **Do NOT use `swipe` to read feeds** — its default ~100pt travel barely moves the page; you'll under-scroll. Reserve `swipe` for carousels / partial drags / pull-to-refresh.
 - **Harvest repeated data cheaply**: when you want many similar values off a page, `page_source{filter:{text:"<substring common to them>"}}` returns only the matching nodes + ancestors — far smaller and easier to parse than the whole tree.
 
@@ -283,6 +283,33 @@ After `launch_app`/`activate_app`, that app is the **sticky target**.
 - **Read-only** methods (page_source, screenshot, find_element) read the CURRENT foreground and do NOT re-activate — so if the bound app got backgrounded and you want to read IT, run one interaction first, or pass an explicit `bundle_id` to the read call.
 - If the bound app **crashed** (state notRunning), interaction methods return a clear error → `launch_app` again.
 - A **system alert/permission dialog** covering the app → read it via `page_source{bundle_id:"com.apple.springboard"}` and tap its button first.
+
+## When to screenshot (and when not to)
+
+Screenshots are the easiest tool to over-use: look at the picture, spot the
+button, convert pixels to points, tap. Every step there can go wrong silently —
+in testing, a tap meant for a search field landed on the nav bar, and a stray tap
+while scrolling added a product to a cart. Neither reported an error.
+
+**To act on a control** → `find_element{element_id:"<label>"}` → `tap{ref}`.
+A `ref` re-resolves the live element, survives scrolling and animation, and needs
+no coordinate maths at all.
+
+**To understand the screen** → `page_source{visible_only:true}`. It returns every
+on-screen element with type, label and exact frame, is usually *faster* than a
+screenshot (~100ms vs ~150ms) and is far smaller.
+
+**Screenshot when the tree genuinely can't answer you:**
+
+- the target has no label — icon-only buttons, images, custom-drawn controls
+- you need a visual judgement (layout, colour, what something looks like)
+- confirming an action actually landed
+- `page_source` came back sparse — check `ax_coverage`, `sparse_hint`,
+  `viewport_warning`. The usual culprit is a **web view**, whose page content
+  never enters the accessibility tree at all.
+
+Every screenshot response carries a `prefer_instead` field saying which of these
+applies.
 
 ## Coordinates
 
@@ -384,7 +411,7 @@ When operating real shopping/payment apps, stop at the cart/checkout — do NOT 
 ## Diagnostics
 
 - **Check `device_info.system` first when something looks wrong.** Besides thermal/CPU/memory/disk/battery it reports:
-  - `screen_locked` — a locked screen is why a screenshot came back black and taps changed nothing. Call `unlock` rather than retrying the tap.
+  - `screen_locked` — a locked screen is why a screenshot came back black and taps changed nothing. Try `unlock`, but note it only presses Home: on a passcoded device it wakes the display and then fails (~8s), and the user has to unlock by hand. Planning a long unattended run? Have the user set Auto-Lock to Never rather than trying to keep the screen alive from here — note too that sleep does NOT stop the runner, so a read-only task still works with the screen off.
   - `foreground_app` — which app your actions are actually hitting. A surprising value here explains most "the element isn't there" reports.
   - `foreground_is_browser` — present and true when the foreground app is a browser, i.e. page content will NOT appear in `page_source` (see *Locating elements*).
 - `GET /logs` — recent in-memory logs (incl. `⏱ ✓ <method> <ms>` timings).
