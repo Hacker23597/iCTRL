@@ -330,7 +330,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 sendNotification(
                     title: L10n.t(.serverReadyTitle),
                     body: L10n.t(.localOnlyBody) + "\n" + L10n.t(.longPressRemoteOrStop),
-                    category: Self.serverReadyCategoryID
+                    category: Self.serverReadyCategoryID,
+                    identifier: Self.serverReadyNotifID
                 )
             }
         } catch {
@@ -395,6 +396,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             self?.handlePendingCallbackIfAny()
         }
         runLoop.add(safetyTimer, forMode: .default)
+        // Keep the status notification reachable (see startStatusRefresh).
+        startStatusRefresh(on: runLoop)
 
         while keepRunning {
             autoreleasepool {
@@ -1358,12 +1361,31 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// removed once access starts working.
     private static let remoteFailedNotifID = "ictrl.remote.failed"
 
+    /// Fixed identifier for the "server is running" notification.
+    ///
+    /// Fixed, because that notification is the control surface: its long-press
+    /// actions are how you toggle remote access or stop the server. Posted under
+    /// a fresh UUID each time it would pile up as duplicates and, worse, sink out
+    /// of reach as other apps deliver — exactly when you want to shut iCTRL off.
+    /// Re-posting under the SAME id replaces the old one and refreshes its
+    /// delivery time, which is what floats it back to the top.
+    private static let serverReadyNotifID = "ictrl.server.ready"
+
     private func sendNotification(title: String, body: String, category: String? = nil,
-                                  identifier: String? = nil) {
+                                  identifier: String? = nil, silent: Bool = false) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        content.sound = .default
+        // Silent refreshes go in the list WITHOUT a banner: .passive is
+        // documented as "Added to the notification list; does not light up
+        // screen or play sound". That matters more than the sound — a banner
+        // appearing every few minutes covers whatever is on screen and invites
+        // a mis-tap, which on a phone being driven by automation is a real way
+        // to break a run.
+        content.sound = silent ? nil : .default
+        if #available(iOS 15.0, *) {
+            content.interruptionLevel = silent ? .passive : .active
+        }
         if let category = category {
             content.categoryIdentifier = category
         }
@@ -1374,6 +1396,54 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false)
         )
         UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Timer that re-posts the status notification so it stays reachable.
+    private var statusRefreshTimer: Timer?
+
+    /// Re-post the status notification on a timer, keeping it near the top of
+    /// Notification Centre and showing live state.
+    ///
+    /// Re-posting under the same identifier replaces the entry and refreshes its
+    /// delivery time, which is what floats it back up. The refresh is `.passive`
+    /// so it never draws a banner or a sound — it only reorders the list.
+    ///
+    /// Five minutes, not one: with no banner the only cost is a list reorder, and
+    /// what actually matters is being near the top WHEN you go looking. Anything
+    /// delivered in between pushes iCTRL down by at most a few rows in that
+    /// window, while a shorter interval just burns wakeups on a run loop that is
+    /// otherwise idle.
+    private func startStatusRefresh(on runLoop: RunLoop) {
+        statusRefreshTimer?.invalidate()
+        let timer = Timer(timeInterval: 300.0, repeats: true) { [weak self] _ in
+            self?.refreshStatusNotification()
+        }
+        // Added to the run loop the runner actually blocks on, in the same mode
+        // as the existing safety timer. `Timer.scheduledTimer` would attach to
+        // whichever run loop the caller happens to be on — which, off the main
+        // thread, is one that never runs, so the timer would never fire.
+        runLoop.add(timer, forMode: .default)
+        statusRefreshTimer = timer
+        Self.logBuffer.append("🔔 status notification refreshes every 5min (passive)")
+    }
+
+    /// Uptime reading captured when the server started, so the status line can
+    /// report how long it has been up.
+    private static var serverStartedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
+
+    private func refreshStatusNotification() {
+        let sessions = AuthManager.shared.activeSessions.count
+        let addr = remoteAccessEnabled ? getDeviceAddress() : "127.0.0.1"
+        let mins = Int(ProcessInfo.processInfo.systemUptime - Self.serverStartedAt) / 60
+        let human = mins < 60 ? "\(mins)m" : "\(mins / 60)h\(mins % 60)m"
+        sendNotification(
+            title: L10n.t(.serverReadyTitle),
+            body: "\(addr):\(server?.port ?? 8200) · \(sessions) client\(sessions == 1 ? "" : "s") · up \(human)"
+                + "\n" + L10n.t(.longPressRemoteOrStop),
+            category: Self.serverReadyCategoryID,
+            identifier: Self.serverReadyNotifID,
+            silent: true
+        )
     }
 
     /// Remove the "Remote Access Failed" notification (pending + already-delivered).
@@ -1424,7 +1494,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 title: L10n.t(.serverReadyTitle),
                 body: addressLines(port: server?.port ?? 8200) + " — "
                       + L10n.t(.onDeviceOnlySuffix) + "\n" + L10n.t(.longPressDisableOrStop),
-                category: Self.serverRemoteCategoryID
+                category: Self.serverRemoteCategoryID,
+                identifier: Self.serverReadyNotifID
             )
         }
     }
@@ -1445,7 +1516,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             sendNotification(
                 title: L10n.t(.remoteDisabledTitle),
                 body: L10n.t(.remoteDisabledBody) + "\n" + L10n.t(.longPressRemoteOrStop),
-                category: Self.serverReadyCategoryID
+                category: Self.serverReadyCategoryID,
+                identifier: Self.serverReadyNotifID
             )
         } catch {
             Self.logBuffer.append("🔴 Failed to disable remote access: \(error)")
