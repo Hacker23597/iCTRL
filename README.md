@@ -315,3 +315,51 @@ Makefile         build + sign + package
 - Synthesized input is indistinguishable from real touches at the system level,
   but that is no guarantee against app-side anti-automation heuristics — apps
   with bot detection may still challenge you.
+
+## Credits & licensing
+
+iCTRL is licensed under the **GNU Affero General Public License v3** (see
+`LICENSE`). Note that §13 covers network use, not just distribution: anyone
+interacting with an iCTRL server over a network is entitled to its source.
+
+This project would not exist without the following work.
+
+| Project | Used for | License |
+|---|---|---|
+| [jkcoxson/idevice](https://github.com/jkcoxson/idevice) | The Rust library doing all the real protocol work behind `iCTRLApp/DDI` — RSD tunnel, lockdownd, AFC, installation_proxy, image mounter. Fetched as an xcframework by `Scripts/fetch-idevice.sh`. | MIT |
+| [StikDebug](https://github.com/StikDebug/StikDebug) (formerly StikJIT) | **The approach this project's DDI mounting is ported from.** Mounting the Developer Disk Image from the device itself, with no privileged entitlement, is StikDebug's idea; `DDIMounter.swift` sequences the same calls. | AGPL-3.0 |
+| [StosVPN](https://github.com/SideStore/StosVPN) / [LocalDevVPN](https://github.com/jkcoxson/LocalDevVPN) | Provides the local tunnel that makes the device's own `remoted` service routable at `10.7.0.1:49152`, which is what lets an on-device app reach its own lockdownd at all. LocalDevVPN is a maintained fork of StosVPN and is what ships on the App Store. | NOASSERTION — check upstream before reuse |
+| [doronz88/DeveloperDiskImage](https://github.com/doronz88/DeveloperDiskImage) | Mirror of the personalized DDI components (`BuildManifest.plist`, `Image.dmg`, `Image.dmg.trustcache`). Apple doesn't publish these for direct download; the same files ship inside Xcode, and you can import your own copy instead. Maintained by the pymobiledevice3 author. | See upstream |
+| [WebDriverAgent](https://github.com/appium/WebDriverAgent) | Prior art for the long-lived XCUITest runner: the `distantFuture` run loop, failure-proof test case, and app-activation handling all follow patterns it established. No code is copied. | Apache-2.0 |
+
+### How the pieces fit
+
+On iOS 17.4+ the developer services (MobileImageMounter, `com.apple.dvt.*`,
+`testmanagerd`) moved behind **RSD (RemoteServiceDiscovery)** — they are no
+longer plain lockdownd ports. Reaching them from the device itself takes four
+layers:
+
+```
+StosVPN / LocalDevVPN   a route to this device's own lockdownd  (NetworkExtension)
+        ↓
+lockdownd               CoreDeviceProxy → CDTunnel handshake
+        ↓
+idevice (Rust, MIT)     RSD over that tunnel, then image_mounter
+        ↓
+DDIMounter.swift        pairing-file auth → RSD connect → personalized mount
+```
+
+The VPN is needed for the *first* step, not for the tunnel: it is not a real VPN
+at all but a packet reflector. It assigns the device `10.7.0.0`, routes only
+`10.7.0.0/24` (the default route is explicitly excluded, so no real traffic is
+captured), and swaps source/destination addresses so that `10.7.0.1` reflects
+back to the device. That exists because an app cannot reach its own lockdownd on
+`127.0.0.1:62078`; the reflected address makes the connection look ordinary and
+inbound. The RSD tunnel itself is implemented in userspace by `idevice` and needs
+no interface of its own.
+
+The pairing file authenticates the conversation — the same credential Xcode on a
+Mac would use. **It must be in RemotePairing (RP) format**: with an older
+lockdown-format file on iOS 17+, service connections die instantly with EPIPE
+while UDID lookups still appear to succeed, which is a confusing way to fail.
+No privileged entitlement is involved anywhere.

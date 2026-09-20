@@ -15,7 +15,11 @@ over the network is entitled to its complete source.
 
 | Component | Upstream | License | Used for |
 |---|---|---|---|
-| `idevice` | FFI used by `iCTRLApp/DDI` | MIT | RSD tunnel, AFC, installation_proxy, image mounter |
+| `idevice` | [jkcoxson/idevice](https://github.com/jkcoxson/idevice) | MIT | RSD tunnel, lockdownd, AFC, installation_proxy, image mounter — all of `iCTRLApp/DDI`'s protocol work |
+| StikDebug | [StikDebug/StikDebug](https://github.com/StikDebug/StikDebug) | AGPL-3.0 | **Approach only, no code copied.** On-device DDI mounting without a privileged entitlement is StikDebug's idea; `DDIMounter.swift` sequences the same calls. |
+| StosVPN / LocalDevVPN | [SideStore/StosVPN](https://github.com/SideStore/StosVPN), [jkcoxson/LocalDevVPN](https://github.com/jkcoxson/LocalDevVPN) | NOASSERTION | Invoked as a separate app (URL scheme), not vendored. Provides the `10.7.0.1` reflector that lets iCTRL reach this device's own lockdownd. |
+| DeveloperDiskImage mirror | [doronz88/DeveloperDiskImage](https://github.com/doronz88/DeveloperDiskImage) | See upstream | Downloaded at runtime, not redistributed: `BuildManifest.plist`, `Image.dmg`, `Image.dmg.trustcache`. Users may supply their own copy from Xcode instead. |
+| WebDriverAgent | [appium/WebDriverAgent](https://github.com/appium/WebDriverAgent) | Apache-2.0 | **Prior art only, no code copied.** The long-lived-runner patterns (`distantFuture` run loop, failure-proof test case) follow what it established. |
 
 ## On-device signing
 
