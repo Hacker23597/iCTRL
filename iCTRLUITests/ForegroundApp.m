@@ -615,6 +615,15 @@ static NSMutableString *ICTRLBuildLine(NSInteger depth, NSInteger type, NSString
     return line;
 }
 
+/// Element types that are never content: the scroll indicators UIKit overlays on
+/// top of a list. They sit INSIDE the content band, carry a label
+/// ("垂直滚动条, 16页" / "Vertical scroll bar"), and so survive every
+/// geometry-based filter — measured, they were 3 of 18 junk entries harvested
+/// from a feed. Dropping them by type is the only reliable way.
+static BOOL ICTRLIsScrollIndicator(NSInteger type) {
+    return type == 47;   // XCUIElementTypeScrollBar (per XCUIElementTypes.h)
+}
+
 static BOOL ICTRLRectVisible(CGRect f, CGRect viewport) {
     if (CGRectIsNull(viewport)) { return YES; }
     if (f.size.width <= 0 || f.size.height <= 0) { return NO; }   // zero-size: no hit target
@@ -653,7 +662,9 @@ static BOOL ICTRLRenderNode(id node, NSInteger depth, NSInteger maxDepth,
             [inv getReturnValue:&frame];
         }
 
-        BOOL selfVisible = ICTRLRectVisible(frame, viewport);
+        // A scroll indicator is chrome that happens to live inside the content
+        // area and to carry a label, so no geometry filter can exclude it.
+        BOOL selfVisible = ICTRLRectVisible(frame, viewport) && !ICTRLIsScrollIndicator(type);
         BOOL culling = !CGRectIsNull(viewport);
 
         // Build the line ONLY when it can still be emitted. On a recycling list
