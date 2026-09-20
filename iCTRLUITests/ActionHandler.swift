@@ -842,7 +842,28 @@ class ActionHandler {
                 "This image is \(Int(targetPixelW))×\(Int(targetPixelH)) PIXELS at scale \(targetScale). " +
                 "tap/swipe coordinates are in POINTS (\(Int(frame.width))×\(Int(frame.height))). " +
                 "Convert a pixel location (px,py) in THIS image to a tap point with: " +
-                "x = px / \(targetScale), y = py / \(targetScale). Prefer page_source to avoid this conversion."
+                "x = px / \(targetScale), y = py / \(targetScale)."
+            ),
+            // Its own field, not a clause buried in the coordinate maths above.
+            // Screenshots are the most over-used tool here: a model reads one,
+            // eyeballs a control, converts pixels to points and taps — and every
+            // one of those steps can be wrong in a way nothing reports. Measured
+            // in this project: a tap meant for a destination field landed on the
+            // nav bar, and a stray tap during scrolling added a product to a
+            // cart. find_element returns a ref that re-resolves the live element,
+            // so it cannot drift and needs no conversion at all.
+            "prefer_instead": .string(
+                "DON'T tap from this image if you can avoid it. To act on a control: " +
+                "find_element{element_id:\"<label>\"} → tap{ref} — a ref re-resolves the live element, " +
+                "survives scrolling/animation, and skips the pixel→point conversion entirely. " +
+                "To understand the layout: page_source{visible_only:true} returns every on-screen " +
+                "element with its type, label and exact frame, and is usually FASTER than a screenshot " +
+                "(~100ms vs ~150ms) as well as far smaller. " +
+                "Screenshots earn their place when the tree can't answer you: an element with no label " +
+                "(icon-only buttons, images), a layout question you can only judge visually, " +
+                "verifying that an action actually landed, or when page_source comes back sparse " +
+                "(check its ax_coverage / sparse_hint / viewport_warning fields) — most often a web view, " +
+                "where page content never reaches the accessibility tree at all."
             ),
         ]
         if !wantPNG { result["quality"] = .double(quality) }
@@ -1067,10 +1088,17 @@ class ActionHandler {
         else if method == "page_down" { goingDown = true }
         else if let d = cmd.direction?.lowercased() { goingDown = (d != "up") }
 
-        // Number of screenfuls (default 1). One "page" moves ~85% of the height so
-        // a sliver of overlap remains for reading continuity.
+        // Number of screenfuls (default 1). One "page" moves 75% of the height,
+        // leaving ~25% overlap between consecutive reads — about 220pt, which is
+        // most of a typical feed card (~330pt on RED), so an item on the boundary
+        // is fully readable in one of the two reads.
+        //
+        // Overlap only means something now that the drag actually lands where it
+        // is aimed (see the velocity note below). It was 85% with a fixed-duration
+        // drag that overshot by up to 61%, so the intended "sliver of overlap"
+        // was consumed by overshoot and consecutive reads shared nearly nothing.
         let pages = max(0.1, min(cmd.distance ?? 1.0, 5.0))   // reuse `distance` as page count
-        let pageTravel = size.height * 0.85 * pages
+        let pageTravel = size.height * 0.75 * pages
 
         // Scroll within the middle band, away from the very top/bottom (nav bars,
         // home indicator, pull-to-refresh zones).
@@ -1083,12 +1111,29 @@ class ActionHandler {
             toY = min(size.height * 0.88, fromY + pageTravel)
         }
 
-        // Precise drag: a long moveDuration means NO iOS momentum — content moves
-        // ~exactly the finger travel, page by page.
-        let r = fastHandler.fastSwipe(fromX: cx, fromY: fromY, toX: cx, toY: toY, duration: 0.45)
+        // Hold the drag SPEED below the momentum threshold, rather than using a
+        // fixed duration. A constant 0.45s meant velocity grew with travel, and
+        // iOS starts adding inertia above ~350pt/s — measured on this device:
+        //
+        //   889pt/s -> moved 1.61x the finger travel
+        //   500pt/s -> 1.27x
+        //   344pt/s -> 0.97x   (precise)
+        //   275pt/s -> 0.97x   (precise)
+        //
+        // So the old "NO iOS momentum" claim held only for short drags. At one
+        // full page it overshot past a whole screen, which silently ate the
+        // overlap between consecutive reads — items could pass between two
+        // page_source calls with nothing to indicate it.
+        //
+        // 300pt/s keeps a margin below the threshold. The floor stops very short
+        // drags from becoming absurdly slow; the ceiling bounds the worst case,
+        // since an XCUITest gesture blocks the (serial) UI queue while it runs.
+        let travel = abs(fromY - toY)
+        let dragDuration = min(max(travel / 300.0, 0.30), 2.5)
+        let r = fastHandler.fastSwipe(fromX: cx, fromY: fromY, toX: cx, toY: toY, duration: dragDuration)
         if r.1 != nil { return r }
         return ([
-            "message": .string("Paged \(goingDown ? "down" : "up") \(pages) screenful(s). Precise scroll (no momentum). Re-read with page_source/screenshot."),
+            "message": .string("Paged \(goingDown ? "down" : "up") \(pages) screenful(s) — 75% of the screen each, so consecutive reads overlap by ~25% and nothing falls between them. Precise scroll (no momentum). Re-read with page_source/screenshot."),
             "screen": coordinateHint,
         ], nil)
     }
@@ -1260,6 +1305,19 @@ class ActionHandler {
             focusedByTap = true
         }
 
+        // Typing into a field that already has content APPENDS, and nothing about
+        // the result says so: the response reports the text you asked for, the
+        // field now holds old+new, and a search silently runs on the wrong query.
+        // Hit for real here — searching "椰子汁" in a box still holding "黄桃"
+        // searched for "黄桃椰子汁". So read the field first and say what happened.
+        //
+        // Read-only and cheap: the same snapshot lookup clearFocusedField() does,
+        // skipped entirely when clear:true (the field is about to be emptied).
+        var preexisting = ""
+        if !clearFirst, !text.isEmpty {
+            preexisting = focusedFieldValue() ?? ""
+        }
+
         // clear:true empties the field before typing (tap to focus first, above).
         if clearFirst { clearFocusedField() }
 
@@ -1274,12 +1332,24 @@ class ActionHandler {
         // the keyboard before typing. Synthesize first (the actual input), return
         // immediately, and only then do a best-effort keyboard check for the
         // advisory warning — computed AFTER the text is already in.
+        // Surfaced on BOTH return paths: the append is silent otherwise, and the
+        // response would happily report the text the caller asked for while the
+        // field holds something else entirely.
+        func appendWarning() -> String? {
+            guard !preexisting.isEmpty else { return nil }
+            return "The field already contained \"\(preexisting)\", so it now reads "
+                + "\"\(preexisting + text)\" — typing APPENDS, it does not replace. "
+                + "If you meant to replace, call type{clear:true, text:\"...\"} instead. "
+                + (submit ? "NOTE a Return was already sent, so any search ran on the combined text." : "")
+        }
+
         if cmd.fast == true {
             let r = fastHandler.fastTypeText(text)
             if submit, r.1 == nil { sendReturnKey() }
             if var data = r.0 {
                 let prefix = clearFirst ? "Cleared then typed: " : "Typed: "
                 data["message"] = .string(text.isEmpty && clearFirst ? "Cleared focused field" : (prefix + text + (submit ? " + Return" : "")))
+                if let a = appendWarning() { data["append_warning"] = .string(a) }
                 if let w = keyboardWarningAfterType() { data["warning"] = .string(w) }
                 return (data, r.1)
             }
@@ -1297,6 +1367,7 @@ class ActionHandler {
             let prefix = clearFirst ? "Cleared then typed: " : "Typed: "
             let msg = text.isEmpty && clearFirst ? "Cleared focused field" : (prefix + text + (submit ? " + Return" : ""))
             var out: [String: JSONValue] = ["message": .string(msg)]
+            if let a = appendWarning() { out["append_warning"] = .string(a) }
             if let w = keyboardWarningAfterType() { out["warning"] = .string(w) }
             return (out, nil)
         } catch {
@@ -1314,6 +1385,21 @@ class ActionHandler {
         path.typeText("\n", atOffset: 0.0, typingSpeed: 60, shouldRedact: false)
         record.add(path)
         try? record.synthesize()
+    }
+
+    /// Current text of the focused field, or nil if it can't be read.
+    ///
+    /// Best-effort by nature: plenty of apps put their search box in a WebView or
+    /// a custom control that never reports hasKeyboardFocus, and nil there means
+    /// "unknown", NOT "empty" — callers must not treat the two the same.
+    private func focusedFieldValue() -> String? {
+        guard let bid = resolveForegroundBundleId() else { return nil }
+        let target = XCUIApplication(bundleIdentifier: bid)
+        for query in [target.textFields, target.secureTextFields, target.searchFields] {
+            let el = query.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
+            if el.safeExists, let v = el.value as? String { return v }
+        }
+        return nil
     }
 
     /// Clear the currently-focused text field. Requires the field to already have
