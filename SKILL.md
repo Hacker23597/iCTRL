@@ -1,422 +1,147 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
-skill_version: "1.21.0"
+skill_version: "1.32.0"
 ---
 
-# iCTRL — Control an iPhone over HTTP
+# iCTRL — control an iPhone over HTTP
 
-iCTRL runs on an iPhone and exposes iOS UI automation as a **JSON-RPC 2.0 API over HTTP (port 8200)**. You drive the phone by POSTing RPC calls: tap, type, swipe, read the accessibility view tree, screenshot, launch apps, and more. This document is the operating manual — read it once and you know how to run the phone the fast way.
+iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, port 8200**, encrypted — use a client downloaded from the device (below). `GET /schema` (no auth) lists every method and parameter.
 
-Every request is encrypted, so the practical first step is to **download a client from the device** (`/skill/clients/…`) rather than assemble HTTP by hand — there is a static CLI that needs no interpreter and a Python one, both always matching the running build. See *Connect & authorize* below.
+## Rules — read these first
 
-## Connect & authorize
+1. **Open apps by bundle id, never by tapping home-screen icons.** `resolve_app{text:"<name>"}` → `launch_app{bundle_id}`. Icon positions are guesses.
+2. **Read before you act.** On any screen you haven't read, call `page_source{visible_only:true, max_children:50}` (~0.4s) to learn which view/tab/date you're really on.
+3. **Tap by `ref`.** `find_element{element_id:"<label>"}` → `tap{ref}`. Check `visibility`: `"offscreen"` or a non-empty `alternatives` means you may have a look-alike — use `scroll_to_element` or a more specific label.
+4. **Never repeat an action "to be safe."** A success reply means it worked. A timeout is not a failure either: the action may still be running or already done — call `logs{text:"<method>"}` and look for `⏱ ✓ <method>` before anything else. A retried tap fires twice.
+5. **Every error from a `ref` action means nothing was tapped.** Re-find and retry is safe.
+6. **Screenshot last.** Only when the tree can't answer (images, custom-drawn text, web pages). `screen_text` reads text via OCR without an image round trip.
+7. **Stop before paying.** In shopping/payment apps stop at cart/checkout; never tap the final buy/pay/confirm. Never delete the user's own items (cart, notes, messages) without asking.
 
-Every `/rpc` body is an **encrypted envelope (protocol v1)**. There is no plaintext or Bearer path — an unsealed POST gets `401 auth_required`. All request-path crypto is HMAC-SHA256 only, so this is a few lines in any language.
+## Connect
 
-**Don't hand-write the crypto — download a working client from the device itself.**
-
-**Running inside Minis (or any Alpine/musl sandbox)? Use the compiled CLI.** That rootfs has no `python3`, so the Python client costs an `apk add` (network round-trip, ~50MB) before the first call, then pays interpreter startup on every invocation through an emulated syscall layer. The CLI is a single static aarch64-musl binary with no runtime dependencies — measured ~9x faster per invocation (5.4ms vs 47ms just to start).
-
+In an on-device Alpine/musl sandbox (e.g. Minis) use the static CLI — no Python there, and it starts ~9x faster. The device is `127.0.0.1`:
 ```bash
-# From inside Minis, the device is simply localhost — the guest shares the
-# phone's network stack, so no forwarding or host address is needed.
-wget -qO ictrl     http://127.0.0.1:8200/skill/clients/cli
-wget -qO ictrl.sh  http://127.0.0.1:8200/skill/clients/cli.sh
-sh ictrl.sh pair                          # tap Allow on the device
-sh ictrl.sh call device_info
+wget -qO ictrl    http://127.0.0.1:8200/skill/clients/cli
+wget -qO ictrl.sh http://127.0.0.1:8200/skill/clients/cli.sh
+sh ictrl.sh pair                        # user taps Allow on the phone
 sh ictrl.sh call tap '{"x":100,"y":200}'
-sh ictrl.sh shot screen.jpg               # screenshot straight to a file
+sh ictrl.sh shot screen.jpg             # screenshot to a file
 ```
+Run it as `sh ictrl.sh …` (files arrive without the exec bit; the wrapper fixes it).
 
-Invoke it through `sh ictrl.sh`, not `./ictrl`. Skill files are installed **without the exec bit** (the importer writes 0644 and never chmods), so calling the binary directly fails with `EACCES` on a fresh install. The wrapper runs via `sh` — which needs no exec bit — and fixes the mode on first use. After that `./ictrl` works too.
-
-The key is cached in `~/.ictrl/token.json`, the same file and format the Python client uses, so the two are interchangeable.
-
-**Everywhere else (a Mac, a Linux host with Python):**
+Anywhere with Python:
 ```bash
-curl -o ictrl_rpc.py http://<host>:8200/skill/clients/python   # unauthenticated
-python3 ictrl_rpc.py --host <host>:8200 pair                    # tap Allow on the device
+curl -o ictrl_rpc.py http://<host>:8200/skill/clients/python
+python3 ictrl_rpc.py --host <host>:8200 pair
 python3 ictrl_rpc.py --host <host>:8200 call device_info
-python3 ictrl_rpc.py --host <host>:8200 call tap '{"x":100,"y":200}'
 ```
+The CLI defaults to `127.0.0.1:8200`; `--host` or `ICTRL_HOST` targets another device. The Python client needs `pip install cryptography` for LAN pairing (not for `--plain` over localhost/USB via `iproxy 8200 8200`).
 
-Both speak the identical protocol against the same token store — pick by what the environment already has, not by preference. The CLI defaults to `127.0.0.1:8200`; pass `--host` or set `ICTRL_HOST` to target another device.
-
-## Version check — glance at this on your first `device_info`
-
-This document is **skill_version 1.21.0** (see the frontmatter). Every `device_info` response carries the device's own `skill_version` (same value as `server_version`) plus a `skill_update_hint`.
-
-**This is advisory — a version gap is not an error, and most gaps need no action.** Your installed copy is a snapshot from whenever it was fetched; the device's copy always matches the running build. Use semver to decide whether the difference could actually affect you:
-
-| Gap | What it means | Do |
-|---|---|---|
-| Equal, or **patch** (`1.6.1` → `1.6.2`) | Bug fixes. No method, parameter or return shape changed. | Nothing — carry on. |
-| **Minor** (`1.5.x` → `1.6.x`) | New methods/fields added; existing ones still work. | Refresh only if something you need seems missing, or you want the new features. |
-| **Major** (`1.x` → `2.x`) | Breaking changes are possible. | Refresh before relying on the details below. |
-| `protocol_version` differs from your client's | The envelope format itself moved. | Refresh — nothing will authenticate otherwise. |
-
-To refresh (both endpoints are unauthenticated — no pairing needed):
-
-```bash
-curl -o SKILL.md      http://<host>:8200/skill
-curl -o ictrl_rpc.py  http://<host>:8200/skill/clients/python
-# …or, in Minis / an Alpine sandbox, the compiled client instead of the Python one:
-wget -qO ictrl        http://127.0.0.1:8200/skill/clients/cli
-```
-
-Then re-read SKILL.md. Refresh **both** together — a stale client is the more dangerous half, since it hand-rolls the envelope crypto and mis-decrypts silently if the protocol moved.
-
-If the device's version is *older* than this file, the device is behind. Don't downgrade this skill; stick to what its `capabilities` array advertises and mention the old build to the user.
-
-For individual features, prefer feature-detecting against `capabilities` over comparing versions — versions tell you *whether refreshing is worth it*, capabilities tell you *what you can call right now*.
-
-## Implementing the protocol yourself
-
-Only read this if you can't use one of the bundled clients. The Python one is stdlib-only (X25519 LAN pairing additionally wants `pip install cryptography`; `--plain` over USB/localhost needs nothing) and lives in the repo at `Scripts/ictrl_rpc.py`; the CLI's C source is under `cli/`.
-
-1. **Probe readiness** (short timeout): `GET http://<host>:8200/schema` → HTTP 200 means the service is up. If it's not reachable, the runner isn't running — it must be launched on the device (tapping the iCTRL app, or an `ictrl://` URL scheme if you have one). Unauthenticated routes are only `/schema`, `/skill`, `/skill/clients/python` and `/skill/clients/cli[.sh]` (capability discovery, this manual, and the two client implementations — never session data).
-2. **Pair once** to get the 32-byte key `K`: `POST /pair` with `{"client_name":"<you>","plain":true}` (accepted **only from 127.0.0.1** — USB via `iproxy 8200 8200`), or over the LAN `{"client_name":"<you>","pub":"<base64 raw 32B X25519 pubkey>"}` and unwrap:
-   ```
-   shared  = X25519(client_priv, device_pub)
-   K_wrap  = HMAC-SHA256(shared, "ictrl-pair" || c_pub || d_pub)
-   K       = token_ct XOR HMAC-SHA256(K_wrap, "ictrl-wrap")
-   ```
-   **This BLOCKS until the device user taps Allow on-screen** — use a client timeout ≥ 60s and do NOT retry early (each retry pops another prompt). Denial returns HTTP 403.
-3. **Seal every call**. `POST /rpc` with the envelope below (no auth headers at all):
-   ```
-   tok   = first 4 bytes of SHA256(K), 8 hex chars   (a lookup id, NOT a secret)
-   nonce = 16 fresh random bytes per request          (never reuse — replays are rejected)
-   ts    = unix seconds                               (server allows ±120s)
-
-   K_enc_req  = HMAC(K, "ictrl-v1|enc-req"  || nonce)
-   K_enc_resp = HMAC(K, "ictrl-v1|enc-resp" || nonce)
-   K_mac      = HMAC(K, "ictrl-v1|mac"      || nonce)
-
-   keystream(Kx) = HMAC(Kx, nonce||be32(0)) || HMAC(Kx, nonce||be32(1)) || …   (truncate)
-   ct  = <json-rpc body> XOR keystream(K_enc_req)
-   tag = HMAC(K_mac, "v1" || tok_4B || be64(ts) || nonce || ct)
-   ```
-   Body: `{"v":1,"tok":"…","ts":…,"nonce":"<32 hex>","ct":"<base64>","tag":"<64 hex>"}`
-4. **Open the reply** — sealed under the **same nonce**: verify `tag == HMAC(K_mac, "resp" || nonce || ct)`, then decrypt with `K_enc_resp`. The plaintext is the normal JSON-RPC response.
-
-**Detect capabilities from `device_info`.** The first `device_info` call returns `server_version` (semver), `protocol_version` (int), and a `capabilities` array (`envelope_v1`, `stream_ticket`, `page_source_filter`, `max_depth`, `find_element_ref`, `scroll_to_element`, `clear_text`, `open_url`, `resolve_app`, `page`, `stop_server`, `logs_history`, `screenshot_jpeg`, `reset`, `nonui_lane`). Feature-detect against these — no separate `/schema` fetch — and don't assume a method exists on an older `server_version`.
-
-### Key cache — one key PER DEVICE
-
-**Each device has its own key.** A key is minted by, and only valid on, the device that issued it — there is no shared secret. So the cache is **keyed by `host:port`**, and you can hold keys for many devices at once and drive them **concurrently**.
-
-Persist to **`~/.ictrl/token.json`** as a map, never a bare object:
-```json
-{
-  "10.1.10.3:8200": {"tok": "a1b2c3d4", "key": "<64 hex K>", "client_name": "<you>",
-                     "device_name": "Colour's iPhone", "expires": 1755820800},
-  "10.1.1.253:8200": {"tok": "9f8e7d6c", "key": "<64 hex K>", "client_name": "<you>",
-                      "device_name": "Ethan's iPhone", "expires": 1755906300}
-}
-```
-
-Rules that matter when more than one device is in play:
-- **Look up by the exact `host:port` you are calling.** Never reuse another device's key — it authenticates as an unknown `tok` and fails `401 auth_failed`.
-- **Pair per device**, once each. Pairing device B does not affect device A's key.
-- **Keep each device's `nonce` stream separate** — nonces are random per request anyway, so just never reuse an envelope across devices.
-- Record `device_name` (from `device_info`) alongside the key. Hosts move (DHCP); the name is what lets you tell the user *which phone* you're driving, and lets you notice a host now answers as a different device.
-- Driving several devices at once is fine and fully parallel — separate keys, separate sessions, no shared state on either side.
-- `Scripts/ictrl_rpc.py` already does all of this: `--host` selects the device and the store is a host-keyed map.
-
-On later runs, **use the cached key directly** — don't call `/pair`. Expiry is **idle-based**: a key dies only after 30 days of *no use*, and every call slides that window forward, so a key in regular use never expires and survives app restarts. The `expires` returned at pair time is merely "expiry if never used" — do **not** discard a cached key because that timestamp passed. Re-pair only when a call actually returns **401**. If you cache resolved `bundle_id`s too (e.g. `~/.ictrl/apps.json`, also keyed per host), you can skip `resolve_app` on repeat tasks.
-
-**Dev shortcut:** if the runner was launched from Xcode with `ICTRL_ALLOW_AUTH_ONCE=1` in the scheme's environment, the **first** pairing after that cold start is auto-approved (no on-device tap). It is consumed by that one pairing and never rearms.
-
-**Byte streams use a ticket, not an envelope.** `GET /stream` and `GET /logs*` return raw bytes a browser/player fetches directly, so they can't carry an envelope. Call the `stream_ticket` RPC (over the encrypted channel) to mint a **single-use, ~60s** ticket, then append `?ticket=<t>` to the URL. Mint a fresh one per fetch.
-
-Full machine-readable method list + parameters + guidance: **`GET /schema`** (JSON). This SKILL is the how; `/schema` is the exact what (method names, params, return shapes). Method set can change — trust `/schema` for the current list.
-
-**Capability negotiation.** `/schema` and `device_info` include `protocol_version` and a `capabilities` list. Read them and don't assume a method exists on an older `server_version`; older servers without these fields → treat conservatively.
-
-## The golden rules (this is where speed comes from)
-
-Most automation is slow because of three anti-patterns. Avoid them:
-
-### 1. Don't blind-wait
-`tap`, `type`, `swipe`, `page`, `scroll` **already block on UI quiescence before they return**. After an interaction you can read/act **immediately** — no `wait` call. `page_source` reads whatever is currently settled.
-- The **only** routine wait is **2–3s once after a cold `launch_app`** (the app is still rendering).
-- If a `page_source` comes back mid-transition (splash / placeholder / empty), **then** wait ~1s and re-read — reactively, not by default.
-- Blind 2–3s sleeps after every tap are pure wasted latency.
-
-**How long calls actually take.** Measured on a real device (iPhone 17 Pro, iOS 26), median and p90 in ms:
-
-| Call | median | p90 | Notes |
-|---|---|---|---|
-| `device_info` | 20 | 130 | Cheap — safe to poll |
-| `screenshot` | 155 | 215 | JPEG default; PNG is several times slower to transfer |
-| `tap` | 280 | 650 | Includes the UI settling |
-| `swipe` | 420 | 540 | |
-| `home` | 550 | 600 | |
-| `type` | 640 | 670 | Per call, not per character |
-| `page_source` | 460 | 1250 | Grows with page size — use `filter` |
-| `launch_app` | 860 | 930 | Plus 2–3s of rendering before the UI is readable |
-| `find_element` | 950 | 2200 | A **miss** costs the most — see below |
-
-Use these as your expectation, not as timeouts: keep the client timeout generous (30s+), but if you find yourself *sleeping* longer than the numbers above, you are waiting for nothing. A tap that returns in 280ms has already settled — the next call can go out immediately.
-
-**When something takes much longer than this, it is a signal, not a reason to wait harder:**
-- `find_element` running seconds long usually means the label is **wrong**, not that the element is slow to appear. A miss walks the whole tree before giving up. Confirm the exact text with `page_source{filter:{text:"…"}}` instead of retrying variations.
-- Any UI call exceeding ~6s gets a timeout reply while still running on the device. **Don't blindly retry** — check `GET /logs` for `⏱ ✓ <method>` first; a retried tap fires twice.
-- Repeated timeouts mean the UI channel is wedged (see Diagnostics): `device_info` still answering while `tap` times out confirms it. Call `reset`, don't wait it out.
-
-### 2. Act by `ref`, not by coordinates
-Don't read `page_source`, find an element's frame, and tap its center. Instead:
-- `find_element{element_id:"<label>"}` → returns a stable **`ref`** → `tap{ref}`.
-- A `ref` re-resolves the live element: it survives scroll/animation, needs no coordinate math, and no re-read to re-derive coordinates.
-- Reserve raw coordinate taps for elements with **no usable label** (icons, canvas, games).
-- `page_source` is for **understanding layout**, not for your locate-and-tap loop.
-
-### 3. Trust the result — don't re-do an action that already succeeded
-When a call returns success, it worked. Don't repeat it "to be safe."
-- After `type{submit}`, if it returned no error/warning, the text is in — do NOT re-type the same query. Reading `page_source` and seeing OLD content usually means the page hasn't updated yet (wait ~1s, re-read), NOT that the action failed.
-- Before retrying anything after a client timeout, check `/logs` for `⏱ ✓ <method>` — if it's there, it already ran; retrying doubles it (a tap fires twice, a query searches twice).
-- The cost of a needless retry is high: a wasted type (~2s) plus the taps and reads around it.
+Both share `~/.ictrl/token.json`, keyed by `host:port` — **one key per device**, never another device's; several devices can run in parallel. Store `device_name` with each key (hosts move; the name says which phone). Reuse the key: it expires only after 30 days *unused*, whatever its `expires` says. Re-pair only on a real `401`. Pairing blocks until the user taps Allow — ≥60s timeout, no early retry (each pops another prompt). Dev only: a runner started from Xcode with `ICTRL_ALLOW_AUTH_ONCE=1` auto-approves the first pairing.
 
 ## Core workflow
 
 ```
-0. GET /schema                     → every method + its parameters (unauthenticated, ~150ms, once)
-1. device_info                     → learn point_width/point_height/scale (once)
-2. resolve_app{text:"<name>"}      → name → bundle_id (built-in catalog + iTunes fallback)
-3. launch_app{bundle_id}           → opens it, binds it as the sticky target; wait 2-3s (cold render)
-4. find_element{element_id:"<label>"} → get a ref   (or page_source first to learn labels)
-5. tap{ref} / type{text,submit} / page{direction}  → act (no wait; these self-quiesce)
-6. page_source{visible_only:true, max_children:50}  → read the result (see "under a second" below)
+GET /schema                              every method + params (once)
+device_info                              screen size in points, versions, state
+resolve_app{text} → launch_app{bundle_id}   then wait 2–3s once (cold render)
+page_source{visible_only:true, max_children:50}   where am I?
+find_element{element_id} → tap{ref}      act
+type{text, submit:true}                  enter text
+page{direction:"down"}                   read further
 ```
-
-Step 6 defaults matter: plain `page_source` on a chat list or feed can take
-seconds and still come back without the rows you can see. `visible_only` +
-`max_children:50` measured p50 416ms / p90 593ms across 8 apps and never lost
-visible content. If the result looks sparser than the screen, call `screen_text`.
-
-**Step 0 is worth the one round trip.** Parameter names are not uniform across methods —
-`find_element` wants `element_id`, `resolve_app` wants `text`, `tap` wants `x`/`y` — and a guessed
-name costs a full failed call to discover. `/schema` lists all of them at once and needs no auth.
-
-### Parameter quick reference
-
-The names that are most often guessed wrong. `/schema` remains the authority.
 
 | Method | Required | Useful optional |
 |---|---|---|
-| `find_element` | `element_id` (label **or** accessibility id) | `element_type`, `match:"contains"`, `bundle_id` |
-| `scroll_to_element` | `element_id` | `element_type`, `match`, `direction`, `distance`, `bundle_id` |
-| `tap` / `double_tap` / `long_press` | `x`+`y` **or** `ref` | `duration` (long_press) |
+| `find_element` | `element_id` (label or accessibility id) | `element_type`, `match:"contains"`, `bundle_id` |
+| `scroll_to_element` | `element_id` | `element_type`, `match`, `direction`, `distance` |
+| `tap` / `double_tap` / `long_press` | `ref`, or `x`+`y` | `duration` |
 | `type` | `text` | `submit`, `clear` |
 | `resolve_app` | `text` | — |
 | `launch_app` / `activate_app` / `terminate_app` | `bundle_id` | — |
 | `open_url` | `url` | — |
-| `screenshot` | — | `scale`, `format`, `quality`, `bundle_id` |
-| `page_source` | — | `bundle_id`, `max_depth`, `filter` |
+| `page_source` | — | `visible_only`, `max_children`, `filter`, `bundle_id` |
+| `page` | — | `direction`, `distance` (screens) |
 | `swipe` | — | `direction`, `distance`, `velocity`, `x`, `y` |
-| `page` | — | `direction`, `distance` |
+| `screenshot` | — | `scale`, `format`, `quality` |
 
-Naming traps: the method is **`type`**, not `type_text`. **`element_type` alone never selects an
-element** — it only filters, so `element_id` must accompany it.
+The method is `type`, not `type_text`. `element_type` only filters — `element_id` is always required.
 
-## Read the `hint` field
+Most responses carry a **`hint`** for that exact result — which limits applied, what to do next. Read it, above all when a result is empty or negative.
 
-Most responses carry a **`hint`** string. It is written for you at call time and knows things this document cannot: which limits were applied to *that* response, whether a result is trustworthy, and what to do next when it isn't. **Read it and decide whether it applies** — it is advisory, not an order, but ignoring it is how automations reach confident wrong conclusions.
+## Timing, timeouts and recovery
 
-`hint` is the single field for this. (`message` describes what happened; `skill_update_hint` is only about version drift.)
+- Taps and swipes are synthesized and return **without waiting for the UI to settle**. After a tap that changes screens, the next read can catch a half-drawn transition (queries run 5–30x slower and frames are wrong). If a read looks like the old screen or is sparse, wait ~1s and re-read. Don't sleep blindly after every tap.
+- Typical: `tap` ~0.3s, `page_source` (visible_only) ~0.4s, `find_element` ~1s, `launch_app` ~0.9s + 2–3s render. Much slower usually means a wrong label or a mid-transition screen.
+- The server answers a UI call after **6s** (15s for `page_source`, `tap_element`, `find_and_tap`) even if the work is still running. UI calls run **one at a time**, and a stuck one can't be cancelled. Calls behind it time out too. Their error says *"has NOT run yet: queued behind X"*: they will still run later, so **do not resend them**.
+- After two timeouts in a row, UI calls are rejected immediately. The message names the stuck call and how long it has run. Recovery: `reset` (clears refs and the app binding), then **wait** for the stuck call to end (typically 15–45s; watch `logs`), then retry. `reset` can't stop a call already running.
+- **Only `logs`, `config` and `reset` answer while the UI queue is stuck.** `device_info` shares the UI queue, so it's no health probe; use `logs`.
+- Use a generous client timeout (≥30s).
+- Restarting your side? Reuse the cached key and `bundle_id`s, and get back with a deep link (`open_url`) rather than re-navigating from the app's home.
 
-It matters most when a result is **negative or suspiciously empty** — that is exactly when a hint tells you the result may be an API limitation rather than a fact about the device.
+## Finding and tapping
 
-## Opening apps & jumping back
+- `find_element` matches exact label → accessibility id → (with `match:"contains"`) substring. **An element in view always beats an off-screen one**: a calendar holds "25" in three months, and you get the visible one. The result has `visibility` (`in_view`/`partial`/`offscreen`), and when several matched, `alternatives[]` + `match_count`.
+- A `ref` re-resolves the live element at tap time. If its app has gone to the background (a system sheet, another app), the tap is refused at once: *"belongs to X, which is now in the background"*. Look at the screen before continuing.
+- **Off-screen** → `scroll_to_element{element_id}`. If the target is already in the tree, it drags straight to it in one move. Otherwise it searches, and without `direction` it reverses once at an end. **"NOT anywhere in this view" means it isn't on this screen at all** — check page/tab/date, or whether the data exists; don't keep scrolling.
+- **Text on screen ≠ accessibility label** (common). Copy the label from `page_source`, or use `match:"contains"`. An accessibility `identifier` shown in `page_source` is the most stable `element_id` of all. Duplicate labels → add `element_type`.
+- **Nothing matches but you can see it** → it's a custom control with no label. The failure message lists what *is* on screen. Take its frame from `page_source` and `tap{x,y}`.
+- A coordinate `tap` returns `hit` (the element under the point, sampled before tapping) or `hit_warning` (nothing labelled there — you probably hit empty space).
+- **Web pages don't appear in the accessibility tree.** In Safari or any in-app web view, `page_source` shows only browser chrome (`foreground_is_browser:true` in `device_info`). Use `screenshot` → locate visually → `tap{x,y}`. Native alerts over a page *are* in the tree.
+- A **system alert** covering the app blocks ref/element actions. Read it with `page_source{bundle_id:"com.apple.springboard"}` and tap its button by coordinates.
 
-- **Open an app**: `resolve_app{text:"<name>"}` → `launch_app{bundle_id}`. `launch_app` opens the app's home; use `open_url` when you know a deep link to a specific screen.
-- **Never conclude "the app isn't installed" from a lookup.** `resolve_app` reads a static name→bundle_id catalog and says nothing about *this* device; `list_apps` goes through a private API that newer iOS versions may refuse, returning an **empty list on a phone full of apps**. Both failure modes are silent. To actually decide:
-  1. **`launch_app{bundle_id}`** — the real test. Success proves it's installed; an error means genuinely absent.
-  2. **Ask iOS** — open the home screen, swipe down from mid-screen for Spotlight, type the app's *name*, read the result. Spotlight indexes every installed app regardless of API restrictions, and it works by name, which is what the user gave you anyway.
-  3. Only after one of those should you report the app as missing.
-- **`open_url{url:"scheme://…"}`** — iCTRL can open ANY iOS URL scheme / deep link, not just app launches. Use it to jump straight to a feature, open a web/universal link, or trigger another app's action.
-- **Return to the calling app when the task is done**: after finishing the automation, you can hand control back by opening the caller's URL scheme, e.g. `open_url{url:"<caller-scheme>://"}`. This brings that app to the foreground — a clean way to "return" once you've read/done what you needed on the target app. (If you were invoked with a specific return/callback scheme, use that.)
+## Typing and searching
 
-## Locating elements — pick by situation
+1. The search "bar" on a home screen is often a Button that opens a search page. `find_element` returns `is_text_input`; if false, tap it, then find the real field: `find_element{element_id:"<placeholder>", element_type:"textfield", match:"contains"}` → `tap{ref}` (brings up the keyboard).
+2. `type{text, submit:true}`. `submit` presses Return/Search.
+3. **Trust success.** If `type` returned no warning, the text went in. Old content in the next read means the page hasn't updated yet — wait ~1s, re-read, don't re-type.
+4. **Typing appends.** To replace a field's text use `type{text, clear:true}` or `clear_text` first (select-all + delete). An `append_warning` in the response means you just appended to existing text.
+   If `submit` didn't trigger the search, tap the screen's own search/confirm control — don't re-type.
+5. `page_source` carries `keyboard` (`visible`, `covers_from_y`). Coordinates read before the keyboard appeared are stale: everything above it has shifted.
 
-> **Web pages are invisible to the accessibility tree — read this before automating a browser.**
-> In Safari (or any browser / in-app web view), `page_source` returns **browser chrome only**: a
-> few dozen anonymous `Other` nodes, the status bar, the toolbar. Links, buttons and text *inside
-> the page do not appear at all*, so `find_element` can never match them. Concretely: a page with
-> five app rows returned 42 nodes, none of them page content, while a native app on the same device
-> returned 162 fully-labelled nodes.
-> **Do not** reach for `scroll_to_element` or `match:"contains"` — they cannot fix this.
-> **Do this instead:** `screenshot` → locate the target visually → convert pixel→point by dividing
-> by the `scale` field *from that same screenshot response* → `tap{x,y}`.
-> Native alerts (including the system "…想要安装…" install sheet) are a different matter: those ARE
-> in the tree, so `find_element` works normally for them even while Safari is in front.
+## Reading the screen
 
-- **Known on-screen label** → `find_element{element_id:"<label>"}` → `tap{ref}`. Fastest. Skip page_source.
-- **Off-screen (needs scrolling)** → `scroll_to_element{element_id:"<label>"}` — scrolls and returns the ref in one call. Don't hand-roll swipe loops.
-- **App exposes accessibility ids** (`identifier:` in page_source) → use that id as `element_id` — the most stable key.
-- **On-screen text ≠ accessibility label** (common) → read the exact label from `page_source`, or use `match:"contains"`.
-- **No usable label** (icon / image / webview) → `screenshot`, find it visually, tap by COORDINATE. Screenshots are **JPEG by default** (several times smaller than PNG — and since the whole response is decrypted through the envelope, size is what dominates the round trip). Pass `{"format":"png"}` only for lossless needs; `{"quality":0.4}` shrinks it further.
-- **Duplicate labels** → add `element_type` (button/cell/…) to disambiguate.
+- **Default: `page_source{visible_only:true, max_children:50}`** — on-screen nodes only, well under 1s even on long feeds. Omit `visible_only` only when you need off-screen structure.
+- `filter:{text|label|type:"…"}` returns matching nodes + ancestors — the cheap way to harvest repeated values (prices, titles).
+- **Thin tree?** Chat lists and feeds may expose little of what's visible. When `ax_coverage` is low or `sparse_hint`/`viewport_warning` appears, call `screen_text` (OCR; returns text with tappable point coordinates).
+- `max_depth` small (3–4) returns structure without labels — layout preview only.
+- `max_elements` (default 2000, cap 4000): if the response says `truncated:true`, narrow with `filter`/`visible_only` instead of raising it. An app scrolled for a long time accumulates rows and slows every read; relaunching it clears them.
 
-## Searching & typing (the #1 place automation breaks)
+## Scrolling
 
-1. `launch_app`, wait 2–3s once (cold render).
-2. Find the search ENTRY (by its visible label, whatever the app's language). It is often a **Button/StaticText that opens a separate search page** rather than a real input — check `is_text_input`: false means it's an entry, not the field itself. `find_element{element_id:"<label>"}` → `tap{ref}` — no wait after.
-3. Locate the REAL input: `find_element{element_id:"<its placeholder text>", element_type:"textfield", match:"contains"}`, confirm `is_text_input:true`, `tap{ref}` to focus (keyboard comes up with the tap). **`element_id` is always required** — `element_type` only narrows the search, it cannot select an element on its own.
-4. `type{text:"…", submit:true}` — `submit` appends Return/Search so the field's action fires.
-5. Read results with `page_source` directly.
-- **TRUST the result — do NOT re-type the same text.** If `type` returns success (no error/warning), the text WENT IN. Only re-type when `type` itself returns a "no keyboard/focus" **warning**. A common false-failure trap: after `type{submit}` you read `page_source` and see the OLD content (the search page/results haven't updated yet, or you read a stale home-screen search bar) — that is NOT proof the type failed. Wait ~1s and re-read, or check the results, before ever re-typing. Re-typing the same query is almost always wrong and just doubles the work.
-- **Searching a second time? Use `type{clear:true, text:"…"}`.** Typing APPENDS — a search box still holding the previous query turns "椰子汁" into "黄桃椰子汁" and searches for that, with nothing in the response to say so unless `append_warning` comes back. `clear_text` works too; tap to focus before either.
-- If after `type{submit:true}` the action didn't fire, the field may need its explicit submit/search control tapped instead — `find_element` that control (by its visible label) and `tap{ref}` it, rather than re-typing.
+- **`page{direction:"down"}`** is how to read long content. Each step moves 75% of the screen (25% overlap) at a speed with no momentum, so nothing falls between reads. Don't use `swipe` for reading — it barely moves; keep it for carousels, partial drags and pull-to-refresh.
+- `page`/`swipe`/`scroll` report `moved`. **`moved:false` (`at_end:true`) means stop** — nothing more that way. (A page still loading also looks unmoved; wait ~1s if more is expected.)
+- `position` (`percent`, `fraction`, …) says where you are. Trust it only when `confidence` is `estimated` or `exact`. Lists that build rows lazily pin it near 0/100% with few `rows_seen`.
 
-## Reading long content
+## Apps
 
-- **`page{direction:"down", distance:N}`** — precise steps, no momentum. This is how you read a feed/detail page predictably. Each step moves **70% of the screen**, so consecutive reads overlap by ~30% and an item straddling the boundary is fully visible in one of them. Don't raise `distance` to save calls on a feed: at 1.0 the overlap is already only ~30%, and beyond that items fall between reads unnoticed.
-- **Do NOT use `swipe` to read feeds** — its default ~100pt travel barely moves the page; you'll under-scroll. Reserve `swipe` for carousels / partial drags / pull-to-refresh.
-- **Harvest repeated data cheaply**: when you want many similar values off a page, `page_source{filter:{text:"<substring common to them>"}}` returns only the matching nodes + ancestors — far smaller and easier to parse than the whole tree.
+- `resolve_app` looks offline first: apps opened on this device before (`source:"opened_here"` — launch directly), then a built-in catalog, then the App Store. Only `opened_here` says anything about *this* device.
+- **`launch_app` is the real install test**: success = installed, error = not. Newer iOS refuses `list_apps` enumeration; it then returns only apps opened via iCTRL before (`source:"opened_history"`). Never report "not installed" from a lookup or an empty list — if unsure, check Spotlight (home, swipe down, type the name).
+- `open_url{url}` opens any scheme / deep link / universal link. Finish by opening the caller's scheme to hand control back, if you have one.
+- After `launch_app`/`activate_app` that app is the **bound target**. Coordinate and `element_id` actions bring it back to the front if it drifted (`app_note` says so). `ref` actions don't — they refuse instead. If the bound app leaves the screen, reads follow whatever is in front. Pass `bundle_id` to read a specific app.
 
-## App binding (sticky target)
+## Coordinates and screenshots
 
-After `launch_app`/`activate_app`, that app is the **sticky target**.
-- **Interaction** methods (tap, swipe, type, page, …) re-focus the bound app automatically if the foreground drifted (response carries an `app_note`).
-- **Read-only** methods (page_source, screenshot, find_element) read the CURRENT foreground and do NOT re-activate — so if the bound app got backgrounded and you want to read IT, run one interaction first, or pass an explicit `bundle_id` to the read call.
-- If the bound app **crashed** (state notRunning), interaction methods return a clear error → `launch_app` again.
-- A **system alert/permission dialog** covering the app → read it via `page_source{bundle_id:"com.apple.springboard"}` and tap its button first.
-
-## When to screenshot (and when not to)
-
-Screenshots are the easiest tool to over-use: look at the picture, spot the
-button, convert pixels to points, tap. Every step there can go wrong silently —
-in testing, a tap meant for a search field landed on the nav bar, and a stray tap
-while scrolling added a product to a cart. Neither reported an error.
-
-**To act on a control** → `find_element{element_id:"<label>"}` → `tap{ref}`.
-A `ref` re-resolves the live element, survives scrolling and animation, and needs
-no coordinate maths at all.
-
-**To understand the screen** → `page_source{visible_only:true}`. It returns every
-on-screen element with type, label and exact frame, is usually *faster* than a
-screenshot (~100ms vs ~150ms) and is far smaller.
-
-**Screenshot when the tree genuinely can't answer you:**
-
-- the target has no label — icon-only buttons, images, custom-drawn controls
-- you need a visual judgement (layout, colour, what something looks like)
-- confirming an action actually landed
-- `page_source` came back sparse — check `ax_coverage`, `sparse_hint`,
-  `viewport_warning`. The usual culprit is a **web view**, whose page content
-  never enters the accessibility tree at all.
-
-Every screenshot response carries a `prefer_instead` field saying which of these
-applies.
-
-## Coordinates
-
-`tap`/`swipe`/`drag`/`type(x,y)` use **POINTS**, not pixels. `page_source` frames are already in points. Screenshots are **pixels** → `point = pixel / scale`.
-
-**Use the `scale` from the screenshot response, NOT the one from `device_info`.** They are different numbers: `device_info.screen_scale` is the panel's native ratio (3 on a recent iPhone), while a screenshot defaults to `scale: 2` and is downscaled to match. On a 1206×2622 device that yields an 804×1748 image — dividing by 3 instead of 2 puts the tap ~200pt off, which is the difference between hitting a button and hitting whatever sits above it. Every screenshot response carries `pixel_width/height`, `point_width/height` and its own `scale`; both bundled clients print all three next to the saved file.
-
-## Timeouts & reliability
-
-- Use generous `/rpc` client timeouts (≥ 30s, ideally 60–120s): `/rpc` drives a real device; a cold launch or heavy page takes seconds. A generous timeout is not a reason to *wait* that long — see the timing table above for what each call normally costs. The server itself gives up on a UI call after 6s and replies (15s for the locate-driven ones: `page_source`, `find_and_tap`, `tap_element`), so a request pending far beyond that is a transport problem, not a slow device.
-- **Never locate mid-transition — `wait` 1–2s after ANY navigation** (back, tab switch, opening a page), not just after app launch. While a transition animates, every element query runs 5–30x slower (measured: the same screen answered in 169ms settled vs 6.5s mid-animation) and the tree exposes mid-animation geometry — a skeleton of the page with elements at coordinates they are only passing through, so a match can aim a tap at a spot the control has already left. One `wait` beats a slow, wrong read. Corollary: if a locate that is normally fast suddenly takes seconds, the screen probably wasn't settled — re-read rather than trusting the coordinates.
-- **A client timeout ≠ failure.** The device keeps executing. Before retrying, `GET /logs` and look for `⏱ ✓ <method>` — if present, it already succeeded and retrying would DOUBLE the action (e.g. a tap fires twice).
-- **Cheap recovery** if the service drops: reuse the cached key (`~/.ictrl/token.json`) and `bundle_id` (don't `resolve_app` again); re-`/pair` only if a call actually returns 401; if you know a deep link back (`open_url`), use it instead of re-navigating from the app's home screen.
-- **Cellular vs Wi-Fi.** On Wi-Fi the device's LAN address is remotely reachable. On **cellular/mobile data** the address is a public/CGNAT one that's **reachable on-device only** — the server still runs and localhost/on-device clients work, but a LAN peer can't connect, and that's expected (the server won't self-check or raise a "Local Network" prompt on cellular). If you're driving iCTRL from another host, use Wi-Fi; from on-device (e.g. the same phone) it works on any network.
-
-## Reading the UI (`page_source` params)
-
-- `filter` — return only matching nodes + ancestors: `{label:"<substr>"}`, `{type:"button"}`, or `{text:"<substr>"}`. Also the cheapest way to harvest repeated values (filter by a common substring).
-- `max_depth` — cap tree depth. WARNING: labels live near the LEAVES, so a shallow depth (3–4) returns structure with NO useful labels — use it only to preview layout, not to find an element.
-- `max_elements` — cap node count (default 2000, hard cap 4000). If hit, the response is `truncated:true` — narrow with `filter` or `visible_only` instead of raising this.
-- `visible_only:true` — **return only what is on screen right now**, plus the ancestor path of each visible node. See below; this is the fix for long lists.
-- To LOCATE a control, prefer `find_element{element_id:"<label>"}` (add `element_type:"button"/"textfield"/…` to disambiguate) → it returns a stable `ref` you then `tap{ref}`. Off-screen → `scroll_to_element{element_id}` returns the ref after scrolling. A `ref` beats coordinates (survives scroll/animation).
-
-### Reading the visible screen in under a second
-
-Measured across 8 apps (WeChat, X, JD, RED, Settings, Spotify, App Store, GitHub)
-at 1–8 pages of scroll:
-
-| Approach | p50 | p90 | ever >1s |
-|---|---|---|---|
-| `visible_only` | 494ms | 1354ms | yes (X) |
-| **`visible_only` + `max_children:50`** | **416ms** | **593ms** | **no** |
-| `screen_text` (OCR, fast) | 508ms | 551ms | no |
-| `screen_text` (OCR, accurate) | 701ms | 919ms | no |
-
-**Default to `page_source{visible_only:true, max_children:50}`.** It was the
-fastest option and never exceeded 1s. Verified it loses nothing: at 6–8 pages deep
-in RED/GitHub/JD it returned exactly the same visible labels as the unbounded
-read, at half the time — the rows `max_children` drops are offscreen ones
-`visible_only` would discard anyway.
-
-**Reach for `screen_text` when the tree comes back thin.** On recycling lists the
-accessibility tree can be missing most of what you can see — measured on the same
-screens, OCR found ~5x more text than the tree did:
-
-| App | texts via tree | via OCR |
-|---|---|---|
-| WeChat (6 pages in) | 6 | **35** |
-| X (3 pages in) | 8 | **45** |
-| RED | 30 | **80** |
-| Settings / Spotify / GitHub / JD | 20–69 | similar or fewer |
-
-So: normal apps → the tree is as good or better (and gives you `ref`s). Chat
-lists and feeds → the tree may return almost nothing while OCR reads the screen
-fine. A `viewport_warning` in the response tells you when you are in that case.
-
-### `visible_only` — reading long / infinitely-scrolling lists
-
-A recycling list (chat list, feed, timeline) keeps far more rows in the
-accessibility tree than are on screen. Measured on this device:
-
-| App | Nodes | On screen | Offscreen |
-|---|---|---|---|
-| WeChat chat list | 1500 (truncated) | 130 | **91%** |
-| X timeline | 769 | 104 | **86%** |
-| JD home | 744 | 606 | 19% |
-
-Those offscreen rows are real rows with real labels — WeChat's sit anywhere from
-y = -9115 to y = +13204 — and they **consume the element budget before the
-visible ones are reached**, which is why such a page comes back `truncated:true`
-while still missing what you can actually see.
-
-`page_source{visible_only:true}` keeps only nodes intersecting the screen rect
-(plus their ancestors, so it is still a tree). On the WeChat list that is
-1500 → 130 nodes and 115 KB → 9 KB, and it no longer truncates.
-
-**What it is NOT:** a way to read the whole list. It is a snapshot of the current
-viewport. **To see more, scroll and read again** — `page{direction:"down"}` then
-`page_source{visible_only:true}`, repeating until you find what you need. To jump
-straight to a known item, prefer `scroll_to_element{element_id:"<label>"}`.
-
-**Use the full tree (omit the flag) when** you are looking for something just
-offscreen, or reasoning about list length/position — `scroll_to_element` needs
-the uncelled tree to know which way to scroll. That is why this is opt-in.
-
-**Performance caveat.** `visible_only` cuts the payload and the element budget,
-but **not the traversal**. A container's frame does not bound its children in a
-recycling list (measured: 89% of parent/child pairs violate containment — WeChat's
-Table reports exactly the screen rect while its cells live thousands of points
-away), so every node must still be visited to learn where it is. Expect a large
-drop in bytes and a modest one in time. On a very long list the call can still be
-slow; combine with `filter` or `max_depth` if it is, and remember an app that has
-been scrolled for a long time accumulates rows — relaunching it drops them.
-
-## Safety
-
-When operating real shopping/payment apps, stop at the cart/checkout — do NOT tap the final buy/pay/confirm button. Let the user complete payment themselves.
+- `tap`/`swipe`/`drag` take **points**. `page_source` frames and OCR boxes are points.
+- Screenshots are pixels: `point = pixel / scale`, using the **`scale` from that screenshot response** (default 2), not `device_info.screen_scale` (the panel's 3). Mixing them puts taps ~200pt off.
+- Screenshots are JPEG by default; `format:"png"` only when lossless matters.
 
 ## Diagnostics
 
-- **Check `device_info.system` first when something looks wrong.** Besides thermal/CPU/memory/disk/battery it reports:
-  - `screen_locked` — a locked screen is why a screenshot came back black and taps changed nothing. Try `unlock`, but note it only presses Home: on a passcoded device it wakes the display and then fails (~8s), and the user has to unlock by hand. Planning a long unattended run? Have the user set Auto-Lock to Never rather than trying to keep the screen alive from here — note too that sleep does NOT stop the runner, so a read-only task still works with the screen off.
-  - `foreground_app` — which app your actions are actually hitting. A surprising value here explains most "the element isn't there" reports.
-  - `foreground_is_browser` — present and true when the foreground app is a browser, i.e. page content will NOT appear in `page_source` (see *Locating elements*).
-- `GET /logs` — recent in-memory logs (incl. `⏱ ✓ <method> <ms>` timings).
-- `GET /logs/files` — list persisted daily log files (survive crashes/restarts).
-- `GET /logs/history?date=YYYY-MM-DD` — read a persisted day's log (recover logs from before a crash).
-- `reset` — recover when UI calls start timing out and the log shows `kAXErrorServerNotFound` (the accessibility connection to the app dropped). Clears cached refs + the sticky app binding, then `launch_app` the target app to force a reconnect. Runs off the UI queue, so it answers even while UI methods are blocked.
-- `config{stop_server:true}` — stop the service (paired keys persist; relaunch the runner to restart). This is the guaranteed fix if `reset` + `launch_app` doesn't bring UI calls back.
-- **`device_info`, `logs` and `config` never block behind UI work** — they run on a separate lane. If they answer but `tap`/`find_element` time out, the UI channel is wedged, not the server. After 2 consecutive UI timeouts the server starts rejecting UI calls immediately (with a recovery hint) rather than queueing them behind a stuck one.
+- `device_info.system`: `screen_locked` (black screenshots, taps doing nothing — `unlock` only presses Home; a passcode needs the user), `foreground_app` (what you're really driving), `foreground_is_browser`, thermal/memory/battery. Screen sleep does not stop the runner. For long unattended runs, ask the user to set Auto-Lock to Never.
+- `logs{text?, max_elements?}`: recent log lines over the normal channel. `⏱ ✓ <method>` = completed, `⏱ TIMEOUT`, `⛔️`/`✅` channel state. `GET /logs/files` and `GET /logs/history?date=YYYY-MM-DD` keep logs across crashes; byte endpoints (`/logs*`, `/stream`) need a single-use `?ticket=` from the `stream_ticket` RPC.
+- `reset`: clears refs and the binding and rebuilds the UI channel state, then `launch_app` the target. `config{stop_server:true}` stops the runner (keys persist); it must be relaunched on the device.
+- If `/schema` is unreachable, the runner isn't running. The user must start it on the phone, and the Developer Disk Image must be mounted (it is lost on every reboot).
+- On cellular the device isn't reachable from the LAN (on-device clients still work).
+
+## Versions
+
+Compare `device_info.skill_version` with this file's frontmatter. Patch gap: ignore. Minor: refresh if something seems missing. Major, or a different `protocol_version`: refresh `GET /skill` **and** the client together. Device *older* than this file: don't downgrade — use only its `capabilities[]` and tell the user.
+
+## Protocol (only if you can't use a bundled client)
+
+Reference implementation: the Python client (`/skill/clients/python`).
+- **Pair**: `POST /pair {"client_name","pub":"<b64 X25519 pubkey>"}`, or `{"client_name","plain":true}` from 127.0.0.1 only. Unwrap: `shared=X25519(c_priv,d_pub)`, `K_wrap=HMAC(shared,"ictrl-pair"‖c_pub‖d_pub)`, `K=token_ct XOR HMAC(K_wrap,"ictrl-wrap")`. Denied → 403.
+- **Seal** each `/rpc` call: `tok`=first 4 bytes of SHA256(K) as hex; `nonce`=16 random bytes (never reuse); `ts`=unix seconds (±120s). `K_enc_req=HMAC(K,"ictrl-v1|enc-req"‖nonce)`, `K_enc_resp` likewise with `enc-resp`, `K_mac` with `mac`. Keystream = `HMAC(Kx, nonce‖be32(i))` blocks. `ct = body XOR ks(K_enc_req)`, `tag = HMAC(K_mac,"v1"‖tok‖be64(ts)‖nonce‖ct)`. Send `{"v":1,"tok","ts","nonce":hex,"ct":b64,"tag":hex}`.
+- **Open** the reply (same nonce): check `tag == HMAC(K_mac,"resp"‖nonce‖ct)`, decrypt with `K_enc_resp`.

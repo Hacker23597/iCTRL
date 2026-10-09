@@ -85,13 +85,22 @@
         NSArray *apps = [client performSelector:sel];
         if (![apps isKindOfClass:[NSArray class]] || apps.count == 0) { return nil; }
 
+        // SpringBoard is always in this list, so it is skipped in favour of a
+        // real app — but only an app that says it is in front. When SpringBoard
+        // itself is what's showing (a system alert, the home screen), the next
+        // entry can be an app already sent to the background; returning it made
+        // callers query a window-less app, which on iOS 16 spun XCTest at 100%
+        // CPU until the system killed the runner. state is answered by
+        // testmanagerd without touching the accessibility tree — milliseconds.
+        NSString *springboard = nil;
         for (id element in apps) {
             NSString *bid = [self bundleIDForElement:element];
-            if (bid.length > 0 &&
-                ![bid isEqualToString:@"com.apple.springboard"]) {
-                return bid;
-            }
+            if (bid.length == 0) { continue; }
+            if ([bid isEqualToString:@"com.apple.springboard"]) { springboard = bid; continue; }
+            NSInteger state = [self appStateForBundleID:bid];
+            if (state == 4 || state == 0) { return bid; }   // runningForeground, or unknown
         }
+        if (springboard) { return springboard; }
         // Fallback: return whatever the first element resolves to.
         return [self bundleIDForElement:apps.firstObject];
     } @catch (__unused NSException *e) {
@@ -281,6 +290,21 @@
         return stateFn(app, @selector(state));
     } @catch (__unused NSException *e) {
         return 0;
+    }
+}
+
++ (nullable NSString *)safeLabelForBundleID:(NSString *)bundleId {
+    if (bundleId.length == 0) { return nil; }
+    @try {
+        Class appClass = NSClassFromString(@"XCUIApplication");
+        if (!appClass) { return nil; }
+        id (*initFn)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+        id app = initFn([appClass alloc], @selector(initWithBundleIdentifier:), bundleId);
+        if (!app || ![app respondsToSelector:@selector(label)]) { return nil; }
+        id label = [app performSelector:@selector(label)];
+        return [label isKindOfClass:[NSString class]] && [label length] > 0 ? label : nil;
+    } @catch (__unused NSException *e) {
+        return nil;
     }
 }
 
@@ -490,6 +514,20 @@ static id ICTRLDeepestLabelledNode(id snapshot, NSUInteger depth) {
     }
 }
 
++ (NSInteger)boolPropertyState:(NSString *)name ofElement:(id)element
+                        reason:(NSString * _Nullable * _Nullable)outReason {
+    if (!element) { return 0; }
+    @try {
+        SEL sel = NSSelectorFromString(name);
+        if (![element respondsToSelector:sel]) { return 0; }
+        BOOL (*fn)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
+        return fn(element, sel) ? 1 : 0;
+    } @catch (NSException *e) {
+        if (outReason) { *outReason = e.reason ?: e.name; }
+        return -1;
+    }
+}
+
 + (nullable id)boundedSnapshotForBundleID:(NSString *)bundleId
                                  maxDepth:(NSInteger)maxDepth
                               maxChildren:(NSInteger)maxChildren {
@@ -630,37 +668,42 @@ static BOOL ICTRLRectVisible(CGRect f, CGRect viewport) {
     return CGRectIntersectsRect(f, viewport);
 }
 
+/// Reads the properties the renderer and the locator need off one snapshot
+/// node — one reader, so a fix to how a property is read lands in both.
+static void ICTRLReadNode(id node, NSString **label, NSString **ident, NSString **value,
+                          NSInteger *type, CGRect *frame) {
+    SEL s;
+    s = NSSelectorFromString(@"label");
+    if ([node respondsToSelector:s]) { id v = [node performSelector:s]; if ([v isKindOfClass:[NSString class]]) *label = v; }
+    s = NSSelectorFromString(@"identifier");
+    if ([node respondsToSelector:s]) { id v = [node performSelector:s]; if ([v isKindOfClass:[NSString class]]) *ident = v; }
+    s = NSSelectorFromString(@"value");
+    if ([node respondsToSelector:s]) { id v = [node performSelector:s]; if ([v isKindOfClass:[NSString class]]) *value = v; }
+    s = NSSelectorFromString(@"elementType");
+    if ([node respondsToSelector:s]) {
+        NSMethodSignature *sig = [node methodSignatureForSelector:s];
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        inv.selector = s; [inv invokeWithTarget:node];
+        NSUInteger raw = 0; [inv getReturnValue:&raw]; *type = (NSInteger)raw;
+    }
+    s = NSSelectorFromString(@"frame");
+    if ([node respondsToSelector:s]) {
+        NSMethodSignature *sig = [node methodSignatureForSelector:s];
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        inv.selector = s; [inv invokeWithTarget:node];
+        [inv getReturnValue:frame];
+    }
+}
+
 static BOOL ICTRLRenderNode(id node, NSInteger depth, NSInteger maxDepth,
                             NSInteger maxElements, NSMutableArray *lines,
                             NSInteger *count, BOOL *truncated, CGRect viewport) {
     if (!node || *count >= maxElements) { if (*count >= maxElements) { *truncated = YES; } return NO; }
     @try {
         NSString *label = nil, *ident = nil, *value = nil;
-        SEL s;
-        s = NSSelectorFromString(@"label");
-        if ([node respondsToSelector:s]) { id v = [node performSelector:s]; if ([v isKindOfClass:[NSString class]]) label = v; }
-        s = NSSelectorFromString(@"identifier");
-        if ([node respondsToSelector:s]) { id v = [node performSelector:s]; if ([v isKindOfClass:[NSString class]]) ident = v; }
-        s = NSSelectorFromString(@"value");
-        if ([node respondsToSelector:s]) { id v = [node performSelector:s]; if ([v isKindOfClass:[NSString class]]) value = v; }
-
         NSInteger type = 0;
-        s = NSSelectorFromString(@"elementType");
-        if ([node respondsToSelector:s]) {
-            NSMethodSignature *sig = [node methodSignatureForSelector:s];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.selector = s; [inv invokeWithTarget:node];
-            NSUInteger raw = 0; [inv getReturnValue:&raw]; type = (NSInteger)raw;
-        }
-
         CGRect frame = CGRectZero;
-        s = NSSelectorFromString(@"frame");
-        if ([node respondsToSelector:s]) {
-            NSMethodSignature *sig = [node methodSignatureForSelector:s];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.selector = s; [inv invokeWithTarget:node];
-            [inv getReturnValue:&frame];
-        }
+        ICTRLReadNode(node, &label, &ident, &value, &type, &frame);
 
         // A scroll indicator is chrome that happens to live inside the content
         // area and to carry a label, so no geometry filter can exclude it.
@@ -691,7 +734,7 @@ static BOOL ICTRLRenderNode(id node, NSInteger depth, NSInteger maxDepth,
 
         BOOL keptAnything = selfVisible;
         if (depth < maxDepth) {
-            s = NSSelectorFromString(@"children");
+            SEL s = NSSelectorFromString(@"children");
             if ([node respondsToSelector:s]) {
                 id kids = [node performSelector:s];
                 if ([kids isKindOfClass:[NSArray class]]) {
@@ -729,6 +772,217 @@ static BOOL ICTRLRenderNode(id node, NSInteger depth, NSInteger maxDepth,
         return culling ? keptAnything : YES;
     } @catch (__unused NSException *e) {}
     return NO;
+}
+
+// XCUIElementType raw values used below (XCUIElementTypes.h).
+static BOOL ICTRLIsChromeBar(NSInteger t) { return t == 21 || t == 22 || t == 24 || t == 25; } // Nav, Tab, Toolbar, Status
+static BOOL ICTRLIsScrollable(NSInteger t) { return t == 26 || t == 32 || t == 46; }            // Table, Collection, ScrollView
+
+/// Whether a `contains` hit sits on a token boundary. "25" inside "9月25日" is
+/// a real hit; inside "2025年" it is an accident of digits. Only same-class
+/// neighbours (digit next to digit, ASCII letter next to ASCII letter) break a
+/// boundary — CJK text has no spaces, so a CJK neighbour never does.
+static BOOL ICTRLSameClass(unichar a, unichar b) {
+    BOOL ad = a >= '0' && a <= '9', bd = b >= '0' && b <= '9';
+    if (ad && bd) { return YES; }
+    BOOL al = (a | 0x20) >= 'a' && (a | 0x20) <= 'z', bl = (b | 0x20) >= 'a' && (b | 0x20) <= 'z';
+    return al && bl;
+}
+
+/// 0 = prefix, 1 = on a token boundary, 2 = anywhere else.
+static NSInteger ICTRLContainsQuality(NSString *hay, NSString *needle, NSRange r) {
+    if (r.location == 0) { return 0; }
+    unichar before = [hay characterAtIndex:r.location - 1];
+    BOOL leftOK = !ICTRLSameClass(before, [needle characterAtIndex:0]);
+    NSUInteger after = NSMaxRange(r);
+    BOOL rightOK = after >= hay.length
+        || !ICTRLSameClass([hay characterAtIndex:after], [needle characterAtIndex:needle.length - 1]);
+    return (leftOK && rightOK) ? 1 : 2;
+}
+
+typedef struct {
+    __unsafe_unretained NSString *needle;
+    BOOL contains;
+    __unsafe_unretained NSSet<NSNumber *> *types;   // nil = any type
+    NSInteger maxDepth;
+    NSInteger maxVisit;
+    NSInteger visited;
+    CGRect viewport;
+} ICTRLLocateCtx;
+
+/// Collects EVERY match instead of returning the first. The first-in-DFS
+/// answer was wrong exactly when it mattered: a calendar month view keeps the
+/// previous month's cells in the tree above the screen, so `contains:"25"`
+/// returned an off-screen "8月25日" while "9月25日" sat in plain view.
+static void ICTRLCollect(id node, NSInteger depth, ICTRLLocateCtx *ctx,
+                         BOOL inChrome, NSValue *scrollAncestor,
+                         NSMutableDictionary<NSString *, NSNumber *> *labelSeen,
+                         NSMutableDictionary<NSString *, NSNumber *> *identSeen,
+                         NSMutableArray<NSMutableDictionary *> *out,
+                         NSMutableArray<NSArray *> *chromeBars,
+                         NSMutableArray<NSValue *> *scrollables,
+                         NSMutableArray<NSString *> *fingerprint) {
+    if (!node || ctx->visited >= ctx->maxVisit) { return; }
+    @try {
+        ctx->visited++;
+        NSString *label = nil, *ident = nil, *value = nil;
+        NSInteger type = 0;
+        CGRect frame = CGRectZero;
+        ICTRLReadNode(node, &label, &ident, &value, &type, &frame);
+
+        if (ICTRLIsChromeBar(type)) { [chromeBars addObject:@[@(type), [NSValue valueWithCGRect:frame]]]; }
+        if (ICTRLIsScrollable(type) && ICTRLRectVisible(frame, ctx->viewport)) {
+            [scrollables addObject:[NSValue valueWithCGRect:frame]];
+        }
+        if (fingerprint.count < 40 && label.length && ICTRLRectVisible(frame, ctx->viewport)) {
+            [fingerprint addObject:[NSString stringWithFormat:@"%@@%d", label, (int)frame.origin.y]];
+        }
+
+        // The root is the Application; XCUIElementQuery.descendants excludes
+        // it, so it must not count toward the ordinal a live query re-resolves.
+        BOOL typeOK = depth > 0 && (!ctx->types || [ctx->types containsObject:@(type)]);
+        if (typeOK) {
+            NSInteger labelOrdinal = label.length ? [labelSeen[label] integerValue] : 0;
+            NSInteger identOrdinal = ident.length ? [identSeen[ident] integerValue] : 0;
+            if (label.length) { labelSeen[label] = @(labelOrdinal + 1); }
+            if (ident.length) { identSeen[ident] = @(identOrdinal + 1); }
+
+            NSInteger tier = -1, quality = 0;
+            if (label.length && [label isEqualToString:ctx->needle]) { tier = 0; }
+            else if (ident.length && [ident isEqualToString:ctx->needle]) { tier = 1; }
+            else if (ctx->contains) {
+                NSString *hay = [NSString stringWithFormat:@"%@ %@", label ?: @"", value ?: @""];
+                NSRange r = [hay rangeOfString:ctx->needle options:NSCaseInsensitiveSearch];
+                if (r.location != NSNotFound) { tier = 2; quality = ICTRLContainsQuality(hay, ctx->needle, r); }
+            }
+            // A hit with no label can't be re-resolved by label; its identifier
+            // is the only handle a live query has.
+            if (tier >= 0 && (label.length || ident.length)) {
+                BOOL byLabel = label.length > 0 && tier != 1;
+                NSMutableDictionary *c = [@{
+                    @"how": tier == 0 ? @"exact" : (tier == 1 ? @"id" : @"contains"),
+                    @"tier": @(tier), @"quality": @(quality),
+                    @"label": label ?: @"", @"identifier": ident ?: @"",
+                    @"type": @(type),
+                    @"key": byLabel ? @"label" : @"identifier",
+                    @"ordinal": @(byLabel ? labelOrdinal : identOrdinal),
+                    @"order": @(out.count),
+                    @"in_chrome": @(inChrome),
+                    @"x": @(frame.origin.x), @"y": @(frame.origin.y),
+                    @"w": @(frame.size.width), @"h": @(frame.size.height),
+                } mutableCopy];
+                if (scrollAncestor) {
+                    CGRect a = scrollAncestor.CGRectValue;
+                    c[@"container"] = @{ @"x": @(a.origin.x), @"y": @(a.origin.y),
+                                          @"w": @(a.size.width), @"h": @(a.size.height) };
+                }
+                if (out.count < 200) { [out addObject:c]; }
+            }
+        }
+
+        if (depth >= ctx->maxDepth) { return; }
+        BOOL childChrome = inChrome || ICTRLIsChromeBar(type);
+        NSValue *childScroll = ICTRLIsScrollable(type) ? [NSValue valueWithCGRect:frame] : scrollAncestor;
+        SEL s = NSSelectorFromString(@"children");
+        if ([node respondsToSelector:s]) {
+            id kids = [node performSelector:s];
+            if ([kids isKindOfClass:[NSArray class]]) {
+                for (id k in (NSArray *)kids) {
+                    ICTRLCollect(k, depth + 1, ctx, childChrome, childScroll, labelSeen, identSeen,
+                                 out, chromeBars, scrollables, fingerprint);
+                }
+            }
+        }
+    } @catch (__unused NSException *e) {}
+}
+
++ (nullable NSDictionary *)locateInBoundedSnapshot:(id)root
+                                             query:(NSString *)query
+                                          contains:(BOOL)contains
+                                             types:(nullable NSArray<NSNumber *> *)types
+                                          viewport:(CGRect)viewport
+                                          maxDepth:(NSInteger)maxDepth {
+    if (!root || !query.length) { return nil; }
+    // Held in a strong local for the whole walk: the context's field is
+    // __unsafe_unretained (C structs can't own objects here), so assigning a
+    // freshly made set straight into it left ARC free to release the set at
+    // once — and the first typed lookup crashed reading a freed object.
+    __attribute__((objc_precise_lifetime)) NSSet<NSNumber *> *typeSet =
+        types ? [NSSet setWithArray:types] : nil;
+    ICTRLLocateCtx ctx = {
+        .needle = query, .contains = contains,
+        .types = typeSet,
+        .maxDepth = maxDepth, .maxVisit = 6000, .visited = 0, .viewport = viewport,
+    };
+    NSMutableArray<NSMutableDictionary *> *cands = [NSMutableArray array];
+    NSMutableArray<NSArray *> *bars = [NSMutableArray array];
+    NSMutableArray<NSValue *> *scrollables = [NSMutableArray array];
+    NSMutableArray<NSString *> *fp = [NSMutableArray array];
+    ICTRLCollect(root, 0, &ctx, NO, nil, [NSMutableDictionary dictionary], [NSMutableDictionary dictionary],
+                 cands, bars, scrollables, fp);
+
+    // Content band = screen minus nav/status bars on top and tab/toolbars at the
+    // bottom — same rules as page_source's coverage measure, read from the tree
+    // because the bars differ per device and per app.
+    CGFloat h = viewport.size.height;
+    CGFloat top = 0, bottom = h;
+    for (NSArray *b in bars) {
+        NSInteger t = [b[0] integerValue];
+        CGRect f = [b[1] CGRectValue];
+        if (f.size.height <= 0 || f.size.height >= h * 0.4 || !ICTRLRectVisible(f, viewport)) { continue; }
+        BOOL topBar = (t == 21 || t == 25);
+        if (topBar && CGRectGetMaxY(f) > top && f.origin.y < h * 0.3) { top = CGRectGetMaxY(f); }
+        if (!topBar && f.origin.y < bottom && CGRectGetMaxY(f) > h * 0.7) { bottom = f.origin.y; }
+    }
+
+    // Visibility: 0 = centre inside the content band (or on a bar, where it is
+    // chrome and genuinely reachable), 1 = partly on screen, 2 = off screen.
+    for (NSMutableDictionary *c in cands) {
+        CGRect f = CGRectMake([c[@"x"] doubleValue], [c[@"y"] doubleValue], [c[@"w"] doubleValue], [c[@"h"] doubleValue]);
+        NSInteger vis = 2;
+        if (ICTRLRectVisible(f, viewport)) {
+            CGFloat mx = CGRectGetMidX(f), my = CGRectGetMidY(f);
+            BOOL centreOn = mx >= 0 && mx <= viewport.size.width && my >= 0 && my <= h;
+            BOOL inBand = my > top && my < bottom;
+            vis = (centreOn && (inBand || [c[@"in_chrome"] boolValue])) ? 0 : 1;
+        }
+        c[@"vis"] = @(vis);
+        c[@"visibility"] = vis == 0 ? @"in_view" : (vis == 1 ? @"partial" : @"offscreen");
+    }
+    // Reachable beats textually closer: an exact match you cannot tap is worth
+    // less than a contains-match you can. Within a visibility class the old
+    // ranking holds (exact > id > contains), then boundary hits, then the
+    // shorter label, then tree order.
+    [cands sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        for (NSString *k in @[@"vis", @"tier", @"quality"]) {
+            NSComparisonResult r = [a[k] compare:b[k]];
+            if (r != NSOrderedSame) { return r; }
+        }
+        NSUInteger la = [a[@"label"] length], lb = [b[@"label"] length];
+        if (la != lb) { return la < lb ? NSOrderedAscending : NSOrderedDescending; }
+        return [a[@"order"] compare:b[@"order"]];
+    }];
+
+    // The scroll container to drag in when nothing matched: the largest
+    // scrollable on screen, which is the page body rather than a carousel.
+    CGRect container = CGRectNull;
+    CGFloat best = 0;
+    for (NSValue *v in scrollables) {
+        CGRect f = CGRectIntersection(v.CGRectValue, viewport);
+        CGFloat area = f.size.width * f.size.height;
+        if (area > best) { best = area; container = f; }
+    }
+    NSMutableDictionary *result = [@{
+        @"candidates": cands,
+        @"visited": @(ctx.visited),
+        @"content_top": @(top), @"content_bottom": @(bottom),
+        @"fingerprint": [fp componentsJoinedByString:@"|"],
+    } mutableCopy];
+    if (!CGRectIsNull(container)) {
+        result[@"scroll_container"] = @{ @"x": @(container.origin.x), @"y": @(container.origin.y),
+                                          @"w": @(container.size.width), @"h": @(container.size.height) };
+    }
+    return result;
 }
 
 + (nullable NSString *)renderBoundedSnapshot:(id)root

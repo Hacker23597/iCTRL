@@ -46,6 +46,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// Used to tell "app crashed/closed" from "app just not frontmost".
 + (NSInteger)appStateForBundleID:(NSString *)bundleId;
 
+/// The app's display name as the home screen shows it (its Application
+/// element's accessibility label), caught safely. nil if the app isn't running
+/// or the read throws. Costs one accessibility round-trip to the target app.
++ (nullable NSString *)safeLabelForBundleID:(NSString *)bundleId;
+
 /// Whether a system alert / permission dialog is currently on screen (owned by
 /// SpringBoard, covering the app). When true, actions should target the system
 /// UI to dismiss it first. Caught safely; returns NO on any error.
@@ -97,6 +102,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// unanswerable query as "no" rather than as a crash.
 + (BOOL)safeBoolProperty:(NSString *)name ofElement:(id)element fallback:(BOOL)fallback;
 
+/// As `safeBoolProperty:`, but tells a real NO apart from a read that threw:
+/// returns 1 / 0, or -1 with the exception's reason in `outReason`.
+///
+/// The distinction is the whole point. `exists` throwing means XCTest could
+/// not answer at all — the app is busy or backgrounded — and reporting that as
+/// "element gone" sent a real incident's post-mortem down the wrong path.
++ (NSInteger)boolPropertyState:(NSString *)name ofElement:(id)element
+                        reason:(NSString * _Nullable * _Nullable)outReason;
+
 /// Fetches an accessibility snapshot with the traversal bounded ON THE DEVICE.
 ///
 /// `XCUIElement.snapshot()` asks the target app to walk and serialise its whole
@@ -112,6 +126,29 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable id)boundedSnapshotForBundleID:(NSString *)bundleId
                                  maxDepth:(NSInteger)maxDepth
                               maxChildren:(NSInteger)maxChildren;
+
+/// Every match for `query` in a bounded snapshot, ranked for acting on.
+///
+/// Returns @{candidates, visited, content_top, content_bottom, fingerprint,
+/// scroll_container?}. Each candidate is @{how, label, identifier, type, x, y,
+/// w, h, visibility ("in_view" | "partial" | "offscreen"), key ("label" |
+/// "identifier"), ordinal, container?}. `ordinal` is the index a live
+/// `label == X` (or identifier) query over the same `types` would give this
+/// node, so the caller can re-resolve THIS element rather than the first one
+/// that happens to share its label.
+///
+/// Ranking: in view > partly visible > off screen, then exact > id > contains,
+/// then contains-hits on a token boundary, then shorter labels. `types` are
+/// XCUIElementType raw values and must mirror the live query's type filter;
+/// nil means any type. `fingerprint` summarises what is on screen, for telling
+/// whether a scroll moved anything. Walks in Obj-C for the same reason as the
+/// renderer below.
++ (nullable NSDictionary *)locateInBoundedSnapshot:(id)root
+                                             query:(NSString *)query
+                                          contains:(BOOL)contains
+                                             types:(nullable NSArray<NSNumber *> *)types
+                                          viewport:(CGRect)viewport
+                                          maxDepth:(NSInteger)maxDepth;
 
 /// Renders a bounded snapshot tree to the same one-line-per-node text
 /// `page_source` produces.

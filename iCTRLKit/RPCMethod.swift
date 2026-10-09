@@ -64,6 +64,15 @@ struct RPCMethodRegistry {
             returns: "{count, items:[{label, confidence, x, y, width, height, center_x, center_y, element_type:'OCRText', is_text_input, exists}], coordinate_space:'points', timing:{screenshot_ms, ocr_ms}, hint}"
         ),
         RPCMethodDef(
+            name: "logs",
+            description: "Recent server log lines, over the encrypted RPC channel. Use this after a TIMEOUT: a timed-out call may still have SUCCEEDED on the device, and '⏱ ✓ <method>' in the log is how you tell. Runs on the non-UI lane, so it answers even while UI calls are wedged — unlike GET /logs, which is a byte stream needing a stream_ticket minted over this same channel.",
+            params: [
+                RPCParamDef(name: "text", type: "string", required: false, description: "Only return lines containing this substring — pass the method name to check one action."),
+                RPCParamDef(name: "max_elements", type: "number", required: false, description: "How many lines to return (default 80, max 500). Most recent last."),
+            ],
+            returns: "{lines:[string], count, total, hint}"
+        ),
+        RPCMethodDef(
             name: "reset",
             description: "Recover after UI automation stops responding (calls timing out, logs showing kAXErrorServerNotFound). Clears cached element refs, the sticky app binding and the cached screen size, and re-arms the circuit breaker that rejects UI calls once the channel is judged unhealthy. Does NOT itself restart XCTest's accessibility session — after calling it, launch_app (or activate_app) the target app to force a reconnect, then retry. If UI calls still time out, restart the runner: config{stop_server:true}, then relaunch it. Safe to call any time; runs off the UI queue so it works even while UI methods are blocked.",
             params: [],
@@ -132,20 +141,20 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "direction", type: "string", required: false, description: "'down' (default, reveal below) or 'up'"),
                 RPCParamDef(name: "distance", type: "number", required: false, description: "Number of screenfuls (default 1; e.g. 0.5 = half a page, 2 = two pages). One screenful travels 70% of the height, leaving ~30% overlap so nothing falls between consecutive reads. Raising this past 1 trades that safety for fewer calls — on a feed, items can then pass between reads with no way to notice."),
             ],
-            returns: "{message, screen}"
+            returns: "{message, screen, moved, position?, at_end?, hint?}. **moved:false means the gesture changed nothing** — you are at the end of the scrollable content in that direction, so scrolling again is wasted. `position` gives {percent, fraction, scrolled_pt, scrollable_pt, content_pt, content_top_y, content_bottom_y, rows_seen, row_estimate, confidence} derived from row frames; check `confidence` (estimated | low | exact) before trusting it, and note lazily-built lists report only visible rows so the figure pins near 0 or 100. A page still loading also reads as unmoved."
         ),
         RPCMethodDef(
             name: "scroll_to_element",
-            description: "Auto-scroll until an element becomes visible, then return a stable 'ref' plus its tap point. Matching is EXACT by default (label == element_id, or accessibility id) to avoid hitting the wrong element — pass match:'contains' for a loose substring match. Narrow further with element_type. IMPORTANT: element_id must be the ACCESSIBILITY LABEL (from page_source), which may differ from on-screen text (e.g. a button showing '添加至购物袋' may have label '添加'). Prefer this over manual swipe loops.",
+            description: "Scroll until an element is IN VIEW (inside the content area, not merely present in the tree), then return a stable 'ref' plus its tap point. If the element is already in the tree off screen it drags straight to it in one precise move; otherwise it searches, reversing once at an end when no direction is given, and reports 'NOT anywhere in this view' after reaching both ends — trust that and check the page/date/tab instead of scrolling further. Matching is EXACT by default (label == element_id, or accessibility id) to avoid hitting the wrong element — pass match:'contains' for a loose substring match. Narrow further with element_type. IMPORTANT: element_id must be the ACCESSIBILITY LABEL (from page_source), which may differ from on-screen text (e.g. a button showing '添加至购物袋' may have label '添加'). Prefer this over manual swipe loops.",
             params: [
                 RPCParamDef(name: "element_id", type: "string", required: true, description: "Exact accessibility label or identifier (see page_source)"),
                 RPCParamDef(name: "match", type: "string", required: false, description: "'exact' (default) or 'contains' (substring)"),
                 RPCParamDef(name: "element_type", type: "string", required: false, description: "Restrict to a type: button/textfield/label/image/cell/switch/icon"),
-                RPCParamDef(name: "direction", type: "string", required: false, description: "Finger direction to scroll: up/down/left/right (default: up = reveal below)"),
-                RPCParamDef(name: "distance", type: "number", required: false, description: "Max swipe attempts (default: 12). Each swipe is ~40% of the screen (small, to avoid scrolling past short targets). Stops early if the end of the content is reached."),
+                RPCParamDef(name: "direction", type: "string", required: false, description: "Finger direction to search in when the target is not in the tree yet: up/down/left/right. Omit it to search up (reveal below) and then the other way; give it to search one way only."),
+                RPCParamDef(name: "distance", type: "number", required: false, description: "Max scroll moves (default: 12). Aimed moves go exactly to a known target; searching moves are ~60% of the scroll area at a speed that adds no momentum, so nothing is skipped. Stops early at the end of the content."),
                 RPCParamDef(name: "bundle_id", type: "string", required: false, description: "App to search; default = detected foreground app"),
             ],
-            returns: "{found, swipes, ref, x, y, center_x, center_y, label, hint} — then tap by {ref}. Label matching ignores invisible formatting characters."
+            returns: "{found, swipes, ref, x, y, center_x, center_y, label, visibility, hint} — then tap by {ref}. Label matching ignores invisible formatting characters."
         ),
         RPCMethodDef(
             name: "scroll",
@@ -200,22 +209,22 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "list_apps",
-            description: "List installed apps with their bundle_id and name. NOTE: this relies on a private API that often returns an EMPTY list inside the XCTest sandbox — if count is 0, that's the sandbox limitation, not 'no apps'. Prefer resolve_app to get a bundle_id from an app name. Pass text to filter by name or bundle substring (case-insensitive). By default only user apps are returned; pass element_type:\"all\" to include system apps.",
+            description: "List installed apps with their bundle_id and name. The system enumeration is a private API that newer iOS refuses; when it does, this returns source:'opened_history' instead — apps previously opened successfully through iCTRL on THIS device, most recent first (every entry is installed, but the list is incomplete). An empty list never means 'not installed'. Prefer resolve_app to get a bundle_id from an app name. Pass text to filter by name or bundle substring (case-insensitive). By default only user apps are returned; pass element_type:\"all\" to include system apps.",
             params: [
                 RPCParamDef(name: "text", type: "string", required: false, description: "Filter by name/bundle_id substring"),
                 RPCParamDef(name: "element_type", type: "string", required: false, description: "'all' to include system apps (default: user apps only)"),
             ],
-            returns: "{count, apps:[{bundle_id, name}], hint}"
+            returns: "{count, source:'system'|'opened_history', apps:[{bundle_id, name, last_opened?}], hint}"
         ),
         RPCMethodDef(
             name: "resolve_app",
-            description: "Resolve an app NAME/keyword to its bundle_id. PURPOSE: launch_app/activate_app need an exact bundle_id, but you usually only know the app's name — call resolve_app first to turn e.g. '大麦' into 'cn.damai.iphone', then pass that to launch_app. HOW IT WORKS: checks a built-in catalog of ~100 common apps first (instant, offline; returns source:'built-in'), and falls back to the App Store's iTunes Search API for anything else (returns full metadata). Note: resolving a bundle_id does NOT mean the app is installed on this device — launch_app will report if it isn't. (Alias: search_app.)",
+            description: "Resolve an app NAME/keyword to its bundle_id. PURPOSE: launch_app/activate_app need an exact bundle_id, but you usually only know the app's name — call resolve_app first to turn e.g. '大麦' into 'cn.damai.iphone', then pass that to launch_app. HOW IT WORKS: looks offline first — apps this device has learned (opened successfully, or found by an earlier store lookup) merged per bundle_id with a built-in catalog of ~100 common apps — and falls back to the App Store's iTunes Search API for anything else (returns full metadata; the result is remembered so the next lookup is offline). Offline entries carry source:'opened_here' (launched on THIS device before — launch_app it directly), 'built-in' or 'learned'. Only 'opened_here' says anything about this device; otherwise launch_app will report if the app isn't installed. (Alias: search_app.)",
             params: [
                 RPCParamDef(name: "text", type: "string", required: true, description: "App name or keyword to resolve (e.g. '大麦', 'WeChat')"),
                 RPCParamDef(name: "country", type: "string", required: false, description: "App Store country code for the fallback search (default: cn)"),
                 RPCParamDef(name: "distance", type: "number", required: false, description: "Max results to return (default: 5, max 25)"),
             ],
-            returns: "{count, term, source:'built-in'|'app_store', apps:[{name, bundle_id, developer?, category?, rating?, ...}], hint}"
+            returns: "{count, term, source:'offline'|'app_store', apps:[{name, bundle_id, source?, installed_here?, last_opened?, developer?, category?, rating?, ...}], hint}"
         ),
         RPCMethodDef(
             name: "open_url",
@@ -251,7 +260,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "find_element",
-            description: "Find an on-screen element by its accessibility LABEL (exact by default) or identifier, and get a stable 'ref' + frame back. Matching order: exact label → accessibility id → (if match:'contains') substring; returns the first HITTABLE match. Use match:'contains' for loose matching, element_type to disambiguate. If the element needs scrolling to appear, use scroll_to_element instead. The returned ref is the reliable way to then tap/double_tap/long_press it.",
+            description: "Find an on-screen element by its accessibility LABEL (exact by default) or identifier, and get a stable 'ref' + frame back. Matching order: exact label → accessibility id → (if match:'contains') substring, and an element IN VIEW always beats an off-screen one (a month view holds '25' in three months — you get the visible one). The result carries visibility ('in_view'|'partial'|'offscreen') and, when several elements matched, alternatives[] and match_count. Use match:'contains' for loose matching, element_type to disambiguate. If the element needs scrolling to appear, use scroll_to_element instead. The returned ref is the reliable way to then tap/double_tap/long_press it.",
             params: [
                 RPCParamDef(name: "element_id", type: "string", required: true, description: "Accessibility label (from page_source) or identifier"),
                 RPCParamDef(name: "match", type: "string", required: false, description: "'exact' (default) or 'contains' (substring)"),
@@ -331,7 +340,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.22.0"
+    static let serverVersion = "1.32.0"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///

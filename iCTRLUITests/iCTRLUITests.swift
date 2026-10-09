@@ -848,7 +848,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// Diagnosis and recovery must not queue behind the fault they diagnose, so
     /// they get their own lane. Every method here must be free of XCUITest APIs.
     private static let nonUIMethods: Set<String> = [
-        "config", "reset", "is_locked",
+        "config", "reset", "is_locked", "logs", "recent_logs",
         "resolve_app", "search_app", "search_apps",
         "list_apps", "installed_apps",
         // Class-metadata introspection only — takes no snapshot, touches no
@@ -889,6 +889,26 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// Set when the breaker trips, so the message can name how long it's been.
     private var uiBreakerTrippedAt: Date?
     private let uiHealthLock = NSLock()
+    /// The UI call currently executing, if any. The queue is serial and a stuck
+    /// call can't be cancelled, so "what is it stuck on, and for how long" is the
+    /// one fact every later timeout needs — without it a post-mortem has to
+    /// reconstruct it from logs, and got it wrong (blamed the calls behind it).
+    private var uiInFlight: (method: String, since: TimeInterval)?
+
+    private func setUIInFlight(_ method: String?) {
+        uiHealthLock.lock()
+        uiInFlight = method.map { ($0, ProcessInfo.processInfo.systemUptime) }
+        uiHealthLock.unlock()
+    }
+
+    /// "tap (running 42s)" for the call holding the UI queue, or nil.
+    private func uiInFlightSummary() -> String? {
+        uiHealthLock.lock()
+        defer { uiHealthLock.unlock() }
+        guard let f = uiInFlight else { return nil }
+        let secs = Int(ProcessInfo.processInfo.systemUptime - f.since)
+        return "\(f.method) (running \(secs)s)"
+    }
 
     /// Consecutive timeouts before the UI channel is treated as unhealthy. Two
     /// keeps a single slow-but-recoverable action (a heavy page snapshot) from
@@ -901,11 +921,16 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         defer { uiHealthLock.unlock() }
         guard uiTimeoutStreak >= Self.uiBreakerThreshold, let since = uiBreakerTrippedAt else { return nil }
         let secs = Int(Date().timeIntervalSince(since))
+        let stuck = uiInFlight.map { f -> String in
+            let running = Int(ProcessInfo.processInfo.systemUptime - f.since)
+            return " The queue is held by \(f.method), running for \(running)s — it can't be cancelled, "
+                 + "only waited out; logs{text:\"\(f.method)\"} shows when it ends."
+        } ?? ""
         return "UI automation is unresponsive: \(uiTimeoutStreak) consecutive calls timed out "
-             + "(first \(secs)s ago), so this request was rejected instead of queued behind them. "
-             + "The accessibility connection to the foreground app has most likely dropped. "
-             + "Call reset to rebuild it, or launch_app to bring the target app back to the front. "
-             + "device_info, logs and config still work."
+             + "(first \(secs)s ago), so this request was rejected instead of queued behind them."
+             + stuck + " "
+             + "Call reset to rebuild the accessibility connection, or launch_app to bring the target app "
+             + "back to the front. logs, config and reset still answer; device_info shares the UI queue."
     }
 
     /// Record a UI method timing out. Trips the breaker at the threshold.
@@ -1016,9 +1041,15 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             // by the very state reset was called to clear.
             if method == "reset" { self.noteUISuccess() }
 
+            // Set once the call actually begins — a timeout reply has to say
+            // whether this call ran and hung, or is still waiting behind another.
+            let started = Atomic(false)
+
             queue.async {
                 let start = ProcessInfo.processInfo.systemUptime
                 var result: ([String: JSONValue]?, JSONRPCError?) = (nil, .internalError)
+                started.set(true)
+                if isUIMethod { self.setUIInFlight(method) }
 
                 // Log the request WITH key params BEFORE running it, so if this
                 // call crashes/hangs the persisted log shows exactly what was
@@ -1062,7 +1093,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 Self.logBuffer.recordTiming(method: method, ms: ms, ok: result.1 == nil)
                 // Completing at all proves the UI channel is alive, even if the
                 // action itself failed (element not found is a healthy answer).
-                if isUIMethod { self.noteUISuccess() }
+                if isUIMethod { self.setUIInFlight(nil); self.noteUISuccess() }
                 if let err = result.1 { Self.logBuffer.append("← ERR \(method): \(err.message)") }
                 done.signal()
                 replyOnce(result)  // may be a no-op if the watchdog already replied
@@ -1072,11 +1103,25 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             let budget = Self.rpcBudget(for: method)
             DispatchQueue.global().async {
                 if done.wait(timeout: .now() + budget) == .timedOut {
+                    // Queued, not hung: this call never started because another
+                    // one holds the serial UI queue. It will still run once that
+                    // finishes — the caller must know that before retrying.
+                    if isUIMethod, !started.get(), let holder = self.uiInFlightSummary() {
+                        Self.logBuffer.append("⏱ TIMEOUT \(method) — still queued behind \(holder)")
+                        self.noteUITimeout(method: method)
+                        replyOnce((nil, .serverError(
+                            "\(method) has NOT run yet: it is queued behind \(holder), which is stuck and can't be " +
+                            "cancelled. It will still execute once that finishes — do not send it again. " +
+                            "Wait, and watch logs{text:\"\(method)\"} for '⏱ ✓ \(method)'. If the stuck call is against " +
+                            "an app that left the screen, activate_app it or wait for it to fail on its own."
+                        )))
+                        return
+                    }
                     Self.logBuffer.append("⏱ TIMEOUT \(method) (>\(Int(budget))s) — still running in background")
                     if isUIMethod { self.noteUITimeout(method: method) }
                     replyOnce((nil, .serverError(
                         "\(method) exceeded \(Int(budget))s and may still be running on the device. " +
-                        "Do NOT blindly retry — check GET /logs for a '✓ \(method)' entry first; the action may have already succeeded."
+                        "Do NOT blindly retry — the action may have already succeeded. Call logs{text:\"\(method)\"} (an ordinary RPC on the non-UI lane, works even while UI calls are wedged) and look for '⏱ ✓ \(method)'. If UI calls keep timing out, reset rebuilds the accessibility connection."
                     )))
                 }
             }
@@ -1757,4 +1802,13 @@ extension String {
     static func * (lhs: String, rhs: Int) -> String {
         String(repeating: lhs, count: rhs)
     }
+}
+
+/// A lock-guarded flag, for state one queue writes and another reads.
+private final class Atomic<T> {
+    private let lock = NSLock()
+    private var value: T
+    init(_ value: T) { self.value = value }
+    func get() -> T { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ v: T) { lock.lock(); value = v; lock.unlock() }
 }

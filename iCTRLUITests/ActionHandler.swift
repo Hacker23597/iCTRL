@@ -80,14 +80,42 @@ class ActionHandler {
         }
     }
 
-    /// Resolve a stored ref back to a live XCUIElement (nil if gone/expired).
-    private func resolveRef(_ refId: String) -> XCUIElement? {
-        guard let ref = refStore[refId] else { return nil }
-        // Expired?
-        if nowMonotonic - ref.createdAt > Self.refTTL {
+    /// Resolve a stored ref back to a live XCUIElement, or say precisely why it
+    /// can't be — every failure here means the action was NOT performed.
+    ///
+    /// Checks the ref's app is still in front BEFORE querying it. A live query
+    /// against a backgrounded app doesn't fail fast: XCTest waits out its own
+    /// snapshot timeout (~16s, repeatedly), and the serial UI queue is stuck
+    /// behind it the whole time. That is exactly how one tap on App Store's
+    /// UPDATE — with App Store already sent to the background — ran for 97.9s,
+    /// timed out tap/screenshot/launch_app/device_info behind it, and then
+    /// reported the misleading "element gone". page_source and find_element had
+    /// this guard (snapshotPrecheck); refs did not.
+    private func resolveRef(_ refId: String) -> (XCUIElement?, JSONRPCError?) {
+        guard let ref = refStore[refId], nowMonotonic - ref.createdAt <= Self.refTTL else {
             refStore.removeValue(forKey: refId)
-            return nil
+            return (nil, JSONRPCError(code: -32602, message:
+                "ref '\(refId)' is unknown or expired (refs live 1 hour) — nothing was tapped. " +
+                "Re-find it with find_element/scroll_to_element.", data: nil))
         }
+
+        // Unlike snapshotPrecheck this does NOT fall through to whatever else is
+        // in front: a ref names one element in one app, and acting on a
+        // look-alike in another app would be worse than refusing.
+        if let bid = ref.bundleId, bid != "com.apple.springboard" {
+            let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bid)) ?? .unknown
+            if state == .background || state == .backgroundSuspended || state == .notRunning {
+                let live = ForegroundApp.currentBundleID()
+                let what = state == .notRunning ? "not running" : "in the background"
+                return (nil, JSONRPCError(code: -32004, message:
+                    "ref '\(refId)' belongs to \(bid), which is now \(what)" +
+                    (live.map { " (in front: \($0))" } ?? "") + " — the action was NOT performed. " +
+                    "Something moved it off screen (a system sheet, a switch to another app). " +
+                    "Check with screenshot or page_source; to continue in \(bid), activate_app{bundle_id:\"\(bid)\"} " +
+                    "and find_element again.", data: nil))
+            }
+        }
+
         let target: XCUIApplication = ref.bundleId.map { XCUIApplication(bundleIdentifier: $0) } ?? app
         let base = elementQuery(in: target, type: ref.elementType)
         let query: XCUIElementQuery
@@ -97,7 +125,22 @@ class ActionHandler {
         case .containsLabel(let v): query = base.matching(NSPredicate(format: "label CONTAINS[c] %@", v))
         }
         let el = query.element(boundBy: ref.index)
-        return el.safeExists ? el : nil
+        var reason: NSString?
+        switch ForegroundApp.boolPropertyState("exists", ofElement: el, reason: &reason) {
+        case 1:
+            return (el, nil)
+        case 0:
+            return (nil, JSONRPCError(code: -32602, message:
+                "ref '\(refId)' no longer matches anything — the view changed since it was found. " +
+                "Nothing was tapped. Re-find it with find_element/scroll_to_element.", data: nil))
+        default:
+            // XCTest couldn't answer at all. Not the same as "gone", and saying
+            // "gone" is what misled the last post-mortem.
+            return (nil, .serverError(
+                "Couldn't resolve ref '\(refId)': the accessibility query failed (\(reason as String? ?? "no reason given")). " +
+                "The app is probably busy or changing screens — the action was NOT performed, so it is safe " +
+                "to retry once it settles (check with screenshot)."))
+        }
     }
 
     private func elementQuery(in target: XCUIApplication, type: String?) -> XCUIElementQuery {
@@ -128,7 +171,37 @@ class ActionHandler {
     /// live-detected foreground app. An explicit bundle_id on the call overrides
     /// everything (handled by callers passing it through).
     private func resolveForegroundBundleId() -> String? {
+        // The binding is a PREFERENCE, not a fact. It used to win
+        // unconditionally, which meant that once the bound app was closed or
+        // switched away from, every read stayed pointed at it — reporting a
+        // stale bundle id from device_info, refusing page_source as
+        // "backgrounded", and in the worst case returning a tree belonging to
+        // an app that is no longer on screen. Reported in the wild: screenshots
+        // showed Minis while page_source served an Apple Store checkout tree.
+        //
+        // So the binding only holds while the app it names is actually usable.
         if let bound = boundBundleId, !bound.isEmpty {
+            let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bound)) ?? .unknown
+            if state == .foreground || state == .unknown {
+                return bound
+            }
+            // Bound app is background/suspended/gone — defer to what is really
+            // in front, and drop the binding so it stops misleading later calls.
+            if let live = ForegroundApp.currentBundleID(), !live.isEmpty, live != bound {
+                // SpringBoard in front means an alert or the home screen over
+                // the app, not a new target: read it, but keep the binding so
+                // we snap back when the app returns. Rebinding to SpringBoard
+                // would stick for good — it reports foreground permanently.
+                if live == "com.apple.springboard" {
+                    iCTRLUITests.logBuffer.append(
+                        "🔀 bound app \(bound) is \(state) — SpringBoard is in front (alert/home), reading it")
+                    return live
+                }
+                iCTRLUITests.logBuffer.append(
+                    "🔀 bound app \(bound) is \(state) — following live foreground \(live)")
+                boundBundleId = live
+                return live
+            }
             return bound
         }
         // Never opened anything explicitly — use the live foreground app.
@@ -159,6 +232,17 @@ class ActionHandler {
 
     /// Appended to lookup failures in a browser — the one piece of advice that
     /// actually recovers the situation.
+    /// Told at the moment a caller is hunting for an app icon — screenshotting
+    /// or tapping the home screen — since that is when the advice lands; the
+    /// same rule sitting in SKILL.md was skipped in a real session.
+    static let homeScreenAdvice =
+        "You are on the home screen. To open an app don't hunt for its icon (folders, pages and " +
+        "layout differ per device): resolve_app{text:\"<app name>\"} → launch_app{bundle_id}."
+
+    static func isHomeScreen() -> Bool {
+        ForegroundApp.currentBundleID() == "com.apple.springboard"
+    }
+
     private static let webViewAdvice =
         " ⚠️ The foreground app is a BROWSER: web page content is NOT exposed to the " +
         "accessibility tree, so find_element/page_source can never see links, buttons or text in the page " +
@@ -290,7 +374,8 @@ class ActionHandler {
     ///   - if it's already frontmost (or was just launched), no-op.
     /// Returns an error to abort the action, or nil to proceed. `note` (if set) is
     /// attached to the successful response so the model learns what happened.
-    private func ensureBoundAppForeground(allowOverAlert: Bool = false) -> (error: JSONRPCError?, note: String?) {
+    private func ensureBoundAppForeground(allowOverAlert: Bool = false,
+                                          refBased: Bool = false) -> (error: JSONRPCError?, note: String?) {
         // A system alert (permission prompt, etc.) sits above the app. A ref/
         // element interaction on the bound app underneath would misfire, so we
         // surface guidance — BUT a raw coordinate tap can legitimately target the
@@ -330,9 +415,17 @@ class ActionHandler {
             return (nil, "The previously bound app '\(bound)' had exited, so it was unbound; " +
                 "actions now target the live foreground app. Re-open it with " +
                 "launch_app{bundle_id:\"\(bound)\"} to bind to it again.")
+        case .background where refBased, .backgroundSuspended where refBased:
+            // A ref names an element in THAT app, so pulling the app back is
+            // tempting — but activate() is the XCTest call that hangs (it waits
+            // for the app to go idle), and the 3s bound below only stops us
+            // waiting, not the call. On App Store that combination held the UI
+            // queue for 97.9s. The app may also have left on purpose (a system
+            // sign-in sheet). Leave it; resolveRef refuses at once and says why.
+            return (nil, nil)
         case .background, .backgroundSuspended, .unknown:
             // Bring it forward — exception-safe, bounded.
-            _ = runWithTimeout(seconds: 3) {
+            _ = runWithTimeout(seconds: 3, label: "activate") {
                 _ = ForegroundApp.safeActivateBundleID(bound)
             }
             lastBoundActivateAt = nowMonotonic
@@ -362,7 +455,8 @@ class ActionHandler {
             let hasCoords = cmd.x != nil && cmd.y != nil
             let hasCoordPair = cmd.fromX != nil && cmd.fromY != nil
             let coordinateBased = hasCoords || hasCoordPair
-            let prep = ensureBoundAppForeground(allowOverAlert: coordinateBased)
+            let refBased = cmd.ref != nil || cmd.fromRef != nil || cmd.toRef != nil
+            let prep = ensureBoundAppForeground(allowOverAlert: coordinateBased, refBased: refBased)
             if let err = prep.error { return (nil, err) }   // alert up / app crashed → abort with guidance
             foregroundNote = prep.note
         }
@@ -406,6 +500,28 @@ class ActionHandler {
             return unlock()
         case "is_locked":
             return isLocked()
+        case "logs", "recent_logs":
+            // An RPC, not just the GET /logs byte stream. The timeout messages
+            // tell a caller to "check the logs to see whether the action
+            // actually landed" — but /logs needs a stream_ticket minted over
+            // this very channel, so following that advice cost an extra
+            // round trip plus URL assembly at exactly the wrong moment.
+            // Reported as a real obstacle during a wedged session.
+            let n = max(1, min(cmd.maxElements ?? 80, 500))
+            let all = iCTRLUITests.logBuffer.dump().split(separator: "\n").map(String.init)
+            var tail = Array(all.suffix(n))
+            if let needle = cmd.text, !needle.isEmpty {
+                tail = all.filter { $0.localizedCaseInsensitiveContains(needle) }.suffix(n)
+            }
+            return ([
+                "lines": .array(tail.map { .string($0) }),
+                "count": .int(tail.count),
+                "total": .int(all.count),
+                "hint": .string(
+                    "Most recent last. After a timeout, look for '⏱ ✓ <method>' — that means the action "
+                    + "COMPLETED on the device and must not be retried; '⏱ ✗' or '⏱ TIMEOUT' mean it did not. "
+                    + "Pass text:\"<method>\" to filter, max_elements to change how many lines come back."),
+            ], nil)
         case "snapshot_api":
             var out: [String: JSONValue] = [:]
             for (k, v) in ForegroundApp.snapshotAPICapabilities() {
@@ -784,7 +900,7 @@ class ActionHandler {
             // that can be slow, and only when the caller explicitly asked for it.
             var appImage: UIImage?
             var finished = false
-            let done = runWithTimeout(seconds: 3) {
+            let done = runWithTimeout(seconds: 3, label: "app-screenshot") {
                 _ = ObjCException.catching {
                     appImage = XCUIApplication(bundleIdentifier: bid).screenshot().image
                 }
@@ -867,6 +983,7 @@ class ActionHandler {
             ),
         ]
         if !wantPNG { result["quality"] = .double(quality) }
+        if Self.isHomeScreen() { result["hint"] = .string(Self.homeScreenAdvice) }
         var out = result
         if let bid = scopedTo {
             out["scoped_to"] = .string(bid)
@@ -912,9 +1029,8 @@ class ActionHandler {
     /// Resolve a ref for a spatial action, returning the live element or a
     /// descriptive error. Shared by tap/double_tap/long_press.
     private func resolveRefForAction(_ refId: String) -> (XCUIElement?, JSONRPCError?) {
-        guard let el = resolveRef(refId) else {
-            return (nil, JSONRPCError(code: -32602, message: "ref '\(refId)' no longer resolves — element gone, view changed, or ref expired (refs live 1 hour). Re-find it with find_element/scroll_to_element.", data: nil))
-        }
+        let (resolved, err) = resolveRef(refId)
+        guard let el = resolved else { return (nil, err) }
         guard el.safeIsHittable else {
             let f = el.frame
             return (nil, JSONRPCError(code: -32602, message: "Element for ref '\(refId)' exists but isn't hittable; scroll it fully into view (scroll_to_element) or tap its center by coordinate (\(Int(f.midX)),\(Int(f.midY))).", data: nil))
@@ -973,7 +1089,29 @@ class ActionHandler {
         // which on animation-heavy apps could block for up to 60s. Pass fast:false
         // only if you specifically need XCUITest's element-aware tap.
         if cmd.fast != false {
-            return fastHandler.fastTap(x: x, y: y)
+            // Sample what sits under the point BEFORE tapping: afterwards the UI
+            // may have moved (a keyboard appearing shifts everything up), so a
+            // post-tap probe would describe the new layout, not what was hit.
+            let hit = elementUnder(x: x, y: y)
+            var r = fastHandler.fastTap(x: x, y: y)
+            if var data = r.0 {
+                if let h = hit {
+                    data["hit"] = .object(h)
+                } else {
+                    // Nothing interactive there. The synthesized event still
+                    // "succeeds" — iOS delivers it to empty space — so without
+                    // this the caller sees success and only finds out from a
+                    // screenshot that the keyboard never appeared.
+                    data["hit_warning"] = .string(
+                        "No labelled element was found at (\(Int(x)),\(Int(y))) — the tap may have "
+                        + "landed on empty space. Coordinates also go stale when the layout shifts "
+                        + "(a keyboard appearing moves everything up). Re-read page_source and prefer "
+                        + "find_element{element_id} → tap{ref}, which re-resolves the live element.")
+                }
+                if Self.isHomeScreen() { data["hint"] = .string(Self.homeScreenAdvice) }
+                r.0 = data
+            }
+            return r
         }
 
         let normalized = app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
@@ -1130,12 +1268,20 @@ class ActionHandler {
         // since an XCUITest gesture blocks the (serial) UI queue while it runs.
         let travel = abs(fromY - toY)
         let dragDuration = min(max(travel / 300.0, 0.30), 2.5)
+        // Sampled before and after so the response can say whether the gesture
+        // actually moved anything — see scrollOutcome.
+        let before = scrollFingerprint()
         let r = fastHandler.fastSwipe(fromX: cx, fromY: fromY, toX: cx, toY: toY, duration: dragDuration)
         if r.1 != nil { return r }
-        return ([
+        // Let the content settle before sampling, or an in-flight scroll reads
+        // as "didn't move".
+        usleep(350_000)
+        var out: [String: JSONValue] = [
             "message": .string("Paged \(goingDown ? "down" : "up") \(pages) screenful(s) — 75% of the screen each, so consecutive reads overlap by ~25% and nothing falls between them. Precise scroll (no momentum). Re-read with page_source/screenshot."),
             "screen": coordinateHint,
-        ], nil)
+        ]
+        for (k, v) in scrollOutcome(before: before, after: scrollFingerprint()) { out[k] = v }
+        return (out, nil)
     }
 
     private func swipe(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
@@ -1240,10 +1386,16 @@ class ActionHandler {
             case "left":  (fx, fy, tx, ty) = (midX + dx, midY, midX - dx, midY)
             default:      (fx, fy, tx, ty) = (midX - dx, midY, midX + dx, midY)
             }
+            let before = scrollFingerprint()
             let r = fastHandler.fastSwipe(fromX: fx, fromY: fy, toX: tx, toY: ty, duration: 0.3)
             if r.1 == nil {
-                return (["message": .string("Scrolled \(direction) (synthesized)"),
-                         "screen": coordinateHint], nil)
+                usleep(350_000)
+                var out: [String: JSONValue] = [
+                    "message": .string("Scrolled \(direction) (synthesized)"),
+                    "screen": coordinateHint,
+                ]
+                for (k, v) in scrollOutcome(before: before, after: scrollFingerprint()) { out[k] = v }
+                return (out, nil)
             }
             // fall through to the native gesture when synthesis failed
         }
@@ -1403,47 +1555,99 @@ class ActionHandler {
     }
 
     /// Clear the currently-focused text field. Requires the field to already have
-    /// keyboard focus (tap it first). Strategy: move the caret to the end, then
-    /// send a run of backspaces. We size the run from the focused element's value
-    /// length when we can read it, and otherwise fall back to a generous default
-    /// (extra backspaces past an empty field are harmless no-ops).
-    /// Returns the number of delete keystrokes sent.
+    /// keyboard focus (tap it first). Strategy: ⌘A + one delete, verified by
+    /// re-reading the field; if the selection didn't take, a run of backspaces
+    /// and forward-deletes sized from the text length (extra deletes past an
+    /// empty field are harmless no-ops).
+    /// Returns the number of delete keystrokes sent — exactly 1 means select-all worked.
     @discardableResult
     private func clearFocusedField() -> Int {
-        // Best-effort read of the focused element's current text length.
-        var count = 0
-        if let bid = resolveForegroundBundleId() {
-            let target = XCUIApplication(bundleIdentifier: bid)
-            // The focused field usually surfaces as the element with keyboardFocus.
-            let focused = target.textFields.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-            if focused.safeExists, let v = focused.value as? String { count = v.count }
-            if count == 0 {
-                let sv = target.secureTextFields.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-                if sv.safeExists, let v = sv.value as? String { count = v.count }
-            }
-        }
-        // Fall back to a generous fixed count if we couldn't measure it. Cap the
-        // measured count too, so a pathological value can't send thousands of keys.
-        let deletes = min(max(count, count == 0 ? 60 : count), 200)
+        // Best-effort read of the focused field's current text.
+        let count = focusedFieldValue()?.count ?? 0
+        // Select-all, then one delete. Backspacing character-by-character was
+        // wrong in two ways that compounded:
+        //
+        //   * it sent EXACTLY `count` backspaces, leaving no margin, so any
+        //     dropped keystroke left text behind;
+        //   * the comment claimed it moved the caret to the end first, but no
+        //     such key was ever sent — so it only deleted to the LEFT of
+        //     wherever the caret happened to be.
+        //
+        // Observed: clearing "someone@example.com" (19 chars, 19 backspaces)
+        // left ".com" — the caret sat before ".com", 15 characters went, and the
+        // remaining 4 backspaces hit an empty run.
+        //
+        // ⌘A doesn't care where the caret is and is a fixed two keystrokes
+        // regardless of length, so it is both correct and faster.
+        let selectedAll = selectAllInFocusedField()
 
-        // Move caret to end first (End of text), then delete backwards. \u{8} is
-        // backspace; some fields also honor forward-delete, but backspace after
-        // caret-to-end covers the common case.
-        let record = XCSynthesizedEventRecord(name: "ClearText")
-        let path = XCPointerEventPath(forTextInput: ())
-        let backspaces = String(repeating: "\u{8}", count: deletes)
-        path.typeText(backspaces, atOffset: 0.0, typingSpeed: 90, shouldRedact: false)
-        record.add(path)
-        try? record.synthesize()
-        return deletes
+        // Backspace after select-all replaces the selection. If ⌘A didn't take
+        // (some custom/web inputs ignore it), fall back to backspaces — with
+        // slack this time, and a forward-delete run to catch anything sitting
+        // to the RIGHT of the caret.
+        func send(_ keys: String) {
+            let record = XCSynthesizedEventRecord(name: "ClearText")
+            let path = XCPointerEventPath(forTextInput: ())
+            path.typeText(keys, atOffset: 0.0, typingSpeed: 90, shouldRedact: false)
+            record.add(path)
+            try? record.synthesize()
+        }
+        func backspaceRun() -> Int {
+            let n = min(max(count + 8, 40), 200)
+            send(String(repeating: "\u{8}", count: n) + String(repeating: "\u{7F}", count: n))
+            return n
+        }
+
+        guard selectedAll else { return backspaceRun() }
+        send("\u{8}")
+        // ⌘A being DELIVERED is not ⌘A being honoured: Flutter, React Native
+        // and web inputs often ignore the shortcut, and then the single delete
+        // above removed one character while this reported the field cleared.
+        // If the text shrank by one or less, the selection never happened.
+        // (An emptied field may read back as its placeholder; that is a
+        // different length, and a spare backspace run on it is a no-op.)
+        if count > 1, let after = focusedFieldValue(), !after.isEmpty, after.count >= count - 1 {
+            iCTRLUITests.logBuffer.append("⌨️ ⌘A had no effect on the focused field — falling back to backspaces")
+            return 1 + backspaceRun()
+        }
+        return 1
+    }
+
+    /// Select the whole contents of the focused field with ⌘A.
+    ///
+    /// Returns false when no focused element could be resolved, or when the
+    /// keystroke threw — callers then need a fallback, since a false negative
+    /// here means the field is still full.
+    private func selectAllInFocusedField() -> Bool {
+        guard let bid = resolveForegroundBundleId() else { return false }
+        let target = XCUIApplication(bundleIdentifier: bid)
+        for query in [target.textFields, target.secureTextFields, target.searchFields, target.textViews] {
+            let el = query.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
+            guard el.safeExists else { continue }
+            // Obj-C @try: typeKey raises on an element that cannot accept keys,
+            // and an NSException here would take the runner down with it.
+            var ok = false
+            _ = ObjCException.catching {
+                el.typeKey("a", modifierFlags: .command)
+                ok = true
+            }
+            if ok { return true }
+        }
+        return false
     }
 
     /// clear_text method: clear the focused field without typing anything new.
     private func clearText(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         let keyboardConfirmed = hasKeyboardFocus()
         let sent = clearFocusedField()
+        // `sent == 1` means select-all worked; anything larger means it fell
+        // back to blind backspacing, which is worth knowing when a field turns
+        // out not to be empty afterwards.
         var out: [String: JSONValue] = [
-            "message": .string("Cleared focused field (\(sent) deletes sent)"),
+            "message": .string(sent == 1
+                ? "Cleared focused field (select-all + delete)"
+                : "Cleared focused field by deleting characters (\(sent) keystrokes) — this field doesn't support select-all"),
+            "method": .string(sent == 1 ? "select_all" : "backspaces"),
         ]
         if !keyboardConfirmed {
             out["warning"] = .string(
@@ -1571,13 +1775,60 @@ class ActionHandler {
     /// XCUIApplication.launch()/activate() can hang indefinitely (bad bundle id,
     /// animation-heavy launch), and since RPCs run serially on the main thread,
     /// one hang freezes the WHOLE server. This bounds the wait and returns instead.
-    private func runWithTimeout(seconds: TimeInterval, _ work: @escaping () -> Void) -> Bool {
+    ///
+    /// A timeout only stops the WAITING: the work can't be cancelled and keeps
+    /// running. With `label`, at most one abandoned call per label may be alive —
+    /// while one is, new calls with that label are refused (return false at
+    /// once) instead of stacking up. Unbounded stacking is how abandoned XCTest
+    /// queries can hold several cores at 100% until iOS kills the runner.
+    private func runWithTimeout(seconds: TimeInterval, label: String? = nil,
+                                _ work: @escaping () -> Void) -> Bool {
+        if let label = label, let since = Self.abandonedSince(label) {
+            iCTRLUITests.logBuffer.append(
+                "🧵 \(label) skipped — the previous one was abandoned \(Int(nowMonotonic - since))s ago and is still running")
+            return false
+        }
+        final class Job { let lock = NSLock(); var state = 0 }   // 0 running, 1 finished, 2 abandoned
+        let job = Job()
         let sem = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .userInitiated).async {
             work()
             sem.signal()
+            job.lock.lock()
+            let wasAbandoned = job.state == 2
+            job.state = 1
+            job.lock.unlock()
+            if wasAbandoned, let label = label, let since = Self.clearAbandoned(label) {
+                iCTRLUITests.logBuffer.append(
+                    "🧵 abandoned \(label) finally ended after \(Int(ProcessInfo.processInfo.systemUptime - since))s")
+            }
         }
-        return sem.wait(timeout: .now() + seconds) == .success
+        if sem.wait(timeout: .now() + seconds) == .success { return true }
+        job.lock.lock()
+        defer { job.lock.unlock() }
+        guard job.state == 0 else { return true }   // finished in the gap
+        job.state = 2
+        if let label = label {
+            Self.markAbandoned(label)
+            iCTRLUITests.logBuffer.append(
+                "🧵 \(label) abandoned after \(Int(seconds))s — still running in the background")
+        }
+        return false
+    }
+
+    private static let abandonedLock = NSLock()
+    private static var abandoned: [String: TimeInterval] = [:]
+
+    private static func abandonedSince(_ label: String) -> TimeInterval? {
+        abandonedLock.lock(); defer { abandonedLock.unlock() }
+        return abandoned[label]
+    }
+    private static func markAbandoned(_ label: String) {
+        abandonedLock.lock(); abandoned[label] = ProcessInfo.processInfo.systemUptime; abandonedLock.unlock()
+    }
+    private static func clearAbandoned(_ label: String) -> TimeInterval? {
+        abandonedLock.lock(); defer { abandonedLock.unlock() }
+        return abandoned.removeValue(forKey: label)
     }
 
     /// List installed apps (bundle_id + name). Optional `text` filters by a
@@ -1585,23 +1836,31 @@ class ActionHandler {
     /// includes system apps (default: user apps only).
     private func listApps(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         let userOnly = (cmd.elementType?.lowercased() != "all")
-        guard let apps = ForegroundApp.installedAppsUserOnly(userOnly) else {
-            return (nil, .serverError("Could not list installed apps (LSApplicationWorkspace unavailable)."))
-        }
+        let enumerated = ForegroundApp.installedAppsUserOnly(userOnly) ?? []
+
+        // iOS 26 answers the enumeration with nothing. What we can still say is
+        // which apps were opened successfully HERE — incomplete, but every entry
+        // is real, which is more than an empty list offers.
+        let fromHistory = enumerated.isEmpty
+        let apps: [[AnyHashable: Any]] = fromHistory ? AppMemory.shared.openedApps() : enumerated
 
         let filter = cmd.text?.lowercased()
         var items: [JSONValue] = []
         for entry in apps {
             let bid = entry["bundle_id"] as? String ?? ""
-            let name = entry["name"] as? String ?? ""
+            var name = entry["name"] as? String ?? ""
+            if name.isEmpty {
+                name = Self.builtInApp(bid)?["name"] ?? entry["store_name"] as? String ?? ""
+            }
             if let f = filter, !f.isEmpty,
                !name.lowercased().contains(f), !bid.lowercased().contains(f) {
                 continue
             }
-            items.append(.object([
-                "bundle_id": .string(bid),
-                "name": .string(name),
-            ]))
+            var obj: [String: JSONValue] = ["bundle_id": .string(bid), "name": .string(name)]
+            if fromHistory, let t = entry["last_opened"] as? Double {
+                obj["last_opened"] = .string(ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: t)))
+            }
+            items.append(.object(obj))
         }
 
         // An empty list is NOT proof the app is missing. This enumeration goes
@@ -1610,8 +1869,14 @@ class ActionHandler {
         // on a device with dozens of apps installed. Saying so here matters:
         // otherwise a caller reads count:0 as "not installed" and abandons a
         // task that was perfectly doable.
-        var hint = "Use a bundle_id with launch_app. Pass {\"text\":\"大麦\"} to filter, " +
+        var hint = "Use a bundle_id with launch_app. Pass {\"text\":\"<name>\"} to filter, " +
                    "or {\"element_type\":\"all\"} to include system apps."
+        if fromHistory {
+            hint = "iOS refused app enumeration, so this lists only apps previously OPENED successfully " +
+                   "through iCTRL on this device (most recent first). Every entry is installed; an app " +
+                   "missing from here may still be installed — resolve_app{text:\"<name>\"} then " +
+                   "launch_app to check."
+        }
         if items.isEmpty {
             hint = "⚠️ Empty result — this does NOT mean the app is absent. App enumeration is a " +
                    "private API that newer iOS versions may refuse, returning nothing even when the " +
@@ -1620,6 +1885,7 @@ class ActionHandler {
         }
         return ([
             "count": .int(items.count),
+            "source": .string(fromHistory ? "opened_history" : "system"),
             "apps": .array(items),
             "hint": .string(hint),
         ], nil)
@@ -1651,6 +1917,11 @@ class ActionHandler {
         return apps
     }()
 
+    /// The built-in catalog entry for one bundle id, if it has one.
+    private static func builtInApp(_ bundleId: String) -> [String: String]? {
+        builtInApps.first { $0["bundle_id"] == bundleId }
+    }
+
     /// Case-insensitive lookup in the built-in catalog by name / query / bundle_id.
     /// Returns matches as {name, bundle_id} dicts.
     private func lookupBuiltInApps(_ term: String) -> [[String: String]] {
@@ -1680,33 +1951,63 @@ class ActionHandler {
         let country = cmd.country ?? "cn"
         let limit = min(max(Int(cmd.distance ?? 5), 1), 25)
 
-        // 1) Built-in catalog first — instant, offline, covers common apps.
-        let builtIn = lookupBuiltInApps(term)
-        if !builtIn.isEmpty {
-            let apps: [JSONValue] = builtIn.prefix(limit).map { a in
-                .object([
-                    "name": .string(a["name"] ?? ""),
-                    "bundle_id": .string(a["bundle_id"] ?? ""),
-                    "source": .string("built-in"),
-                ])
+        // 1) Offline first: what this device has learned (opened apps, earlier
+        //    store lookups) merged with the built-in catalog. Both use the same
+        //    {name, bundle_id, query, country} shape and are joined PER BUNDLE
+        //    ID — a term may hit only one side (the catalog's query "boss直聘"
+        //    vs the home-screen name read at launch), and either hit must still
+        //    carry the other side's facts, above all "opened here".
+        var order: [String] = []
+        var seen = Set<String>()
+        for e in AppMemory.shared.lookup(term) {
+            if let bid = e["bundle_id"] as? String, seen.insert(bid).inserted { order.append(bid) }
+        }
+        for a in lookupBuiltInApps(term) {
+            if let bid = a["bundle_id"], seen.insert(bid).inserted { order.append(bid) }
+        }
+        var offline: [(verified: Bool, obj: JSONValue)] = []
+        for bid in order {
+            let learned = AppMemory.shared.entry(for: bid)
+            let builtIn = Self.builtInApp(bid)
+            let verified = (learned?["installed"] as? Bool) == true
+            let name = (learned?["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? builtIn?["name"] ?? learned?["store_name"] as? String ?? ""
+            var obj: [String: JSONValue] = [
+                "name": .string(name),
+                "bundle_id": .string(bid),
+                "source": .string(verified ? "opened_here" : (builtIn != nil ? "built-in" : "learned")),
+            ]
+            if let installed = learned?["installed"] as? Bool { obj["installed_here"] = .bool(installed) }
+            if let t = learned?["last_opened"] as? Double {
+                obj["last_opened"] = .string(ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: t)))
             }
+            offline.append((verified, .object(obj)))
+        }
+        // Proven-installed first, otherwise the order found (a partition, not
+        // sort — Swift's sort does not promise stability).
+        offline = offline.filter { $0.verified } + offline.filter { !$0.verified }
+        let anyVerified = offline.contains { $0.verified }
+        if !offline.isEmpty {
+            let apps = offline.prefix(limit).map(\.obj)
             return ([
                 "count": .int(apps.count),
                 "term": .string(term),
-                "source": .string("built-in"),
+                "source": .string("offline"),
                 "apps": .array(apps),
-                // The catalog says what a bundle id IS, never whether it is on
-                // this device — it is a static, offline name→id table. A match
-                // here reads like confirmation and is not one: resolving 美团 to
-                // com.meituan.imeituan succeeded on a device that did not have
-                // it, and only launch_app revealed that.
-                "hint": .string("Matched the built-in app catalog (instant, offline) — this maps a NAME to a " +
-                                "bundle_id and does NOT mean the app is installed here. Confirm by calling " +
-                                "launch_app: success proves it, an error means genuinely absent. " +
-                                Self.appLookupFallbackHint),
+                // A catalog hit says what a bundle id IS, never whether it is on
+                // this device. It reads like confirmation and is not one:
+                // resolving 美团 to com.meituan.imeituan succeeded on a device
+                // that did not have it, and only launch_app revealed that. Only
+                // 'opened_here' entries are evidence about this device.
+                "hint": .string(anyVerified
+                    ? "Entries with source 'opened_here' were launched successfully on THIS device before — " +
+                      "call launch_app with that bundle_id directly. Other entries only map a name to a bundle_id."
+                    : "Matched offline (built-in catalog / earlier store lookups) — this maps a NAME to a " +
+                      "bundle_id and does NOT mean the app is installed here. Confirm by calling " +
+                      "launch_app: success proves it, an error means genuinely absent. " +
+                      Self.appLookupFallbackHint),
             ], nil)
         }
-
         // 2) Fall back to the iTunes Search API.
         var comps = URLComponents(string: "https://itunes.apple.com/search")!
         comps.queryItems = [
@@ -1752,6 +2053,12 @@ class ActionHandler {
                 "version": .string(r["version"] as? String ?? ""),
                 "track_id": .int((r["trackId"] as? Int) ?? 0),
             ])
+        }
+
+        // Keep the mapping so the next lookup for this name is offline.
+        for r in results {
+            guard let bid = r["bundleId"] as? String, let name = r["trackName"] as? String else { continue }
+            AppMemory.shared.recordResolved(bundleId: bid, name: name, query: term, country: country)
         }
 
         return ([
@@ -1801,14 +2108,17 @@ class ActionHandler {
         // what XCUIApplication.launch()/activate() did).
         let opened = ForegroundApp.openBundleID(bundleId)
         guard opened else {
+            AppMemory.shared.recordNotInstalled(bundleId: bundleId)
             return (nil, .serverError(
-                "Could not open '\(bundleId)'. The bundle_id is likely wrong or not installed. Call list_apps to find the correct one."
+                "Could not open '\(bundleId)'. The bundle_id is likely wrong or not installed. " +
+                "Call resolve_app{text:\"<app name>\"} to look up the correct one."
             ))
         }
         usleep(800_000)  // brief settle; app is coming to foreground async
         lastForegroundBundleId = bundleId
         boundBundleId = bundleId       // sticky target for subsequent actions
         lastBoundActivateAt = nowMonotonic  // just brought forward — skip redundant re-activate
+        rememberOpened(bundleId)
         return ([
             "message": .string("Opened \(bundleId). Actions now target this app until you open another."),
             "bound_app": .string(bundleId),
@@ -1828,7 +2138,7 @@ class ActionHandler {
         // Safe activate (Obj-C @try/@catch) — a raw XCUIApplication.activate() can
         // throw an NSException that Swift can't catch and that aborts the runner.
         var activated = false
-        let ok = runWithTimeout(seconds: 5) {
+        let ok = runWithTimeout(seconds: 5, label: "activate") {
             activated = ForegroundApp.safeActivateBundleID(bundleId)
         }
         guard ok else {
@@ -1840,14 +2150,41 @@ class ActionHandler {
         lastForegroundBundleId = bundleId
         boundBundleId = bundleId       // sticky target for subsequent actions
         lastBoundActivateAt = nowMonotonic  // just brought forward — skip redundant re-activate
+        rememberOpened(bundleId)
         return (["message": .string("Activated \(bundleId). Actions now target this app.")], nil)
+    }
+
+    /// Record `bundleId` in AppMemory as installed — but only once the process
+    /// is demonstrably up. `openApplicationWithBundleID:` returning YES means
+    /// the request was accepted, not that anything launched, and a history that
+    /// lists apps which never opened would repeat list_apps' old lie in reverse.
+    ///
+    /// The name is read once (first launch) and cached; it is one accessibility
+    /// round-trip, bounded so a cold-starting app can't stall launch_app.
+    private func rememberOpened(_ bundleId: String) {
+        let needName = !AppMemory.shared.hasName(bundleId)
+        var state = AppState.unknown
+        var name: String?
+        _ = runWithTimeout(seconds: 2, label: "app-state") {
+            state = AppState(rawValue: ForegroundApp.appState(forBundleID: bundleId)) ?? .unknown
+            if needName, state != .notRunning, state != .unknown {
+                name = ForegroundApp.safeLabel(forBundleID: bundleId)
+            }
+        }
+        let running: Set<AppState> = [.foreground, .background, .backgroundSuspended]
+        guard running.contains(state) || ForegroundApp.currentBundleID() == bundleId else {
+            iCTRLUITests.logBuffer.append("📒 not remembering \(bundleId) — state \(state) after open")
+            return
+        }
+        AppMemory.shared.recordOpened(bundleId: bundleId, name: name)
+        iCTRLUITests.logBuffer.append("📒 remembered \(bundleId)\(name.map { " as '\($0)'" } ?? "")")
     }
 
     private func terminateApp(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let bundleId = cmd.bundleId else {
             return (nil, JSONRPCError(code: -32602, message: "terminate_app requires a 'bundle_id'", data: nil))
         }
-        let ok = runWithTimeout(seconds: 5) {
+        let ok = runWithTimeout(seconds: 5, label: "terminate") {
             _ = ForegroundApp.safeTerminateBundleID(bundleId)
         }
         guard ok else {
@@ -1877,6 +2214,133 @@ class ActionHandler {
     /// Same clear-per-call pattern as lastLocateError.
     private var lastLocateSnapFrame: CGRect?
     private var lastLocateSnapLabel: String?
+    /// Every candidate the last bounded locate saw, best first — lets
+    /// find_element say "3 matches, picked the on-screen one" instead of
+    /// silently choosing. nil when a fallback path matched.
+    private var lastLocateScan: LocateScan?
+
+    /// One match from `ForegroundApp.locateInBoundedSnapshot`.
+    struct LocateHit {
+        let label: String
+        let identifier: String
+        let byLabel: Bool          // re-resolve by label (else by identifier)
+        let ordinal: Int           // index among same-label (or same-id) live matches
+        let how: String            // exact | id | contains
+        let frame: CGRect
+        let visibility: String     // in_view | partial | offscreen
+        let container: CGRect?     // nearest scrollable ancestor
+
+        var inView: Bool { visibility == "in_view" }
+        var match: ElementRef.Match { byLabel ? .exactLabel(label) : .identifier(identifier) }
+
+        init?(_ d: [String: Any]) {
+            func num(_ k: String) -> Double { (d[k] as? NSNumber)?.doubleValue ?? 0 }
+            label = d["label"] as? String ?? ""
+            identifier = d["identifier"] as? String ?? ""
+            byLabel = (d["key"] as? String) != "identifier"
+            ordinal = (d["ordinal"] as? NSNumber)?.intValue ?? 0
+            how = d["how"] as? String ?? "exact"
+            frame = CGRect(x: num("x"), y: num("y"), width: num("w"), height: num("h"))
+            visibility = d["visibility"] as? String ?? "offscreen"
+            container = (d["container"] as? [String: Any]).map(LocateScan.rect)
+            if byLabel ? label.isEmpty : identifier.isEmpty { return nil }
+        }
+
+        var summary: JSONValue {
+            .object([
+                "label": .string(label.isEmpty ? identifier : label),
+                "visibility": .string(visibility),
+                "center_x": .double(frame.midX),
+                "center_y": .double(frame.midY),
+            ])
+        }
+    }
+
+    /// The result of one bounded walk: ranked candidates plus the screen facts
+    /// scroll_to_element steers by.
+    struct LocateScan {
+        let candidates: [LocateHit]
+        let contentTop: Double
+        let contentBottom: Double
+        let fingerprint: String
+        let scrollContainer: CGRect?
+        let visited: Int
+
+        static func rect(_ d: [String: Any]) -> CGRect {
+            func num(_ k: String) -> Double { (d[k] as? NSNumber)?.doubleValue ?? 0 }
+            return CGRect(x: num("x"), y: num("y"), width: num("w"), height: num("h"))
+        }
+    }
+
+    /// XCUIElementType raw values matching `elementQuery(in:type:)` exactly —
+    /// the ordinal a candidate carries is only meaningful against a live query
+    /// filtered the same way. nil = any type.
+    private static func typeFilterRaws(_ type: String?) -> [NSNumber]? {
+        let t: XCUIElement.ElementType
+        switch type?.lowercased() {
+        case "button":                  t = .button
+        case "textfield", "text_field": t = .textField
+        case "textview", "text_view":   t = .textView
+        case "label", "static_text":    t = .staticText
+        case "image":                   t = .image
+        case "cell":                    t = .cell
+        case "switch":                  t = .switch
+        case "icon":                    t = .icon
+        default:                        return nil
+        }
+        return [NSNumber(value: t.rawValue)]
+    }
+
+    /// One bounded snapshot, every match ranked. nil when the bounded path is
+    /// unavailable — callers fall back rather than treating that as "absent".
+    private func scanCandidates(query: String, type: String?, matchMode: String,
+                                bundleId: String) -> LocateScan? {
+        guard let root = ForegroundApp.boundedSnapshot(
+                forBundleID: bundleId,
+                maxDepth: Self.defaultMaxDepth,
+                maxChildren: Self.maxChildrenPerNode),
+              let r = ForegroundApp.locate(
+                inBoundedSnapshot: root, query: query,
+                contains: matchMode == "contains",
+                types: Self.typeFilterRaws(type),
+                viewport: CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height),
+                maxDepth: Self.defaultMaxDepth) as? [String: Any] else { return nil }
+        let raw = r["candidates"] as? [[String: Any]] ?? []
+        return LocateScan(
+            candidates: raw.compactMap(LocateHit.init),
+            contentTop: (r["content_top"] as? NSNumber)?.doubleValue ?? 0,
+            contentBottom: (r["content_bottom"] as? NSNumber)?.doubleValue ?? pointSize.height,
+            fingerprint: r["fingerprint"] as? String ?? "",
+            scrollContainer: (r["scroll_container"] as? [String: Any]).map(LocateScan.rect),
+            visited: (r["visited"] as? NSNumber)?.intValue ?? 0)
+    }
+
+    /// Re-resolve a snapshot hit to the LIVE element that IS that node.
+    ///
+    /// `label == X` + firstMatch returned whichever same-labelled element came
+    /// first — with two "日历" buttons, or a month view holding "25" in three
+    /// months, that is routinely a different one. The ordinal picks the same
+    /// position; the frame check confirms it, and a short scan recovers when
+    /// the tree shifted between the snapshot and now.
+    private func liveElement(for hit: LocateHit, in q: XCUIElementQuery) -> (XCUIElement, Int)? {
+        let sub = hit.byLabel
+            ? q.matching(NSPredicate(format: "label == %@", hit.label))
+            : q.matching(identifier: hit.identifier)
+        func sameSpot(_ el: XCUIElement) -> Bool {
+            let f = el.frame
+            return abs(f.midX - hit.frame.midX) <= 2 && abs(f.midY - hit.frame.midY) <= 2
+        }
+        let atOrdinal = sub.element(boundBy: hit.ordinal)
+        if atOrdinal.safeExists, sameSpot(atOrdinal) { return (atOrdinal, hit.ordinal) }
+        for i in 0..<6 where i != hit.ordinal {
+            let el = sub.element(boundBy: i)
+            guard el.safeExists else { break }
+            if sameSpot(el) { return (el, i) }
+        }
+        // Frames can legitimately move (an animation settling); the ordinal is
+        // still the best guess at the same node.
+        return atOrdinal.safeExists ? (atOrdinal, hit.ordinal) : nil
+    }
 
     /// Refuses a snapshot that is going to fail slowly, before it is attempted.
     ///
@@ -1888,10 +2352,34 @@ class ActionHandler {
     /// app's state up front turns that into an instant, actionable error.
     ///
     /// SpringBoard is always readable, so it's exempt.
+    ///
+    /// `strict` is for callers that go on to query THIS app (find, scroll):
+    /// they must not proceed just because something else is in front, since the
+    /// query would still be aimed at the backgrounded app.
     static func snapshotPrecheck(bundleId: String?, action: String,
-                                 retryWith method: String) -> JSONRPCError? {
+                                 retryWith method: String, strict: Bool = false) -> JSONRPCError? {
         guard let bid = bundleId, bid != "com.apple.springboard" else { return nil }
-        let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bid)) ?? .unknown
+        var state = AppState(rawValue: ForegroundApp.appState(forBundleID: bid)) ?? .unknown
+
+        // The id being checked is usually the STICKY binding from the last
+        // launch_app, not whatever is actually on screen. If that app has since
+        // been backgrounded but something else is frontmost, refusing the read
+        // is simply wrong — the screen is readable, just not the app we happened
+        // to remember. Seen with com.apple.store.Jolly: screenshot succeeded
+        // while page_source claimed there was no snapshottable window.
+        //
+        // So when the bound app looks unusable, ask what IS in front and, if it
+        // is something else that is running, let the call proceed against it.
+        if !strict, state == .background || state == .backgroundSuspended || state == .notRunning,
+           let live = ForegroundApp.currentBundleID(), !live.isEmpty, live != bid {
+            let liveState = AppState(rawValue: ForegroundApp.appState(forBundleID: live)) ?? .unknown
+            if liveState == .foreground || liveState == .unknown {
+                iCTRLUITests.logBuffer.append(
+                    "🔀 precheck: bound app \(bid) is \(state), but \(live) is frontmost — proceeding")
+                state = .foreground
+            }
+        }
+
         switch state {
         case .notRunning:
             return JSONRPCError(code: -32004, message:
@@ -1943,7 +2431,21 @@ class ActionHandler {
         // Resolve which app to inspect:
         //   explicit bundle_id → that app
         //   otherwise → detected foreground app (private API, then last-launched)
-        let inspectedBundleId = cmd.bundleId ?? resolveForegroundBundleId()
+        // An explicit bundle_id is honoured as-is. Otherwise prefer whatever is
+        // ACTUALLY frontmost over the sticky binding: reading is a passive
+        // operation, and a caller asking "what is on screen" means the screen,
+        // not the app we last launched. Without this, switching apps by any
+        // means other than launch_app leaves every read pointed at the old one.
+        var inspectedBundleId = cmd.bundleId ?? resolveForegroundBundleId()
+        if cmd.bundleId == nil,
+           let bound = boundBundleId, !bound.isEmpty,
+           let live = ForegroundApp.currentBundleID(), !live.isEmpty, live != bound,
+           live != "com.apple.springboard" {
+            let boundState = AppState(rawValue: ForegroundApp.appState(forBundleID: bound)) ?? .unknown
+            if boundState != .foreground {
+                inspectedBundleId = live
+            }
+        }
 
         let target: XCUIApplication
         if let bundleId = inspectedBundleId {
@@ -2273,6 +2775,14 @@ class ActionHandler {
             // is no way to tell "the trigger decided the tree was fine" from "the
             // trigger never ran", which is exactly the ambiguity that hid a bug here.
             "ax_coverage": .double((visibleLabelledCoverage(body) * 100).rounded() / 100),
+            // Where this read sits in the list, so a caller can tell "more below"
+            // from "already at the bottom" without scrolling to find out.
+            "scroll_position": scrollPosition().map { JSONValue.object($0) } ?? .null,
+            // A keyboard appearing shifts the whole layout up, which silently
+            // invalidates any coordinate read before it — the reported failure
+            // was a send button that moved ~50pt between the read and the tap.
+            // Reporting the occluded band lets a caller notice that itself.
+            "keyboard": keyboardState(),
             // Which channel produced the tree. NOT named "source": that key is
             // already the tree TEXT in this same dictionary, and a duplicate key
             // in a Swift dictionary literal is a runtime trap — it crashed the
@@ -2520,6 +3030,246 @@ class ActionHandler {
             if mid > topChrome, mid < bottomChrome { n += 1 }
         }
         return n
+    }
+
+    /// A cheap fingerprint of what is on screen, for telling whether a scroll
+    /// actually moved anything.
+    ///
+    /// Reads the bounded snapshot rather than live `staticTexts` queries: this
+    /// runs before AND after every page/swipe, and a live query costs a full
+    /// hierarchy walk per call. Labels plus their y positions, because a feed
+    /// can repeat the same strings at different offsets.
+    private func scrollFingerprint() -> String? {
+        guard let bid = resolveForegroundBundleId(),
+              let root = ForegroundApp.boundedSnapshot(
+                forBundleID: bid,
+                maxDepth: Self.defaultMaxDepth,
+                maxChildren: Self.maxChildrenPerNode) else { return nil }
+        var n = 0
+        var t: ObjCBool = false
+        guard let body = ForegroundApp.renderBoundedSnapshot(
+                root, maxDepth: Self.defaultMaxDepth, maxElements: 400,
+                visibleRect: CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height),
+                nodesWritten: &n, truncated: &t) else { return nil }
+        var parts: [String] = []
+        for line in body.split(separator: "\n") {
+            guard line.contains(", label: '") else { continue }
+            guard let r = line.range(of: ", label: '") else { continue }
+            let rest = line[r.upperBound...]
+            guard let end = rest.range(of: "'") else { continue }
+            guard let fr = line.range(of: "{{") else { continue }
+            let y = line[fr.lowerBound...].split(separator: ",").dropFirst().first ?? ""
+            parts.append("\(rest[..<end.lowerBound])@\(y.trimmingCharacters(in: .whitespaces))")
+            if parts.count >= 25 { break }
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "|")
+    }
+
+    /// Whether a keyboard is up and which part of the screen it covers.
+    private func keyboardState() -> JSONValue {
+        guard let bid = resolveForegroundBundleId() else { return .object(["visible": .bool(false)]) }
+        let target = XCUIApplication(bundleIdentifier: bid)
+        var visible = false
+        var top: Double = 0
+        _ = ObjCException.catching {
+            let kb = target.keyboards.firstMatch
+            if kb.safeExists {
+                visible = true
+                top = kb.frame.minY
+            }
+        }
+        guard visible else { return .object(["visible": .bool(false)]) }
+        return .object([
+            "visible": .bool(true),
+            "covers_from_y": .double(top.rounded()),
+            "usable_height": .double(top.rounded()),
+            "hint": .string(
+                "A keyboard is up and covers y >= \(Int(top)). Coordinates read BEFORE it appeared are "
+                + "stale — content above it has shifted up. Re-read before tapping by coordinate."),
+        ])
+    }
+
+    /// A few labels actually present on screen, for failure diagnostics.
+    private func nearbyLabels(limit: Int) -> [String]? {
+        guard let bid = resolveForegroundBundleId(),
+              let root = ForegroundApp.boundedSnapshot(
+                forBundleID: bid, maxDepth: Self.defaultMaxDepth,
+                maxChildren: Self.maxChildrenPerNode) else { return nil }
+        var n = 0
+        var t: ObjCBool = false
+        guard let body = ForegroundApp.renderBoundedSnapshot(
+                root, maxDepth: Self.defaultMaxDepth, maxElements: 600,
+                visibleRect: CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height),
+                nodesWritten: &n, truncated: &t) else { return nil }
+        var out: [String] = []
+        for line in body.split(separator: "\n") {
+            guard let r = line.range(of: ", label: '") else { continue }
+            let rest = line[r.upperBound...]
+            guard let e = rest.range(of: "'") else { continue }
+            let v = String(rest[..<e.lowerBound])
+            if v.count >= 2, !out.contains(v) { out.append(v) }
+            if out.count >= limit { break }
+        }
+        return out
+    }
+
+    /// The smallest labelled element containing a point, from the bounded
+    /// snapshot. Used to tell a caller what a coordinate tap actually hit.
+    ///
+    /// Smallest-containing, because frames nest: the window, a container and a
+    /// button can all contain the point, and only the innermost is informative.
+    private func elementUnder(x: Double, y: Double) -> [String: JSONValue]? {
+        guard let bid = resolveForegroundBundleId(),
+              let root = ForegroundApp.boundedSnapshot(
+                forBundleID: bid,
+                maxDepth: Self.defaultMaxDepth,
+                maxChildren: Self.maxChildrenPerNode) else { return nil }
+        var n = 0
+        var t: ObjCBool = false
+        guard let body = ForegroundApp.renderBoundedSnapshot(
+                root, maxDepth: Self.defaultMaxDepth, maxElements: 2000,
+                nodesWritten: &n, truncated: &t) else { return nil }
+
+        var best: (area: Double, type: String, label: String, f: [Double])?
+        for line in body.split(separator: "\n") {
+            guard line.contains(", label: '") || line.contains(", value: '") else { continue }
+            guard let r = line.range(of: "{{"),
+                  let end = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { continue }
+            let f = line[r.lowerBound..<end.upperBound]
+                .split(whereSeparator: { !"-0123456789".contains($0) }).compactMap { Double($0) }
+            guard f.count >= 4, f[2] > 0, f[3] > 0 else { continue }
+            guard x >= f[0], x <= f[0] + f[2], y >= f[1], y <= f[1] + f[3] else { continue }
+            let area = f[2] * f[3]
+            if best == nil || area < best!.area {
+                let t = String(line.drop { $0 == " " }.prefix { $0 != "," })
+                var label = ""
+                if let lr = line.range(of: ", label: '") {
+                    let rest = line[lr.upperBound...]
+                    if let le = rest.range(of: "'") { label = String(rest[..<le.lowerBound]) }
+                }
+                best = (area, t, label, f)
+            }
+        }
+        guard let b = best else { return nil }
+        return [
+            "element_type": .string(b.type),
+            "label": .string(b.label),
+            "x": .double(b.f[0]), "y": .double(b.f[1]),
+            "width": .double(b.f[2]), "height": .double(b.f[3]),
+        ]
+    }
+
+    /// Where the list is scrolled to, derived from the row frames.
+    ///
+    /// There is no contentOffset to read: a scrollable container reports the
+    /// SCREEN rect as its own frame (WeChat's chat Table is exactly
+    /// {{0,0},{402,874}} however far it is scrolled). What does carry the
+    /// information is its rows — their frames are absolute, so rows above the
+    /// viewport have negative y and rows below run past the screen height.
+    /// Measured on a WeChat chat list: 388 rows spanning y -9091..20500, which
+    /// puts the viewport 9091pt into a 28717pt scrollable range — 31.7%.
+    ///
+    /// Only meaningful when the app materialises rows it is not showing. Lists
+    /// built lazily (SwiftUI, and Settings/App Store/RED as measured) expose
+    /// only what is on screen, so the arithmetic degenerates to 0% or 100%;
+    /// `confidence` says which case you are in rather than leaving the caller
+    /// to guess.
+    private func scrollPosition() -> [String: JSONValue]? {
+        guard let bid = resolveForegroundBundleId(),
+              let root = ForegroundApp.boundedSnapshot(
+                forBundleID: bid,
+                maxDepth: Self.defaultMaxDepth,
+                maxChildren: Self.maxChildrenPerNode) else { return nil }
+        var n = 0
+        var t: ObjCBool = false
+        guard let body = ForegroundApp.renderBoundedSnapshot(
+                root, maxDepth: Self.defaultMaxDepth, maxElements: 4000,
+                nodesWritten: &n, truncated: &t) else { return nil }
+
+        // Rows only — Cell for tables/collections, and the direct children of a
+        // ScrollView for everything else. Chrome must not count: a nav bar at
+        // y=62 would anchor `top` to the viewport and flatten the range.
+        var tops: [Double] = []
+        var bottoms: [Double] = []
+        var rowHeights: [Double] = []
+        for line in body.split(separator: "\n") {
+            let trimmed = line.drop { $0 == " " }
+            guard trimmed.hasPrefix("Cell,") else { continue }
+            guard let r = line.range(of: "{{"),
+                  let end = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { continue }
+            let f = line[r.lowerBound..<end.upperBound]
+                .split(whereSeparator: { !"-0123456789".contains($0) }).compactMap { Double($0) }
+            guard f.count >= 4, f[3] > 0 else { continue }
+            tops.append(f[1])
+            bottoms.append(f[1] + f[3])
+            rowHeights.append(f[3])
+        }
+        guard tops.count >= 3, let top = tops.min(), let bottom = bottoms.max() else { return nil }
+
+        let viewportH = pointSize.height
+        let contentH = bottom - top
+        let scrollable = contentH - viewportH
+        // Everything fits on screen: nothing to scroll, so a percentage would be
+        // a fiction. Say so instead of reporting 0%.
+        guard scrollable > 1 else {
+            return [
+                "fits_on_screen": .bool(true),
+                "confidence": .string("exact"),
+                "note": .string("All \(tops.count) rows fit in the viewport — there is nothing to scroll."),
+            ]
+        }
+
+        let scrolledPast = max(-top, 0)
+        let fraction = min(max(scrolledPast / scrollable, 0), 1)
+        let rowH = rowHeights.sorted()[rowHeights.count / 2]
+        let rowIndex = rowH > 0 ? Int(scrolledPast / rowH) + 1 : 0
+
+        // `truncated` means max_children cut the row list short, so `bottom` is
+        // not the real end of the content and the percentage reads high.
+        let cut = t.boolValue
+        var out: [String: JSONValue] = [
+            "percent": .double((fraction * 1000).rounded() / 10),
+            "fraction": .double((fraction * 1000).rounded() / 1000),
+            "scrolled_pt": .double(scrolledPast.rounded()),
+            "scrollable_pt": .double(scrollable.rounded()),
+            "content_pt": .double(contentH.rounded()),
+            "viewport_pt": .double(viewportH),
+            "content_top_y": .double(top.rounded()),
+            "content_bottom_y": .double(bottom.rounded()),
+            "rows_seen": .int(tops.count),
+            "confidence": .string(cut ? "low" : "estimated"),
+        ]
+        if rowIndex > 0 { out["row_estimate"] = .string("~\(rowIndex)/\(tops.count)") }
+        out["note"] = .string(cut
+            ? "max_children truncated the row list, so content_pt is an underestimate and percent reads HIGH. Raise max_children for a better figure."
+            : "Derived from row frames, not a real contentOffset. Apps that build rows lazily (SwiftUI lists) expose only the visible ones, which pins this near 0% or 100% — treat a suspiciously round figure with rows_seen in single digits as unreliable.")
+        return out
+    }
+
+    /// Compare two fingerprints into the fields a caller needs.
+    ///
+    /// `moved:false` is the signal that matters: it means the gesture changed
+    /// nothing, so the content you are looking for is NOT further in this
+    /// direction and repeating the scroll is wasted. Without it a caller keeps
+    /// swiping at a wall, which is exactly what happened in testing.
+    ///
+    /// One caveat worth passing on: a page still LOADING also looks unchanged,
+    /// so `at_end` is reported as a likelihood, not a fact.
+    private func scrollOutcome(before: String?, after: String?) -> [String: JSONValue] {
+        guard let b = before, let a = after else {
+            return ["moved": .bool(true), "motion_check": .string("unavailable")]
+        }
+        let moved = (b != a)
+        var out: [String: JSONValue] = ["moved": .bool(moved)]
+        if let pos = scrollPosition() { out["position"] = .object(pos) }
+        if !moved {
+            out["at_end"] = .bool(true)
+            out["hint"] = .string(
+                "The screen did not change — you are most likely at the end of the scrollable "
+                + "content in this direction, so scrolling further will do nothing. "
+                + "If the page was still loading when this ran, wait ~1s and re-read before concluding that.")
+        }
+        return out
     }
 
     /// Fraction of the CONTENT area (screen minus nav/tab chrome) covered by
@@ -2800,7 +3550,213 @@ class ActionHandler {
     /// Scroll until an element whose label/value/identifier contains `element_id`
     /// (or matches accessibility id) becomes visible, then return its tap point.
     /// Uses native XCUIElement scrolling against the foreground app.
+    /// Bring an element into view.
+    ///
+    /// Aims instead of searching when it can: the bounded snapshot usually
+    /// already holds the target's frame (a calendar day view keeps all 24 hours
+    /// in the tree), so one precise drag of exactly the right distance replaces
+    /// a series of blind 40% swipes in a guessed direction. It also refuses to
+    /// call an element "found" merely because it exists — the old check did,
+    /// and so answered "on screen" for things hundreds of points away.
+    ///
+    /// Only when the target is absent from the tree (recycling lists) does it
+    /// scroll blind — inside the real scroll container, at a speed below iOS's
+    /// momentum threshold, reversing once if the direction wasn't given, and
+    /// saying plainly when both ends were reached without a sighting.
     private func scrollToElement(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+        guard let query = cmd.elementId, !query.isEmpty else {
+            return legacyScrollToElement(cmd)
+        }
+        guard let bundleId = cmd.bundleId ?? resolveForegroundBundleId() else {
+            return legacyScrollToElement(cmd)
+        }
+        // Same few-ms guard as locateElement: every scan and drag below targets
+        // this app, and a backgrounded one makes each scan a slow, CPU-bound miss.
+        if let err = Self.snapshotPrecheck(bundleId: bundleId, action: "scroll to '\(query)'",
+                                           retryWith: "scroll_to_element", strict: true) {
+            return (nil, err)
+        }
+        let matchMode = (cmd.matchMode ?? "exact").lowercased()
+        let typeFilter = cmd.elementType
+        let explicitDirection = cmd.direction?.lowercased()
+        var direction = explicitDirection ?? "up"
+        let maxSteps = max(1, Int(cmd.distance ?? 12))
+        let size = pointSize
+        let target = XCUIApplication(bundleIdentifier: bundleId)
+        let q = elementQuery(in: target, type: typeFilter)
+
+        var steps = 0
+        var reversed = false
+        var endedDirections: [String] = []
+        var lastFingerprint: String?
+        var aimedStalls = 0
+        var lastHit: LocateHit?
+        var trace: [String] = []
+
+        func opposite(_ d: String) -> String {
+            switch d { case "up": return "down"; case "down": return "up"
+                       case "left": return "right"; default: return "left" }
+        }
+
+        // A synthesized drag held at 300pt/s — below the ~350pt/s where iOS adds
+        // momentum — so the content moves by the finger travel, not 1.6x it.
+        func drag(in area: CGRect, finger: String, travel: Double) {
+            let horizontal = (finger == "left" || finger == "right")
+            let span = horizontal ? area.width : area.height
+            let t = min(travel, span * 0.8)
+            let margin = (span - t) / 2
+            let (fx, fy, tx, ty): (Double, Double, Double, Double)
+            switch finger {
+            case "down":  (fx, fy, tx, ty) = (area.midX, area.minY + margin, area.midX, area.minY + margin + t)
+            case "left":  (fx, fy, tx, ty) = (area.maxX - margin, area.midY, area.maxX - margin - t, area.midY)
+            case "right": (fx, fy, tx, ty) = (area.minX + margin, area.midY, area.minX + margin + t, area.midY)
+            default:      (fx, fy, tx, ty) = (area.midX, area.maxY - margin, area.midX, area.maxY - margin - t)
+            }
+            _ = fastHandler.fastSwipe(fromX: fx, fromY: fy, toX: tx, toY: ty,
+                                      duration: min(max(t / 300.0, 0.30), 2.5))
+            usleep(350_000)   // let the content settle before the next read
+        }
+
+        func dragArea(_ scan: LocateScan, _ hit: LocateHit?) -> CGRect {
+            let band = CGRect(x: 0, y: scan.contentTop, width: size.width,
+                              height: max(scan.contentBottom - scan.contentTop, 1))
+            let area = (hit?.container ?? scan.scrollContainer ?? band).intersection(band)
+            return area.isNull || area.height < 80 ? band : area
+        }
+
+        while true {
+            guard let scan = scanCandidates(query: query, type: typeFilter, matchMode: matchMode,
+                                            bundleId: bundleId) else {
+                // No bounded snapshot on this build/app — the old search still works.
+                return steps == 0 ? legacyScrollToElement(cmd) : (nil, .serverError(
+                    "scroll_to_element lost the accessibility snapshot after \(steps) scrolls. Call page_source to see where it stopped."))
+            }
+            let hit = scan.candidates.first
+            lastHit = hit
+
+            if let hit = hit, hit.inView {
+                iCTRLUITests.logBuffer.append("🧭 scroll_to '\(query)' found after \(steps) [\(trace.joined(separator: " "))]")
+                var out: [String: JSONValue] = [
+                    "found": .bool(true),
+                    "swipes": .int(steps),
+                    "x": .double(hit.frame.midX), "y": .double(hit.frame.midY),
+                    "center_x": .double(hit.frame.midX), "center_y": .double(hit.frame.midY),
+                    "label": .string(hit.label),
+                    "visibility": .string(hit.visibility),
+                ]
+                if let (_, idx) = liveElement(for: hit, in: q) {
+                    let ref = makeRef(ElementRef(bundleId: bundleId, match: hit.match, elementType: typeFilter,
+                                                 index: idx, createdAt: nowMonotonic))
+                    out["ref"] = .string(ref)
+                    out["hint"] = .string("Element is in view. Prefer tapping by ref: {\"method\":\"tap\",\"params\":{\"ref\":\"\(ref)\"}} — a ref re-resolves the live element and won't drift like a coordinate.")
+                } else {
+                    out["hint"] = .string("Element is in view but could not be re-resolved as a live element; tap its center by coordinate.")
+                }
+                return (out, nil)
+            }
+
+            if steps >= maxSteps { break }
+
+            if let hit = hit {
+                // Its position is known: drag by exactly the distance that
+                // centres it in the content band.
+                let area = dragArea(scan, hit)
+                let offX = hit.frame.midX < 0 || hit.frame.midX > size.width
+                let finger: String
+                let travel: Double
+                if offX {
+                    // A sideways drag on a plain row is a swipe action (Delete,
+                    // Archive), not a scroll — only aim sideways inside a real
+                    // horizontal scroller.
+                    guard hit.container != nil else {
+                        return (nil, JSONRPCError(
+                            code: -32602,
+                            message: "'\(hit.label)' exists off to the side at (\(Int(hit.frame.midX)),\(Int(hit.frame.midY))) " +
+                                "but not inside a scroll view, so dragging sideways could trigger a row's swipe action " +
+                                "instead. It is on another page/tab — navigate there directly (page_source shows the controls).",
+                            data: ["x": .double(hit.frame.midX), "y": .double(hit.frame.midY)]))
+                    }
+                    let dx = hit.frame.midX - size.width / 2
+                    finger = dx > 0 ? "left" : "right"
+                    travel = abs(dx)
+                } else {
+                    let dy = hit.frame.midY - (scan.contentTop + scan.contentBottom) / 2
+                    finger = dy > 0 ? "up" : "down"
+                    // Under ~20pt a drag reads as a tap to the scroll view.
+                    travel = max(abs(dy), 40)
+                }
+                if let last = lastFingerprint, last == scan.fingerprint {
+                    aimedStalls += 1
+                } else {
+                    aimedStalls = 0
+                }
+                if aimedStalls >= 2 {
+                    return (nil, JSONRPCError(
+                        code: -32602,
+                        message: "'\(hit.label)' exists at (\(Int(hit.frame.midX)),\(Int(hit.frame.midY))) but dragging " +
+                            "toward it does not move the view — it belongs to a part of the UI that scrolling here " +
+                            "can't reach (another page, tab, month or collapsed section). Navigate there directly " +
+                            "instead; page_source shows the controls for it.",
+                        data: ["x": .double(hit.frame.midX), "y": .double(hit.frame.midY)]))
+                }
+                lastFingerprint = scan.fingerprint
+                trace.append("aim:\(finger)\(Int(travel))")
+                drag(in: area, finger: finger, travel: travel)
+                steps += 1
+                continue
+            }
+
+            // Not in the tree at all — scroll blind and watch for the end.
+            if let last = lastFingerprint, last == scan.fingerprint {
+                endedDirections.append(direction)
+                if explicitDirection == nil, !reversed {
+                    reversed = true
+                    direction = opposite(direction)
+                    trace.append("end→reverse")
+                } else {
+                    break
+                }
+            }
+            lastFingerprint = scan.fingerprint
+            let area = dragArea(scan, nil)
+            let horizontal = (direction == "left" || direction == "right")
+            trace.append("blind:\(direction)")
+            drag(in: area, finger: direction, travel: (horizontal ? area.width : area.height) * 0.6)
+            steps += 1
+        }
+
+        iCTRLUITests.logBuffer.append("🧭 scroll_to '\(query)' not found after \(steps) [\(trace.joined(separator: " "))]")
+        let what = "'\(query)'" + (typeFilter.map { " of type '\($0)'" } ?? "")
+        let message: String
+        if let hit = lastHit {
+            message = "'\(hit.label)' is in the view but still \(hit.visibility) at " +
+                "(\(Int(hit.frame.midX)),\(Int(hit.frame.midY))) after \(steps) scrolls toward it. " +
+                "Raise distance, or call page_source to see what is in the way."
+        } else if endedDirections.count >= 2 {
+            // Both ends seen: this is a statement about the view, not a search
+            // that gave up. Said plainly, it sends the caller to question the
+            // premise (wrong date, wrong tab, data never saved) instead of
+            // scrolling and screenshotting the same view for ten more minutes.
+            message = "\(what) is NOT anywhere in this scrollable view — scrolled to both ends (\(steps) scrolls) " +
+                "without it appearing in the accessibility tree. It is not on this screen at all: check you are on " +
+                "the right page/date/tab, or that the item actually exists."
+        } else if endedDirections.count == 1 {
+            message = "No match for \(what): reached the end scrolling \(endedDirections[0]) after \(steps) scrolls. " +
+                "Try direction:\"\(opposite(endedDirections[0]))\"."
+        } else {
+            message = "No match for \(what) after \(steps) scrolls \(direction) (budget exhausted, end not reached). " +
+                "Raise distance (the scroll budget) or check the label in page_source" +
+                (matchMode == "contains" ? "." : ", or use match:\"contains\".")
+        }
+        if foregroundIsWebViewHost() {
+            return (nil, JSONRPCError(code: -32602, message: message + Self.webViewAdvice, data: nil))
+        }
+        return (nil, JSONRPCError(code: -32602, message: message, data: nil))
+    }
+
+    /// The original swipe-and-look search, kept for when no bounded snapshot
+    /// is available.
+    private func legacyScrollToElement(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let query = cmd.elementId, !query.isEmpty else {
             return (nil, JSONRPCError(
                 code: -32602,
@@ -2919,6 +3875,7 @@ class ActionHandler {
         lastLocateError = nil
         lastLocateSnapFrame = nil
         lastLocateSnapLabel = nil
+        lastLocateScan = nil
         let bid = bundleId ?? resolveForegroundBundleId()
         let target: XCUIApplication = bid.map { XCUIApplication(bundleIdentifier: $0) } ?? app
         let q = elementQuery(in: target, type: type)
@@ -2932,6 +3889,19 @@ class ActionHandler {
         }
         func done(_ hit: String) {
             iCTRLUITests.logBuffer.append("🔎 locate '\(query)' \(hit) [\(phases.joined(separator: " "))] total=\(Int((nowMonotonic - t0) * 1000))ms")
+        }
+
+        // Before ANY tree query: a few-ms state check. Every query below is
+        // aimed at `target`, and against a backgrounded app none of them fails
+        // fast — the live query timed out, was abandoned still running, and
+        // spun XCTest at 100% CPU for 48s until iOS killed the runner
+        // (cpu_resource_fatal, iOS 16). This check used to run only at the end.
+        if let err = Self.snapshotPrecheck(bundleId: bid, action: "find '\(query)'",
+                                           retryWith: "find_element", strict: true) {
+            phases.append("precheck=refused")
+            done("✗\(err.message.contains("background") ? "backgrounded" : "not-running")")
+            lastLocateError = err
+            return nil
         }
 
         // Every .safeExists / .safeIsHittable below is a round-trip that XCTest
@@ -2966,7 +3936,32 @@ class ActionHandler {
         // 69865ms on a long-scrolled X timeline. One snapshot of the same WeChat
         // screen costs ~4100ms and answers exact/id/contains together, so it is
         // tried first and the live query is kept only as the fallback.
+        // Fast path: the SAME bounded fetch page_source uses. find_element was
+        // calling safeSnapshot — the unbounded one — which is exactly the cost
+        // page_source was changed to avoid, and is why looking up one element
+        // could be slower than dumping the entire tree.
+        //
+        // The walk runs in Obj-C: bridging a bounded snapshot to the
+        // XCUIElementSnapshot protocol reads every frame as {{0,0},{0,0}} and
+        // stops after one level of children, so a Swift walk would silently
+        // search a tree of 16 empty nodes and report "not found".
         var s = nowMonotonic
+        if let bid = bid,
+           let scan = scanCandidates(query: query, type: type, matchMode: matchMode, bundleId: bid) {
+            phases.append("bounded=\(Int((nowMonotonic - s) * 1000))ms/\(scan.visited)nodes/\(scan.candidates.count)hits")
+            if let best = scan.candidates.first {
+                if let (live, idx) = liveElement(for: best, in: q) {
+                    lastLocateScan = scan
+                    lastLocateSnapFrame = best.frame
+                    lastLocateSnapLabel = best.label
+                    done("→bounded-\(best.how)/\(best.visibility)")
+                    return (live, best.match, idx)
+                }
+                phases.append("bounded-reresolve=miss")
+            }
+        }
+
+        s = nowMonotonic
         var snapshotAlreadyTried = false
         if !Self.preferLiveQueryFirst,
            Self.snapshotPrecheck(bundleId: bid, action: "find '\(query)'",
@@ -3000,7 +3995,7 @@ class ActionHandler {
         // means the two never touch it at the same time.
         final class HitBox { var value: (XCUIElement, Int)? }
         let box = HitBox()
-        let liveDone = runWithTimeout(seconds: Self.liveQueryBudget) {
+        let liveDone = runWithTimeout(seconds: Self.liveQueryBudget, label: "live-query") {
             box.value = firstHittable(q.matching(NSPredicate(format: "label == %@", query)))
         }
         lap("exact", from: s)
@@ -3011,9 +4006,10 @@ class ActionHandler {
             return (best, .exactLabel(query), bestIdx)
         }
 
-        // The snapshot path is where a backgrounded app costs ~16s of blocked
-        // serial queue, so refuse it up front — the same guard page_source has
-        // had. The live query above needs no such check; it fails fast.
+        // Re-checked here: the app can leave the screen during the lookups
+        // above, and the snapshot path below costs ~16s against a backgrounded
+        // app. (The live query does NOT fail fast either — see the check at the
+        // top of this function.)
         if let err = Self.snapshotPrecheck(bundleId: bid, action: "find '\(query)'",
                                            retryWith: "find_element") {
             phases.append("precheck=refused")
@@ -3489,10 +4485,22 @@ class ActionHandler {
             if foregroundIsWebViewHost() {
                 return (nil, JSONRPCError(code: -32602, message: base + "." + Self.webViewAdvice, data: nil))
             }
+            // Say what IS there. "Not found" alone sends a caller round the same
+            // loop — try contains, try a shorter substring, try page_source —
+            // when the useful fact is usually that the control is a custom view
+            // reporting no label at all, and coordinates are the only way in.
+            var diag = ""
+            if let near = nearbyLabels(limit: 6), !near.isEmpty {
+                diag = " On screen right now: " + near.map { "'\($0)'" }.joined(separator: ", ")
+                     + ". If the text you want is visible but not listed, it belongs to a custom"
+                     + " control that reports no accessibility label — find its frame in page_source"
+                     + " and tap by coordinate instead."
+            }
             return (nil, JSONRPCError(
                 code: -32602,
                 message: base +
-                    ". It may be off-screen (use scroll_to_element), or the label differs from on-screen text — check page_source. Try match:'contains'.",
+                    ". It may be off-screen (use scroll_to_element), or the label differs from on-screen text — check page_source. Try match:'contains'."
+                    + diag,
                 data: nil
             ))
         }
@@ -3524,6 +4532,29 @@ class ActionHandler {
             "label": .string(element.label),
             "value": .string(element.value as? String ?? ""),
         ]
+        // Say which of several look-alikes this is, and whether it can be acted
+        // on. `hittable` alone was there before and still got ignored — the
+        // caller tapped an off-screen "8月25日" because nothing said a visible
+        // "9月25日" had matched too.
+        if let scan = lastLocateScan, let best = scan.candidates.first {
+            result["visibility"] = .string(best.visibility)
+            let others = scan.candidates.dropFirst().prefix(4)
+            if !others.isEmpty {
+                result["alternatives"] = .array(others.map { $0.summary })
+                result["match_count"] = .int(scan.candidates.count)
+            }
+            if !best.inView {
+                result["hint"] = .string(
+                    "This match is \(best.visibility == "partial" ? "only partly on screen" : "OFF screen") " +
+                    "(center \(Int(best.frame.midX)),\(Int(best.frame.midY))) and no in-view element matched. " +
+                    "Bring it into view with scroll_to_element{element_id:\"\(elementId)\"" +
+                    (matchMode == "contains" ? ", match:\"contains\"" : "") + "} before tapping.")
+            } else if !others.isEmpty {
+                result["hint"] = .string(
+                    "\(scan.candidates.count) elements matched; this is the best in-view one. " +
+                    "If it is the wrong one, use a more specific element_id (see alternatives).")
+            }
+        }
         // Nudge the caller when they were probably looking for an input field but
         // matched a button (the classic "fake search bar" trap).
         if !isTextInput, (element.elementType == .button || element.elementType == .staticText || element.elementType == .other) {
