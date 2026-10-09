@@ -1,7 +1,7 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
-skill_version: "1.34.0"
+skill_version: "1.35.0"
 ---
 
 # iCTRL — control an iPhone over HTTP
@@ -25,7 +25,7 @@ iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, p
 In an on-device sandbox (e.g. Minis) use the static CLI — no Python needed, ~9x faster to start. The device is `127.0.0.1`. **Install it in one place, `~/.ictrl/bin`, and check before downloading** — it is usually already there from an earlier session:
 ```bash
 C=~/.ictrl/bin; [ -f $C/ictrl ] || { mkdir -p $C && wget -qO $C/ictrl http://127.0.0.1:8200/skill/clients/cli && wget -qO $C/ictrl.sh http://127.0.0.1:8200/skill/clients/cli.sh; }
-sh $C/ictrl.sh call device_info         # works? you're connected; else: sh $C/ictrl.sh pair
+sh $C/ictrl.sh call device_info         # connected? check skill_version (see Versions); else: pair
 sh $C/ictrl.sh call tap '{"x":100,"y":200}'
 sh $C/ictrl.sh shot screen.jpg          # screenshot to a file
 ```
@@ -39,7 +39,7 @@ python3 ictrl_rpc.py --host <host>:8200 call device_info
 ```
 The CLI defaults to `127.0.0.1:8200`; `--host` or `ICTRL_HOST` targets another device. The Python client needs `pip install cryptography` for LAN pairing (not for `--plain` over localhost/USB via `iproxy 8200 8200`).
 
-Both share `~/.ictrl/token.json`, keyed by `host:port` — **one key per device**, never another device's; several devices can run in parallel. Store `device_name` with each key (hosts move; the name says which phone). Reuse the key: it expires only after 30 days *unused*, whatever its `expires` says. Re-pair only on a real `401`. Pairing blocks until the user taps Allow — ≥60s timeout, no early retry (each pops another prompt).
+Both share `~/.ictrl/token.json`, keyed by `host:port` — **one key per device**, never another device's; Store `device_name` with each key (hosts move; the name says which phone). Reuse the key: it expires only after 30 days *unused*, whatever its `expires` says. Re-pair only on a real `401`. Pairing blocks until the user taps Allow — ≥60s timeout, no early retry (each pops another prompt).
 
 ## Core workflow
 
@@ -84,7 +84,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 
 - `find_element` matches exact label → accessibility id → (with `match:"contains"`) substring. **An element in view always beats an off-screen one**: a calendar holds "25" in three months. The result has `visibility` (`in_view`/`partial`/`offscreen`), and when several matched, `alternatives[]` + `match_count`.
 - A `ref` re-resolves the live element at tap time. If its app has gone to the background (a system sheet, another app), the tap is refused at once: *"belongs to X, which is now in the background"*. Look at the screen before continuing.
-- **Off-screen** → `scroll_to_element{element_id}`. If the target is already in the tree, it drags straight to it in one move. Otherwise it searches, and without `direction` it reverses once at an end. **"NOT anywhere in this view" means it isn't on this screen at all** — check page/tab/date, or whether the data exists; don't keep scrolling.
+- **Off-screen** → `scroll_to_element{element_id}`. It drags straight to a target already in the tree, else searches (reversing once at an end when no `direction` is given). **"NOT anywhere in this view" means it isn't on this screen at all** — check page/tab/date or whether the data exists; stop scrolling.
 - **Text on screen ≠ accessibility label** (common). Copy the label from `page_source`, or use `match:"contains"`. An accessibility `identifier` shown in `page_source` is the most stable `element_id` of all. Duplicate labels → add `element_type`.
 - **Nothing matches but you can see it** → it's a custom control with no label. The failure message lists what *is* on screen. Take its frame from `page_source` and `tap{x,y}`.
 - A coordinate `tap` returns `hit` (the element under the point, sampled before tapping) or `hit_warning` (nothing labelled there — you probably hit empty space).
@@ -137,7 +137,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 
 ## Versions
 
-Compare `device_info.skill_version` with this file's frontmatter. Patch gap: ignore. Minor: refresh if something seems missing. Major, or a different `protocol_version`: refresh `GET /skill` **and** the client together. Device *older* than this file: don't downgrade — use only its `capabilities[]` and tell the user.
+On your first `device_info`: if its `skill_version` is **newer** than this file's frontmatter (or `protocol_version` differs), update before anything else: `sh ~/.ictrl/bin/ictrl.sh update <folder holding this SKILL.md>` (Python: re-download `/skill` and `/skill/clients/python`), then re-read this file. Device *older* than this file: don't downgrade; use only its `capabilities[]`.
 
 ## Protocol
 

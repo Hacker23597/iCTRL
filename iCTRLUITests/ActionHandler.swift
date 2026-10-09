@@ -832,15 +832,17 @@ class ActionHandler {
             // device mentions its version on the one call every client makes.
             // Advisory: the caller decides whether the gap actually matters.
             "skill_version": .string(RPCMethodRegistry.serverVersion),
+            // An instruction, not advice, and served by the device so it reaches
+            // agents holding an OLD skill — whose text called version gaps
+            // advisory, which is how a 1.21 copy kept running against 1.33.
             "skill_update_hint": .string(
-                "Advisory, not required. Compare this skill_version with the one in your SKILL.md frontmatter and "
-                + "judge by semver: equal, or a PATCH difference (1.6.1 vs 1.6.2) — carry on, nothing you call has changed. "
-                + "MINOR difference (1.5.x vs 1.6.x) — new methods or fields exist; refresh if something you need seems missing. "
-                + "MAJOR difference, or protocol_version != the value your client implements — refresh before continuing, "
-                + "since the wire format itself may have moved. To refresh (unauthenticated, no pairing needed): "
-                + "curl -o SKILL.md http://<host>:8200/skill && curl -o ictrl_rpc.py http://<host>:8200/skill/clients/python, "
-                + "then re-read SKILL.md. Refresh both together — a stale client hand-rolls the envelope crypto. "
-                + "Prefer feature-detecting against `capabilities` over version comparison for individual features."
+                "If this skill_version (\(RPCMethodRegistry.serverVersion)) is NEWER than the skill_version in your "
+                + "SKILL.md frontmatter, update now, before anything else — even if your copy calls version gaps "
+                + "advisory (older copies did). CLI: sh ~/.ictrl/bin/ictrl.sh update <folder containing your SKILL.md> "
+                + "(an ictrl.sh without `update` must first be refreshed: wget -qO ~/.ictrl/bin/ictrl.sh "
+                + "http://<host>:8200/skill/clients/cli.sh). Python: curl -o <that folder>/SKILL.md http://<host>:8200/skill "
+                + "&& curl -o ictrl_rpc.py http://<host>:8200/skill/clients/python. Then re-read SKILL.md. "
+                + "If this device is OLDER than your copy, don't downgrade: use only what `capabilities` lists."
             ),
             // Coordinate space that tap/swipe/drag/long_press use:
             "point_width": .double(frame.width),

@@ -38,7 +38,7 @@ struct RPCMethodRegistry {
             name: "device_info",
             description: "Get device name, model, OS version, the coordinate space (point size for tap/swipe, pixel size for screenshots, scale), AND the server's identity: server_version, protocol_version, and a capabilities array — so ONE device_info call gives you both the device and what this server supports (no separate /schema fetch for feature detection). CALL THIS FIRST before any coordinate-based action.",
             params: [],
-            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, a 'hint' string, plus server_version (semver), protocol_version (int), capabilities (array of feature tags, e.g. envelope_v1, stream_ticket, find_element_ref, clear_text, page, stop_server), skill_version + skill_update_hint (advisory: compare with your SKILL.md frontmatter; a patch-level gap needs no action, refresh on major/protocol changes), and a 'system' object of live health: thermal_state, low_power_mode, total_memory_mb, processor_count, process_memory_mb, process_cpu_percent, system_free_memory_mb?, disk_total_mb, disk_free_mb, disk_available_now_mb, disk_used_percent, battery_percent?, battery_state?. Keys the sandbox refuses are absent rather than zero. NOTE: process_cpu_percent is THIS runner's usage (can exceed 100% across cores), not system-wide — iOS does not expose global CPU. disk_free_mb matches what Settings shows (counts purgeable space); disk_available_now_mb is the stricter figure."
+            returns: "Object with point_width/point_height (tap space), pixel_width/pixel_height (screenshot space), scale, a 'hint' string, plus server_version (semver), protocol_version (int), capabilities (array of feature tags, e.g. envelope_v1, stream_ticket, find_element_ref, clear_text, page, stop_server), skill_version + skill_update_hint (if the device's skill_version is newer than your SKILL.md frontmatter, update before anything else — the hint has the commands), and a 'system' object of live health: thermal_state, low_power_mode, total_memory_mb, processor_count, process_memory_mb, process_cpu_percent, system_free_memory_mb?, disk_total_mb, disk_free_mb, disk_available_now_mb, disk_used_percent, battery_percent?, battery_state?. Keys the sandbox refuses are absent rather than zero. NOTE: process_cpu_percent is THIS runner's usage (can exceed 100% across cores), not system-wide — iOS does not expose global CPU. disk_free_mb matches what Settings shows (counts purgeable space); disk_available_now_mb is the stricter figure."
         ),
         RPCMethodDef(
             name: "page_source",
@@ -340,7 +340,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.34.0"
+    static let serverVersion = "1.35.0"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///
