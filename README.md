@@ -2,6 +2,22 @@
 
 **AI-friendly iOS automation service, built on XCUITest.**
 
+> [!WARNING]
+> **For automated testing and research only.** iCTRL hands full control of a
+> phone (taps, text input, screen contents, every installed app) to whoever
+> holds a paired key. Any automation like this can be hijacked or misused:
+> a leaked key, a client you shouldn't have approved, or an agent acting on
+> instructions it picked up along the way. **Weigh the risks before you use it:**
+> - Run it only on devices you own and accounts you are entitled to automate.
+> - Approve only the pairing requests you started.
+> - Leave remote access off unless you need it, and stop the server when you
+>   are done.
+> - Don't leave an agent unsupervised around payments, messages or anything
+>   that can't be undone.
+>
+> You are responsible for how you use it, including compliance with the terms
+> of the apps you automate.
+
 iCTRL turns an iPhone into a controllable automation endpoint. It runs a
 long-lived XCUITest runner that exposes a **JSON-RPC 2.0 API over HTTP** (default
 port `8200`), so an AI agent — or any HTTP client — can drive the device: tap,
