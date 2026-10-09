@@ -1960,7 +1960,7 @@ class ActionHandler {
         let storeOnly = cmd.country != nil
         let limit = min(max(Int(cmd.distance ?? 5), 1), 25)
 
-        // Several candidate names in one call ("Trip.com|携程|Trip"). An app's
+        // Several candidate names in one call ("Trip.com|Ctrip|Trip"). An app's
         // name is often not what the user said — a brand vs its store title,
         // English vs Chinese — and trying them one per round cost a real session
         // three model turns. Searched in parallel, merged by bundle_id.

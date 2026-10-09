@@ -10,7 +10,7 @@ iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, p
 
 ## Rules — read these first
 
-1. **Open apps by bundle id, never by tapping home-screen icons.** `resolve_app` → `launch_app{bundle_id}`. By common sense, pass every name it may go by in **one** call: `resolve_app{text:"Trip.com|携程|Trip"}` (brand, store title, English/Chinese). The store is `country` (default `us`); pick it from context (`cn`: China-only).
+1. **Open apps by bundle id, never by tapping home-screen icons.** `resolve_app` → `launch_app{bundle_id}`. By common sense, pass every name it may go by in **one** call: `resolve_app{text:"Trip.com|Ctrip|Trip"}` (brand, store title, English/Chinese). The store is `country` (default `us`); pick it from context (`cn`: China-only).
 2. **Read before you act.** On any screen you haven't read, call `page_source{visible_only:true, max_children:50}` (~0.4s) to learn which view/tab/date you're really on.
 3. **Tap by `ref`.** `find_element{element_id:"<label>"}` → `tap{ref}`. Check `visibility`: `"offscreen"` or a non-empty `alternatives` means you may have a look-alike — use `scroll_to_element` or a more specific label.
 4. **Never repeat an action "to be safe."** A success reply means it worked. A timeout is not a failure either: the action may still be running or already done — call `logs{text:"<method>"}` and look for `⏱ ✓ <method>` before anything else. A retried tap fires twice.
