@@ -173,8 +173,6 @@ final class DDIMounter: ObservableObject {
     /// on it purely for that side effect. Both the connection and the session are
     /// expected to be short-lived; failures here are deliberately ignored,
     /// because the goal is the provider install, not the session.
-    /// Also used by IPAInstaller: any FFI call that builds a reqwest client
-    /// needs the process-default provider installed first.
     nonisolated static func primeCryptoProvider() {
         ictrlLog("Priming rustls crypto provider via a throwaway session")
         var pairing: OpaquePointer?

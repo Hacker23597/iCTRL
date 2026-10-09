@@ -19,15 +19,6 @@ struct SettingsView: View {
     @StateObject private var runner = RunnerStatus(port: 8200)
     @State private var logCount = AppLog.allFiles().count
 
-    /// Sideload state. Kept here rather than in AppState because it is
-    /// transient UI feedback for one action, not app-wide state.
-    @State private var installBusy = false
-    @State private var installPhase: IPAInstaller.Phase = .idle
-    @State private var anisetteReport: AnisetteProbe.Report?
-    @State private var showPackagePicker = false
-    /// Defaults to the runner shipped inside this app — the package almost
-    /// everyone wants, already matched to this build.
-    @State private var selectedPackage: SelectedPackage? = BundledRunner.url.map { .bundled($0) }
 
     /// The runner registers this scheme; opening it starts the automation server.
     ///
@@ -91,7 +82,7 @@ struct SettingsView: View {
             if launchFailed {
                 Section {
                     Label {
-                        Text("Couldn't open the runner. Install iCTRLUITests-Runner on this device, then try again.")
+                        Text("Couldn't open the runner. Install iCTRLUITests-Runner with SideStore (or your own signing), then try again.")
                             .font(.footnote)
                     } icon: {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -99,8 +90,6 @@ struct SettingsView: View {
                     }
                 }
             }
-
-            installSection
 
             serverSection
 
@@ -234,138 +223,6 @@ struct SettingsView: View {
             LabeledRow(L10n.t(.nameLabel), UIDevice.current.name, monospaced: false)
         } header: {
             Text(L10n.t(.deviceSection))
-        }
-    }
-
-    /// Installs an .ipa onto this device over the same tunnel the DDI mount
-    /// uses.
-    ///
-    /// The package must already be signed for this device. Signing it here was
-    /// tried and removed: it needs an Apple ID, a third-party anisette server,
-    /// and a signer that handles the runner's .xctest — which the available
-    /// on-device options do not. Sign with a desktop tool and install the
-    /// result here.
-    private var installSection: some View {
-        Section {
-            if !ddi.isMounted {
-                Label {
-                    Text("Mount the developer image first — installing uses the same tunnel.")
-                        .font(.footnote)
-                } icon: {
-                    Image(systemName: "info.circle")
-                }
-            }
-
-            // What the two buttons below act on. Named rather than left
-            // implicit so it's clear what "Install" is about to install.
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(selectedPackage?.displayName ?? "No package selected")
-                        .font(.subheadline)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    if selectedPackage == nil {
-                        Text("This build carries no runner — choose one.")
-                            .font(.caption).foregroundColor(.secondary)
-                    }
-                }
-                Spacer()
-                Button("Change") { showPackagePicker = true }
-                    .buttonStyle(.bordered)
-                    .disabled(installBusy)
-            }
-
-            Button {
-                guard let package = selectedPackage else { return }
-                startInstall(package)
-            } label: {
-                Label("Install", systemImage: "square.and.arrow.down")
-            }
-            .disabled(!installable || installBusy || selectedPackage == nil)
-
-            switch installPhase {
-            case .idle:
-                EmptyView()
-            case .connecting:
-                progressRow(text: "Connecting…", value: nil)
-            case .uploading(let f):
-                progressRow(text: "Uploading — \(Int(f * 100))%", value: f)
-            case .installing(let f):
-                progressRow(text: "Installing — \(Int(f * 100))%", value: f)
-            case .done(let what):
-                Label {
-                    Text("Installed \(what)").font(.footnote)
-                } icon: {
-                    Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
-                }
-            case .failed(let why):
-                Label {
-                    Text(why).font(.footnote).foregroundColor(.secondary)
-                } icon: {
-                    Image(systemName: "xmark.circle.fill").foregroundColor(.red)
-                }
-            }
-
-            Button {
-                anisetteReport = AnisetteProbe.run()
-            } label: {
-                Label("Check on-device signing support", systemImage: "stethoscope")
-            }
-
-            if let report = anisetteReport {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(report.summary).font(.footnote)
-                    ForEach(report.lines, id: \.self) { line in
-                        Text(line)
-                            .font(.caption2.monospaced())
-                            .foregroundColor(.secondary)
-                    }
-                }
-            }
-        } header: {
-            Text("Install an app")
-        } footer: {
-            Text("Sideloads a package onto this device. It must already be signed for this device — iCTRL installs, it doesn't sign.")
-        }
-        .sheet(isPresented: $showPackagePicker) {
-            PackagePickerView { package in
-                selectedPackage = package
-            }
-        }
-    }
-
-    /// Both install paths need the same transport: a mounted developer image
-    /// and a pairing file.
-    private var installable: Bool {
-        ddi.isMounted && PairingFileStore.exists
-    }
-
-    private func progressRow(text: String, value: Double?) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(text).font(.footnote)
-            if let value {
-                ProgressView(value: value)
-            } else {
-                ProgressView()
-            }
-        }
-    }
-
-    private func startInstall(_ package: SelectedPackage) {
-        let url = package.url
-        // Only a file the user picked lives outside our container. Claiming the
-        // scope for a bundled or downloaded package is harmless but pointless,
-        // and balancing a claim that was never granted is worse.
-        let scoped = package.needsSecurityScope && url.startAccessingSecurityScopedResource()
-        installBusy = true
-        installPhase = .connecting
-        Task {
-            await IPAInstaller.install(ipaURL: url,
-                                       pairingPath: PairingFileStore.storedURL.path) { phase in
-                installPhase = phase
-            }
-            if scoped { url.stopAccessingSecurityScopedResource() }
-            installBusy = false
         }
     }
 
