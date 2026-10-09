@@ -46,6 +46,63 @@ notification on the phone, and from there it works out the rest.
   account) and the Developer Disk Image mounted — see
   [Installation](#before-you-start--two-things-you-need)
 
+## Features
+
+**Built for AI agents**
+- **Self-describing.** The device serves its own operating manual (`GET /skill`,
+  under 15K characters, most important rules first) and a full method schema
+  (`GET /schema`). An agent given only the address learns the rest by itself.
+- **Responses that steer.** Every result carries a `hint`, and every error says
+  what to do next. A `ref` re-resolves the live element at tap time;
+  `visibility` and `alternatives` flag look-alikes; scrolls report whether they
+  moved and where you are in the list.
+- **Knows the apps on the phone.** `resolve_app` turns an app name into a bundle
+  id offline and remembers which apps actually opened on this device, even
+  where iOS refuses to list installed apps.
+
+**Fast**
+- **~280ms taps.** Synthesized touch events with no wait-for-idle.
+- **The visible screen in under 1s**, even on long-scrolled feeds (p50 416ms
+  across 8 apps). Snapshots are bounded on the device, so the app never
+  serializes thousands of off-screen rows.
+- **Element lookups in ~0.3–1s**, on the same bounded walk.
+
+**Sees what the accessibility tree can't**
+- **On-device OCR** (`screen_text`, Vision) returns text with tappable
+  coordinates. `page_source` measures its own coverage and falls back to it
+  automatically when the tree comes back thin (web views, custom-drawn text).
+- **Feedback on coordinate taps.** A tap by coordinates reports which element it
+  hit, or warns that it landed on empty space.
+
+**Robust in long, unattended sessions**
+- **Never queries an app that has left the screen.** Such calls are refused in
+  milliseconds instead of stalling for seconds. System alerts and the home
+  screen are recognised as the foreground.
+- **Diagnosable while stuck.** `logs`, `config` and `reset` keep answering while
+  UI calls hang. A circuit breaker stops queueing behind a stuck call, timeouts
+  name the call holding the queue, and logs survive a crash.
+
+**Secure by default**
+- **Pairing is approved on the phone.** Every request is then encrypted and
+  authenticated: X25519 key exchange, a per-request HMAC-SHA256 envelope, and
+  replay and clock-skew protection.
+- **Local only until you say otherwise.** Remote access is off by default, and
+  an unused key expires after 30 days.
+
+**No Mac required**
+- Install with a **free Apple ID** through SideStore, and mount the Developer
+  Disk Image **on the device** with the iCTRL app or StikDebug.
+- **No UI to look after.** Long-press the runner's notifications to approve
+  pairing, toggle remote access or stop the server.
+- **Clients come from the device:** a Python client and a pure-C static CLI for
+  agents in on-device sandboxes such as Minis.
+
+**Also included:**
+- live H.264 screen stream (`GET /stream`) and a browser control page (`GET /remote`);
+- deep links via `open_url`;
+- `home`, `lock`, `unlock`;
+- iOS 16 and later.
+
 ## How it works
 
 iCTRL is a UITest target that never stops. On launch it starts an `NWListener`
