@@ -1955,6 +1955,9 @@ class ActionHandler {
         // so a "cn" search for it returns Ctrip). Pass country:"cn" for apps
         // that only ship in China.
         let country = cmd.country ?? "us"
+        // An explicit country is a request to ask THAT store — answering from
+        // the offline catalog instead would make the parameter do nothing.
+        let storeOnly = cmd.country != nil
         let limit = min(max(Int(cmd.distance ?? 5), 1), 25)
 
         // Several candidate names in one call ("Trip.com|携程|Trip"). An app's
@@ -1967,19 +1970,30 @@ class ActionHandler {
             if !t.isEmpty, !terms.contains(t) { terms.append(t) }
         }
         if terms.count > 1 {
-            return resolveMany(Array(terms.prefix(6)), country: country, limit: limit)
+            return resolveMany(Array(terms.prefix(6)), country: country, limit: limit, storeOnly: storeOnly)
         }
-        return resolveOne(term: terms.first ?? term, country: country, limit: limit)
+        return resolveOne(term: terms.first ?? term, country: country, limit: limit, storeOnly: storeOnly)
+    }
+
+    /// Which store a result came from, and how to ask another one. Said in every
+    /// store-backed answer: an app missing from the default (US) store looks
+    /// exactly like an app that doesn't exist, unless the caller knows which
+    /// store was asked.
+    private static func storeRegionNote(_ country: String) -> String {
+        "Searched the \(country.uppercased()) App Store (country:\"\(country)\"). Apps are listed per region — " +
+        "if the app you want isn't here, or the user's context points elsewhere (Chinese names or a China-only " +
+        "app → \"cn\", Japan → \"jp\", Hong Kong → \"hk\", …), call resolve_app again with that country."
     }
 
     /// resolve_app for several terms at once: each looked up as resolveOne
     /// would, concurrently, then merged — opened-on-this-device first, one entry
     /// per bundle_id, each tagged with the term that found it.
-    private func resolveMany(_ terms: [String], country: String, limit: Int) -> ([String: JSONValue]?, JSONRPCError?) {
+    private func resolveMany(_ terms: [String], country: String, limit: Int,
+                             storeOnly: Bool) -> ([String: JSONValue]?, JSONRPCError?) {
         var results = [([String: JSONValue]?, JSONRPCError?)](repeating: (nil, nil), count: terms.count)
         let lock = NSLock()
         DispatchQueue.concurrentPerform(iterations: terms.count) { i in
-            let r = resolveOne(term: terms[i], country: country, limit: limit)
+            let r = resolveOne(term: terms[i], country: country, limit: limit, storeOnly: storeOnly)
             lock.lock(); results[i] = r; lock.unlock()
         }
         var verified: [JSONValue] = [], others: [JSONValue] = []
@@ -1999,19 +2013,21 @@ class ActionHandler {
         return ([
             "count": .int(apps.count),
             "terms": .array(terms.map { .string($0) }),
+            "country": .string(country),
             "per_term_source": .object(perTerm),
             "apps": .array(apps),
             "hint": .string(verified.isEmpty
                 ? "Merged results for every term; matched_term says which one found each app. None of them has " +
                   "been opened on this device yet — pick the one whose name is the app you want and launch_app it " +
-                  "(an error means not installed)."
+                  "(an error means not installed). " + Self.storeRegionNote(country)
                 : "Entries with source 'opened_here' were launched successfully on THIS device before — " +
-                  "launch_app that bundle_id directly."),
+                  "launch_app that bundle_id directly. Others: " + Self.storeRegionNote(country)),
         ], nil)
     }
 
     /// resolve_app for one term: offline (learned + built-in), else the App Store.
-    private func resolveOne(term: String, country: String, limit: Int) -> ([String: JSONValue]?, JSONRPCError?) {
+    private func resolveOne(term: String, country: String, limit: Int,
+                            storeOnly: Bool) -> ([String: JSONValue]?, JSONRPCError?) {
         // 1) Offline first: what this device has learned (opened apps, earlier
         //    store lookups) merged with the built-in catalog. Both use the same
         //    {name, bundle_id, query, country} shape and are joined PER BUNDLE
@@ -2048,12 +2064,13 @@ class ActionHandler {
         // sort — Swift's sort does not promise stability).
         offline = offline.filter { $0.verified } + offline.filter { !$0.verified }
         let anyVerified = offline.contains { $0.verified }
-        if !offline.isEmpty {
+        if !offline.isEmpty, !storeOnly {
             let apps = offline.prefix(limit).map(\.obj)
             return ([
                 "count": .int(apps.count),
                 "term": .string(term),
                 "source": .string("offline"),
+                "country": .string("offline — no App Store region was searched"),
                 "apps": .array(apps),
                 // A catalog hit says what a bundle id IS, never whether it is on
                 // this device. It reads like confirmation and is not one:
@@ -2065,7 +2082,8 @@ class ActionHandler {
                       "call launch_app with that bundle_id directly. Other entries only map a name to a bundle_id."
                     : "Matched offline (built-in catalog / earlier store lookups) — this maps a NAME to a " +
                       "bundle_id and does NOT mean the app is installed here. Confirm by calling " +
-                      "launch_app: success proves it, an error means genuinely absent. " +
+                      "launch_app: success proves it, an error means genuinely absent. If this isn't the app, " +
+                      "pass country (\"us\", \"cn\", …) to search that App Store instead. " +
                       Self.appLookupFallbackHint),
             ], nil)
         }
@@ -2128,7 +2146,8 @@ class ActionHandler {
             "country": .string(country),
             "source": .string("app_store"),
             "apps": .array(apps),
-            "hint": .string("Resolved via the App Store (iTunes Search). Use a result's bundle_id with launch_app. Note: the bundle_id confirms App Store identity but does NOT mean the app is installed on THIS device — launch_app will tell you if it isn't."),
+            "hint": .string(Self.storeRegionNote(country) + " Use a result's bundle_id with launch_app; it " +
+                            "confirms App Store identity, NOT that the app is installed here — launch_app tells you."),
         ], nil)
     }
 

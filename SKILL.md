@@ -10,7 +10,7 @@ iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, p
 
 ## Rules — read these first
 
-1. **Open apps by bundle id, never by tapping home-screen icons.** `resolve_app` → `launch_app{bundle_id}`. By common sense, pass every name it may go by in **one** call: `resolve_app{text:"Trip.com|携程|Trip"}` (brand, store title, English/Chinese); results are merged and tagged `matched_term`.
+1. **Open apps by bundle id, never by tapping home-screen icons.** `resolve_app` → `launch_app{bundle_id}`. By common sense, pass every name it may go by in **one** call: `resolve_app{text:"Trip.com|携程|Trip"}` (brand, store title, English/Chinese). The store is `country` (default `us`); pick it from context (`cn`: China-only).
 2. **Read before you act.** On any screen you haven't read, call `page_source{visible_only:true, max_children:50}` (~0.4s) to learn which view/tab/date you're really on.
 3. **Tap by `ref`.** `find_element{element_id:"<label>"}` → `tap{ref}`. Check `visibility`: `"offscreen"` or a non-empty `alternatives` means you may have a look-alike — use `scroll_to_element` or a more specific label.
 4. **Never repeat an action "to be safe."** A success reply means it worked. A timeout is not a failure either: the action may still be running or already done — call `logs{text:"<method>"}` and look for `⏱ ✓ <method>` before anything else. A retried tap fires twice.
@@ -76,7 +76,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 - The server answers a UI call after **6s** (15s for `page_source`, `tap_element`, `find_and_tap`) even if the work is still running. UI calls run **one at a time**, and a stuck one can't be cancelled. Calls behind it time out too. Their error says *"has NOT run yet: queued behind X"*: they will still run later, so **do not resend them**.
 - After two timeouts in a row, UI calls are rejected immediately. The message names the stuck call and how long it has run. Recovery: `reset` (clears refs and the app binding), then **wait** for the stuck call to end (typically 15–45s; watch `logs`), then retry. `reset` can't stop a call already running.
 - **Only `logs`, `config` and `reset` answer while the UI queue is stuck.** `device_info` shares the UI queue, so it's no health probe; use `logs`.
-- Use a client timeout ≥30s. After restarting your side, reuse the cached key and `bundle_id`s and return via a deep link (`open_url`).
+- Client timeout ≥30s. After restarting your side, reuse the cached key and `bundle_id`s and return via a deep link (`open_url`).
 
 ## Finding and tapping
 
@@ -127,7 +127,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 
 ## Diagnostics
 
-- `device_info.system`: `screen_locked` (black screenshots, taps doing nothing — `unlock` only presses Home; a passcode needs the user), `foreground_app`, `foreground_is_browser`, thermal/memory/battery. Screen sleep does not stop the runner. For long unattended runs, ask the user to set Auto-Lock to Never.
+- `device_info.system`: `screen_locked` (black screenshots, taps doing nothing — `unlock` only presses Home; a passcode needs the user), `foreground_app`, `foreground_is_browser`, thermal/memory/battery. Screen sleep doesn't stop the runner; for long runs suggest Auto-Lock → Never.
 - `logs{text?, max_elements?}`: recent log lines over the normal channel. `⏱ ✓ <method>` = completed, `⏱ TIMEOUT`, `⛔️`/`✅` channel state. `GET /logs/files` and `GET /logs/history?date=YYYY-MM-DD` keep logs across crashes; byte endpoints (`/logs*`, `/stream`) need a single-use `?ticket=` from the `stream_ticket` RPC.
 - `reset`: clears refs and the binding and rebuilds the UI channel state, then `launch_app` the target. `config{stop_server:true}` stops the runner (keys persist); it must be relaunched on the device.
 - If `/schema` is unreachable, the runner isn't running. The user must start it on the phone, and the Developer Disk Image must be mounted (it is lost on every reboot).
