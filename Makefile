@@ -20,7 +20,17 @@ RUNNER_IPA    = iCTRLUITests-Runner.ipa
 # ──────────────────────────────────────────────
 # Build both targets with Xcode signing
 # ──────────────────────────────────────────────
-build: Frameworks/IDevice.xcframework
+# A fresh clone has neither: the project is generated (gitignored) and the
+# signing config is per developer. Both are produced on demand, so
+# `git clone` → `make ipa` works with nothing else set up.
+Config/Local.xcconfig:
+	@./Scripts/setup-signing.sh
+
+$(PROJECT)/project.pbxproj: project.yml Config/Signing.xcconfig Config/Local.xcconfig
+	@command -v xcodegen >/dev/null || { echo "❌ xcodegen not found — brew install xcodegen"; exit 1; }
+	xcodegen generate --quiet
+
+build: Frameworks/IDevice.xcframework $(PROJECT)/project.pbxproj
 build:
 	@# Stamp BEFORE xcodebuild, not inside it. As an Xcode pre-build phase the
 	@# generated file is written after the Swift compile has already read it, so
@@ -47,10 +57,6 @@ build:
 # ──────────────────────────────────────────────
 ipa: build
 	@echo ""
-	@# The runner is packaged FIRST so the app can carry a copy of it: the app's
-	@# installer offers the bundled runner as its default package, which means
-	@# the .ipa has to exist before the app is zipped. Both come out of the same
-	@# xcodebuild invocation, so this is purely an ordering constraint.
 	@# === Runner IPA ===
 	@echo "🎨 Copying app icon to Runner..."
 	@# Copy main app's icon assets into Runner so it shows the same icon
@@ -79,11 +85,14 @@ ipa: build
 	@# one bind record at it — the symbol is only touched on the --run-as-tool
 	@# path, which testmanagerd-launched runs never take.
 	@echo "🩹 Building + inserting the older-iOS compat shim..."
-	@# Both steps below are one-shot: optool would add a second load command,
+	@# Both steps below are one-shot: insert-dylib.py would refuse a second load command,
 	@# and the bind record is already re-pointed, so retarget-bind-ordinal.py
 	@# finds nothing to change and fails the build. That happens whenever `make
 	@# ipa` runs twice without the runner being rebuilt in between, which reads
-	@# as a broken build rather than as work already done.
+	@# as a broken build rather than as work already done. The patching runs on
+	@# a copy that only replaces the binary once every step has succeeded — a
+	@# half-patched runner (shim loaded, symbol not retargeted) would otherwise
+	@# be mistaken for a finished one by the check below and shipped.
 	@set -e; \
 	APP="$(BUILD_DIR)/$(RUNNER_APP)"; \
 	if otool -L "$$APP/$(RUNNER_BIN)" | grep -q libXCTCompatShim; then \
@@ -96,13 +105,16 @@ ipa: build
 		-mios-version-min=16.0 -install_name "@rpath/libXCTCompatShim.dylib" \
 		-framework Foundation -o "$$APP/Frameworks/libXCTCompatShim.dylib" \
 		iCTRLCompat/XCTCompatShim.m; \
-	optool install -c load -p "@rpath/libXCTCompatShim.dylib" \
-		-t "$$APP/$(RUNNER_BIN)" >/dev/null; \
-	ORD="$$(python3 Scripts/dylib-ordinal.py "$$APP/$(RUNNER_BIN)" libXCTCompatShim)"; \
-	python3 Scripts/retarget-bind-ordinal.py "$$APP/$(RUNNER_BIN)" \
+	BIN="$$APP/$(RUNNER_BIN)"; TMP="$$BIN.patching"; \
+	cp "$$BIN" "$$TMP"; \
+	trap 'rm -f "$$TMP"' EXIT; \
+	python3 Scripts/insert-dylib.py "$$TMP" "@rpath/libXCTCompatShim.dylib"; \
+	ORD="$$(python3 Scripts/dylib-ordinal.py "$$TMP" libXCTCompatShim)"; \
+	python3 Scripts/retarget-bind-ordinal.py "$$TMP" \
 		'_OBJC_CLASS_$$_XCTCommandLineToolHelper' "$$ORD"; \
-	python3 Scripts/retarget-undef-symbol.py "$$APP/$(RUNNER_BIN)" \
-		'_OBJC_CLASS_$$_XCTCommandLineToolHelper' libXCTCompatShim
+	python3 Scripts/retarget-undef-symbol.py "$$TMP" \
+		'_OBJC_CLASS_$$_XCTCommandLineToolHelper' libXCTCompatShim; \
+	mv "$$TMP" "$$BIN"
 	@echo "🧹 Removing dSYM debug symbols from the app..."
 	@# build-for-testing embeds a .dSYM inside the app; it is debug-symbol data,
 	@# not needed at runtime, and bloats the IPA (~3MB). Strip it before packaging.
@@ -166,23 +178,7 @@ ipa: build
 	rm -rf "$(BUILD_DIR)/Payload"
 	@echo "✅ $(RUNNER_IPA)"
 	@echo ""
-	@# === Main App IPA (carrying the runner just built) ===
-	@# Copied in after the app is built rather than declared as a project
-	@# resource: the runner doesn't exist until the step above, so XcodeGen has
-	@# nothing to reference at generate time.
-	@echo "🎁 Embedding $(RUNNER_IPA) into the app..."
-	@cp "$(RUNNER_IPA)" "$(BUILD_DIR)/$(MAIN_APP)/$(RUNNER_IPA)"
-	@ls -lh "$(BUILD_DIR)/$(MAIN_APP)/$(RUNNER_IPA)" | awk '{print "   " $$5 "  " $$9}'
-	@# Re-sign: adding a file to a signed bundle invalidates its signature, and
-	@# an app whose seal is broken is rejected at install.
-	@set -e; \
-	APP="$(BUILD_DIR)/$(MAIN_APP)"; \
-	AUTH="$$(codesign -dvv "$$APP" 2>&1 | sed -n 's/^Authority=//p' | head -1)"; \
-	if [ -z "$$AUTH" ]; then echo "🔴 could not read signing identity from $$APP"; exit 1; fi; \
-	SHA="$$(security find-identity -v -p codesigning 2>/dev/null | grep -F "$$AUTH" | head -1 | awk '{print $$2}')"; \
-	codesign --force --sign "$${SHA:-$$AUTH}" --preserve-metadata=entitlements "$$APP"; \
-	codesign -v "$$APP" || { echo "🔴 re-sign failed"; exit 1; }; \
-	echo "   ✅ app re-signed"
+	@# === Main App IPA ===
 	@echo "📦 Packaging $(MAIN_IPA)..."
 	rm -rf "$(BUILD_DIR)/Payload"
 	mkdir -p "$(BUILD_DIR)/Payload"

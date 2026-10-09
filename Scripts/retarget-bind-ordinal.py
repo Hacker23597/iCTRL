@@ -17,6 +17,12 @@ appears — and, because the old ordinal must stay in effect for the OTHER symbo
 we re-emit it right after. That only works when both fit in the IMM form, which
 holds here (small ordinals); we bail out loudly otherwise.
 
+Newer linkers (the runner stub from Xcode 27 on) emit LC_DYLD_CHAINED_FIXUPS
+instead of a bind stream. There the library ordinal lives in the fixups'
+IMPORTS table, one entry per imported symbol, so retargeting is a direct field
+write — handled by patch_chained_imports below. Each binary uses one form or the
+other; both are tried.
+
 Usage: retarget-bind-ordinal.py <macho> <symbol> <new-ordinal>
 """
 import struct
@@ -27,6 +33,7 @@ FAT_CIGAM = 0xBEBAFECA
 MH_MAGIC_64 = 0xFEEDFACF
 LC_DYLD_INFO = 0x22
 LC_DYLD_INFO_ONLY = 0x80000022
+LC_DYLD_CHAINED_FIXUPS = 0x80000034
 
 BIND_OPCODE_MASK = 0xF0
 BIND_IMMEDIATE_MASK = 0x0F
@@ -131,6 +138,53 @@ def patch_stream(buf, start, size, want_sym, new_ord):
     return patched
 
 
+def patch_chained_imports(buf, hdr, want_sym, new_ord):
+    """Point every chained-fixups import of `want_sym` at library `new_ord`.
+
+    dyld_chained_fixups_header: version, starts_offset, imports_offset,
+    symbols_offset, imports_count, imports_format, symbols_format (all u32).
+    Import formats (lib_ordinal is the low bits of the first word):
+      1 DYLD_CHAINED_IMPORT           u32: ordinal:8  weak:1 name_offset:23
+      2 DYLD_CHAINED_IMPORT_ADDEND    the same u32 + i32 addend
+      3 DYLD_CHAINED_IMPORT_ADDEND64  u64: ordinal:16 weak:1 reserved:15 name_offset:32, + u64 addend
+    """
+    _ver, _starts, imports_off, symbols_off, count, fmt, sym_fmt = struct.unpack_from("<7I", buf, hdr)
+    if sym_fmt != 0:
+        print(f"🔴 compressed chained-fixups symbol table (format {sym_fmt}) is not supported", file=sys.stderr)
+        return -1
+    stride, ord_bits = {1: (4, 8), 2: (8, 8), 3: (16, 16)}.get(fmt, (0, 0))
+    if not stride:
+        print(f"🔴 unknown chained-fixups imports format {fmt}", file=sys.stderr)
+        return -1
+    if new_ord >= (1 << ord_bits) - 16:   # the top values are special ordinals
+        print(f"🔴 ordinal {new_ord} doesn't fit import format {fmt}", file=sys.stderr)
+        return -1
+
+    want = want_sym.encode()
+    patched = 0
+    for i in range(count):
+        at = hdr + imports_off + i * stride
+        if fmt == 3:
+            word = struct.unpack_from("<Q", buf, at)[0]
+            name_off = word >> 32
+        else:
+            word = struct.unpack_from("<I", buf, at)[0]
+            name_off = word >> 9
+        name_at = hdr + symbols_off + name_off
+        end = buf.index(b"\0", name_at)
+        if bytes(buf[name_at:end]) != want:
+            continue
+        mask = (1 << ord_bits) - 1
+        old = word & mask
+        if old == new_ord:
+            continue
+        word = (word & ~mask) | new_ord
+        struct.pack_into("<Q" if fmt == 3 else "<I", buf, at, word)
+        print(f"   ↪ chained import '{want_sym}': library ordinal {old} → {new_ord}")
+        patched += 1
+    return patched
+
+
 def main():
     if len(sys.argv) != 4:
         print("usage: retarget-bind-ordinal.py <macho> <symbol> <new-ordinal>", file=sys.stderr)
@@ -154,6 +208,12 @@ def main():
         off = base + 32
         for _ in range(ncmds):
             cmd, cmdsize = struct.unpack_from("<II", buf, off)
+            if cmd == LC_DYLD_CHAINED_FIXUPS:
+                dataoff = struct.unpack_from("<I", buf, off + 8)[0]
+                n = patch_chained_imports(buf, base + dataoff, want_sym, new_ord)
+                if n < 0:
+                    return 1
+                total += n
             if cmd in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY):
                 bind_off, bind_size = struct.unpack_from("<II", buf, off + 16)
                 lazy_off, lazy_size = struct.unpack_from("<II", buf, off + 32)

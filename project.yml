@@ -5,10 +5,15 @@ options:
     iOS: "16.0"
   xcodeVersion: "16.0"
 
+# Team and bundle-id prefix come from here, not from this file: each developer
+# has their own (see Config/Signing.xcconfig and Scripts/setup-signing.sh).
+configFiles:
+  Debug: Config/Signing.xcconfig
+  Release: Config/Signing.xcconfig
+
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    DEVELOPMENT_TEAM: K8Q74NT2BG
 
 targets:
   iCTRL:
@@ -30,7 +35,7 @@ targets:
         embed: false
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.openminis.ictrl
+        PRODUCT_BUNDLE_IDENTIFIER: "$(ICTRL_BUNDLE_PREFIX).ictrl"
         GENERATE_INFOPLIST_FILE: YES
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: 1
@@ -73,7 +78,7 @@ targets:
       - target: iCTRL
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.openminis.ictrl.uitests
+        PRODUCT_BUNDLE_IDENTIFIER: "$(ICTRL_BUNDLE_PREFIX).ictrl.uitests"
         GENERATE_INFOPLIST_FILE: YES
         CODE_SIGN_STYLE: Automatic
         SWIFT_OBJC_BRIDGING_HEADER: iCTRLUITests/XCTestPrivate-Bridging-Header.h

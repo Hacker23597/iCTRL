@@ -17,3 +17,7 @@ xcuserdata/
 Frameworks/
 build-sim/
 build/altsign-headers/
+release/
+
+# Per-developer signing (Scripts/setup-signing.sh)
+Config/Local.xcconfig
