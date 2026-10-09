@@ -51,7 +51,7 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "max_children", type: "number", required: false, description: "Max children per node the accessibility server will walk (default 1000, cap 5000). One of only two knobs that bound the FETCH itself — the expensive phase (on a chat list, fetch is ~99% of the call). Lower it on wide recycling lists where thousands of offscreen rows hang off one container."),
                 RPCParamDef(name: "visible_only", type: "boolean", required: false, description: "Return ONLY nodes intersecting the screen, plus their ancestor path. Use on long/infinitely-scrolling lists (chat lists, feeds, timelines): such a list keeps far more rows in the tree than are on screen — measured 91% offscreen on a WeChat chat list — and those offscreen rows exhaust max_elements before the visible ones are reached, so the response truncates while still missing what you can see. This returns the CURRENT VIEWPORT only: to see more, scroll (page{direction:'down'}) and read again, or use scroll_to_element to jump to a known item. Omit it when you need to reason about content just offscreen — scroll_to_element needs the full tree. Cuts payload and node count sharply; cuts TIME only modestly, since a container's frame doesn't bound its children in a recycling list so every node is still visited."),
             ],
-            returns: "{source: the tree as text, truncated, total_returned, max_children_used, timing:{fetch_ms,render_ms}, coordinate_space:'points', hint}. Includes visible overlay windows automatically. AUTOMATIC OCR FALLBACK: when the accessibility tree returns NO on-screen content (common on chat lists and feeds), the response also carries ocr_items[] — same keys as find_element, each tagged source:'ocr', tap via tap{x:center_x,y:center_y} — plus ocr_count, ocr_timing and ocr_reason explaining why. viewport_warning / sparse_hint flag a tree that is present but suspect."
+            returns: "{source: the tree as text, truncated, total_returned, max_children_used, timing:{fetch_ms,render_ms}, coordinate_space:'points', channel:{ax_coverage, recommended:'tree'|'ocr', why} for THIS screen, hint}. Includes visible overlay windows automatically. AUTOMATIC OCR FALLBACK: when the accessibility tree returns NO on-screen content (common on chat lists and feeds), the response also carries ocr_items[] — same keys as find_element, each tagged source:'ocr', tap via tap{x:center_x,y:center_y} — plus ocr_count, ocr_timing and ocr_reason explaining why. viewport_warning / sparse_hint flag a tree that is present but suspect."
         ),
         RPCMethodDef(
             name: "screen_text",
@@ -61,7 +61,7 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "match", type: "string", required: false, description: "'fast' uses Vision's fast recognition level (lower accuracy, quicker); default is accurate."),
                 RPCParamDef(name: "scale", type: "number", required: false, description: "Minimum confidence 0..1 (default 0.3). Raise to drop shaky reads."),
             ],
-            returns: "{count, items:[{label, confidence, x, y, width, height, center_x, center_y, element_type:'OCRText', is_text_input, exists}], coordinate_space:'points', timing:{screenshot_ms, ocr_ms}, hint}"
+            returns: "{count, items:[{label, confidence, x, y, width, height, center_x, center_y, element_type:'OCRText', is_text_input, exists}] (the target app's text only), overlay_text?:[text the system drew over the app — status bar, banners], channel:{ax_coverage, recommended:'tree'|'ocr', why} for THIS screen, coordinate_space:'points', timing:{screenshot_ms, ocr_ms}, hint}. OCR is the fallback: when channel.recommended is 'tree', page_source/find_element give refs and exact labels"
         ),
         RPCMethodDef(
             name: "logs",
@@ -340,7 +340,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.33.0"
+    static let serverVersion = "1.34.0"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///

@@ -1,7 +1,7 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
-skill_version: "1.33.0"
+skill_version: "1.34.0"
 ---
 
 # iCTRL — control an iPhone over HTTP
@@ -15,8 +15,10 @@ iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, p
 3. **Tap by `ref`.** `find_element{element_id:"<label>"}` → `tap{ref}`. Check `visibility`: `"offscreen"` or a non-empty `alternatives` means you may have a look-alike — use `scroll_to_element` or a more specific label.
 4. **Never repeat an action "to be safe."** A success reply means it worked. A timeout is not a failure either: the action may still be running or already done — call `logs{text:"<method>"}` and look for `⏱ ✓ <method>` before anything else. A retried tap fires twice.
 5. **Every error from a `ref` action means nothing was tapped.** Re-find and retry is safe.
-6. **Screenshot last.** Only when the tree can't answer (images, custom-drawn text, web pages). `screen_text` reads text via OCR without an image round trip.
-7. **Stop before paying.** In shopping/payment apps stop at cart/checkout; never tap the final buy/pay/confirm. Never delete the user's own items (cart, notes, messages) without asking.
+6. **Primary path first; fallbacks only when it fails — decided per screen.** The primary path is `page_source` / `find_element` → `tap{ref}`. OCR (`screen_text`) with coordinate taps, screenshots, and workarounds you remember are fallbacks: use one only when the primary path fails or is unavailable on the **current** screen. Every read returns `channel.recommended` for that screen. Return to the primary path on the next screen.
+7. **Remember conditions, not conclusions.** Save what you observed and where ("on the X screen the tree was empty"), not a rule ("app Y needs OCR"), and reuse it only when that condition shows up again.
+8. **Know where data came from.** Act only on the target app's content. Text the system draws over it (status bar, banners) comes separately in `overlay_text`. Screenshots help only if you can view images.
+9. **Stop before paying.** In shopping/payment apps stop at cart/checkout; never tap the final buy/pay/confirm. Never delete the user's own items (cart, notes, messages) without asking.
 
 ## Connect
 
@@ -102,7 +104,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 
 - **Default: `page_source{visible_only:true, max_children:50}`** — on-screen nodes only, well under 1s even on long feeds. Omit `visible_only` only when you need off-screen structure.
 - `filter:{text|label|type:"…"}` returns matching nodes + ancestors — the cheap way to harvest repeated values (prices, titles).
-- **Thin tree?** Chat lists and feeds may expose little of what's visible. When `ax_coverage` is low or `sparse_hint`/`viewport_warning` appears, call `screen_text` (OCR; returns text with tappable point coordinates).
+- **Thin tree?** When `channel.recommended` is `ocr` (or `sparse_hint`/`viewport_warning` appears), read with `screen_text`: text plus tappable point coordinates.
 - `max_depth` small (3–4) returns structure without labels — layout preview only.
 - `max_elements` (default 2000, cap 4000): if the response says `truncated:true`, narrow with `filter`/`visible_only` instead of raising it. An app scrolled for a long time accumulates rows and slows every read; relaunching it clears them.
 
@@ -137,8 +139,6 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 
 Compare `device_info.skill_version` with this file's frontmatter. Patch gap: ignore. Minor: refresh if something seems missing. Major, or a different `protocol_version`: refresh `GET /skill` **and** the client together. Device *older* than this file: don't downgrade — use only its `capabilities[]` and tell the user.
 
-## Protocol (only if you can't use a bundled client)
+## Protocol
 
-- **Pair**: `POST /pair {"client_name","pub":"<b64 X25519 pubkey>"}`, or `{"client_name","plain":true}` from 127.0.0.1 only. Unwrap: `shared=X25519(c_priv,d_pub)`, `K_wrap=HMAC(shared,"ictrl-pair"‖c_pub‖d_pub)`, `K=token_ct XOR HMAC(K_wrap,"ictrl-wrap")`. Denied → 403.
-- **Seal** each `/rpc` call: `tok`=first 4 bytes of SHA256(K) as hex; `nonce`=16 random bytes (never reuse); `ts`=unix seconds (±120s). `K_enc_req=HMAC(K,"ictrl-v1|enc-req"‖nonce)`, `K_enc_resp` likewise with `enc-resp`, `K_mac` with `mac`. Keystream = `HMAC(Kx, nonce‖be32(i))` blocks. `ct = body XOR ks(K_enc_req)`, `tag = HMAC(K_mac,"v1"‖tok‖be64(ts)‖nonce‖ct)`. Send `{"v":1,"tok","ts","nonce":hex,"ct":b64,"tag":hex}`.
-- **Open** the reply (same nonce): check `tag == HMAC(K_mac,"resp"‖nonce‖ct)`, decrypt with `K_enc_resp`.
+Only if you can't use a bundled client: the Python client (`GET /skill/clients/python`) is a complete, readable reference for pairing (X25519) and the v1 request envelope (HMAC-SHA256). Follow it exactly.

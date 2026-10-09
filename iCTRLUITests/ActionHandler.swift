@@ -1103,10 +1103,10 @@ class ActionHandler {
                     // this the caller sees success and only finds out from a
                     // screenshot that the keyboard never appeared.
                     data["hit_warning"] = .string(
-                        "No labelled element was found at (\(Int(x)),\(Int(y))) — the tap may have "
-                        + "landed on empty space. Coordinates also go stale when the layout shifts "
-                        + "(a keyboard appearing moves everything up). Re-read page_source and prefer "
-                        + "find_element{element_id} → tap{ref}, which re-resolves the live element.")
+                        "No labelled element at (\(Int(x)),\(Int(y))). Either the tap hit empty space, or "
+                        + "the content there isn't in the accessibility tree (web or custom-drawn) — "
+                        + "expected if you aimed from OCR. Confirm with a fresh read. Coordinates also go "
+                        + "stale when the layout shifts (a keyboard appearing moves everything up).")
                 }
                 if Self.isHomeScreen() { data["hint"] = .string(Self.homeScreenAdvice) }
                 r.0 = data
@@ -2666,7 +2666,7 @@ class ActionHandler {
                     // A 50% bar fired on RED and cost ~400ms of OCR for nothing.
                     // 15% separates the real failures (0-11%) from sparse-but-fine
                     // layouts (26%+) on everything measured.
-                    if coverage < 0.15 {
+                    if coverage < Self.treeCoverageThreshold {
                         // Run the wider fetch and the OCR CONCURRENTLY: serially
                         // they are ~1.2s + ~0.7s, which blows the 1s budget on
                         // exactly the screens that need help most.
@@ -2854,6 +2854,7 @@ class ActionHandler {
             // is no way to tell "the trigger decided the tree was fine" from "the
             // trigger never ran", which is exactly the ambiguity that hid a bug here.
             "ax_coverage": .double((visibleLabelledCoverage(body) * 100).rounded() / 100),
+            "channel": Self.screenChannel(visibleLabelledCoverage(body)),
             // Where this read sits in the list, so a caller can tell "more below"
             // from "already at the bottom" without scrolling to find out.
             "scroll_position": scrollPosition().map { JSONValue.object($0) } ?? .null,
@@ -3225,6 +3226,10 @@ class ActionHandler {
             guard f.count >= 4, f[2] > 0, f[3] > 0 else { continue }
             guard x >= f[0], x <= f[0] + f[2], y >= f[1], y <= f[1] + f[3] else { continue }
             let area = f[2] * f[3]
+            // A node covering (nearly) the whole screen is the app or a page
+            // container, not what was tapped — reporting it as the hit says
+            // nothing while looking like an answer.
+            if area >= Double(pointSize.width * pointSize.height) * 0.9 { continue }
             if best == nil || area < best!.area {
                 let t = String(line.drop { $0 == " " }.prefix { $0 != "," })
                 var label = ""
@@ -3242,6 +3247,88 @@ class ActionHandler {
             "x": .double(b.f[0]), "y": .double(b.f[1]),
             "width": .double(b.f[2]), "height": .double(b.f[3]),
         ]
+    }
+
+    // MARK: - Which channel can read this screen
+
+    /// Below this share of the content area covered by labelled nodes, the
+    /// accessibility tree can't be trusted for this screen and OCR reads it
+    /// instead. One threshold for both the automatic fallback and the advice.
+    static let treeCoverageThreshold = 0.15
+
+    /// The reading channel for THIS screen, decided from what was just measured.
+    ///
+    /// Said in every read so a caller decides per screen, not per app: the same
+    /// app routinely mixes native screens (tree readable) with web or
+    /// custom-drawn ones (tree empty), and a lesson carried from one to the
+    /// other turns into OCR everywhere — refs lost, misreads, coordinate taps.
+    static func screenChannel(_ coverage: Double) -> JSONValue {
+        let c = (coverage * 100).rounded() / 100
+        let tree = coverage >= treeCoverageThreshold
+        return .object([
+            "ax_coverage": .double(c),
+            "recommended": .string(tree ? "tree" : "ocr"),
+            "why": .string(tree
+                ? "The accessibility tree covers \(Int(c * 100))% of this screen: use page_source / find_element → tap{ref}."
+                : "The accessibility tree covers only \(Int(c * 100))% of this screen (web or custom-drawn content): "
+                  + "read it with screen_text and tap by coordinate. Check again on the next screen."),
+        ])
+    }
+
+    /// Labelled-node coverage of the foreground app's visible screen — one
+    /// bounded read, for responses that don't otherwise walk the tree.
+    private func currentTreeCoverage() -> Double? {
+        guard let bid = resolveForegroundBundleId(),
+              bid != "com.apple.springboard",
+              let root = ForegroundApp.boundedSnapshot(forBundleID: bid, maxDepth: Self.defaultMaxDepth,
+                                                       maxChildren: 50) else { return nil }
+        var n = 0
+        var t: ObjCBool = false
+        guard let body = ForegroundApp.renderBoundedSnapshot(
+                root, maxDepth: Self.defaultMaxDepth, maxElements: 600,
+                visibleRect: CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height),
+                nodesWritten: &n, truncated: &t) else { return nil }
+        return visibleLabelledCoverage(body)
+    }
+
+    /// Screen regions drawn OVER the foreground app by the system: the status
+    /// bar, and anything SpringBoard shows outside the app's own card (banners,
+    /// the Dynamic Island and its live activities, alerts). Text found there is
+    /// not the app's — reading it as the app's content is how one run decided
+    /// the phone was "mirroring" another app.
+    ///
+    /// Generic on purpose: no knowledge of which app or activity drew what,
+    /// just "inside the app's card" versus "on top of it".
+    private func overlayRects() -> [CGRect] {
+        guard let fg = resolveForegroundBundleId(), fg != "com.apple.springboard",
+              let root = ForegroundApp.boundedSnapshot(forBundleID: "com.apple.springboard",
+                                                       maxDepth: Self.defaultMaxDepth, maxChildren: 50) else { return [] }
+        let screen = CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height)
+        var n = 0
+        var t: ObjCBool = false
+        guard let body = ForegroundApp.renderBoundedSnapshot(
+                root, maxDepth: Self.defaultMaxDepth, maxElements: 600, visibleRect: screen,
+                nodesWritten: &n, truncated: &t) else { return [] }
+        var rects: [CGRect] = []
+        var cardIndent: Int?
+        for line in body.split(separator: "\n") {
+            let indent = line.prefix { $0 == " " }.count
+            let text = line.dropFirst(indent)
+            if let ci = cardIndent, indent <= ci { cardIndent = nil }
+            if text.contains("id: 'card:") { cardIndent = indent; continue }
+            let isStatusBar = text.hasPrefix("StatusBar,") || text.hasPrefix("Type25,")
+            if cardIndent != nil && !isStatusBar { continue }
+            guard let r = line.range(of: "{{"),
+                  let end = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { continue }
+            let f = line[r.lowerBound..<end.upperBound]
+                .split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
+            guard f.count >= 4, f[2] > 0, f[3] > 0 else { continue }
+            let rect = CGRect(x: f[0], y: f[1], width: f[2], height: f[3])
+            // Full-screen nodes are containers (windows, the app switcher), not overlays.
+            guard rect.width * rect.height < screen.width * screen.height * 0.6 else { continue }
+            rects.append(rect.insetBy(dx: -2, dy: -2))
+        }
+        return rects
     }
 
     /// Where the list is scrolled to, derived from the row frames.
@@ -4439,6 +4526,9 @@ class ActionHandler {
         do { try handler.perform([request]) } catch { return nil }
         let ocrMs = (nowMonotonic - ocrStart) * 1000
 
+        // Same rule as screen_text: text the system draws over the app is not
+        // the app's, so it never becomes a fallback item.
+        let overlays = overlayRects()
         var items: [JSONValue] = []
         for obs in (request.results ?? []) {
             guard let top = obs.topCandidates(1).first, top.confidence >= minConfidence else { continue }
@@ -4451,6 +4541,7 @@ class ActionHandler {
             let h = b.height * frame.height
             let y = (1 - b.maxY) * frame.height
             if let q = query, !q.isEmpty, !top.string.localizedCaseInsensitiveContains(q) { continue }
+            if overlays.contains(where: { $0.contains(CGPoint(x: x + w / 2, y: y + h / 2)) }) { continue }
             items.append(.object([
                 "label": .string(top.string),
                 "confidence": .double(Double(top.confidence)),
@@ -4502,7 +4593,9 @@ class ActionHandler {
         let ocrMs = (nowMonotonic - ocrStart) * 1000
 
         let minConf = Float(cmd.scale ?? 0.3)
+        let overlays = overlayRects()
         var items: [JSONValue] = []
+        var overlayText: [JSONValue] = []
         for obs in (request.results ?? []) {
             guard let top = obs.topCandidates(1).first, top.confidence >= minConf else { continue }
             // Vision's box is normalised with the ORIGIN AT BOTTOM-LEFT; iOS points
@@ -4515,6 +4608,11 @@ class ActionHandler {
             let y = (1 - b.maxY) * frame.height
             if let q = cmd.elementId, !q.isEmpty,
                !top.string.localizedCaseInsensitiveContains(q) { continue }
+            let center = CGPoint(x: x + w / 2, y: y + h / 2)
+            if overlays.contains(where: { $0.contains(center) }) {
+                if overlayText.count < 12 { overlayText.append(.string(top.string)) }
+                continue
+            }
             items.append(.object([
                 "label": .string(top.string),
                 "confidence": .double(Double(top.confidence)),
@@ -4531,7 +4629,26 @@ class ActionHandler {
             ]))
         }
 
-        return ([
+        // OCR is the fallback channel. Whether it was the right call for THIS
+        // screen is measurable, so measure it and say so — an agent that
+        // learned "this app needs OCR" on one web page otherwise keeps using it
+        // on native screens where the tree gives refs and exact labels.
+        let coverage = currentTreeCoverage()
+        confirmOpened(resolveForegroundBundleId(), name: nil)
+        var hint = "OCR of what is rendered on screen. Tap a result with tap{x:center_x, y:center_y} (points); "
+            + "coordinates go stale on scroll, there are no refs, and icons/images are invisible here."
+        if let c = coverage, c >= Self.treeCoverageThreshold {
+            hint = "This screen's accessibility tree is readable (\(Int((c * 100).rounded()))% coverage) — "
+                + "prefer page_source / find_element → tap{ref} here: refs survive scrolling and labels are exact. "
+                + "OCR is for screens the tree can't read. " + hint
+        } else if coverage != nil {
+            hint = "The accessibility tree can't read this screen, so OCR is the right tool here. " + hint
+                + " Check `channel` again on the next screen."
+        }
+        if !overlayText.isEmpty {
+            hint += " Text drawn over the app by the system (status bar, banners, islands) is in overlay_text, not items — it isn't the app's content."
+        }
+        var result: [String: JSONValue] = [
             "count": .int(items.count),
             "items": .array(items),
             "coordinate_space": .string("points"),
@@ -4539,15 +4656,11 @@ class ActionHandler {
                 "screenshot_ms": .int(Int(shotMs.rounded())),
                 "ocr_ms": .int(Int(ocrMs.rounded())),
             ]),
-            "hint": .string(
-                "OCR of what is RENDERED on screen — independent of the accessibility tree, "
-                + "so it still works when page_source returns no on-screen rows. "
-                + "Tap a result with tap{x:center_x, y:center_y} (already in points). "
-                + "Limits: no `ref` (coordinates go stale on scroll — act immediately), no identifier, "
-                + "and element_type is always 'OCRText', so you cannot tell a button from a label. "
-                + "Text-only: icon buttons and images are invisible here. "
-                + "Prefer find_element when the accessibility tree has the element."),
-        ], nil)
+            "hint": .string(hint),
+        ]
+        if !overlayText.isEmpty { result["overlay_text"] = .array(overlayText) }
+        if let c = coverage { result["channel"] = Self.screenChannel(c) }
+        return (result, nil)
     }
 
     private func findElementInfo(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
