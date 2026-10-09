@@ -92,14 +92,15 @@ final class AppMemory {
 
     // MARK: - Reading
 
-    /// Entries matching `term` against name / store name / query / bundle_id,
+    /// Entries matching `term`: substring on name / store name / query, exact
+    /// on bundle_id (a substring on ids made "trip.com" match "ctrip.com"),
     /// installed-and-recent first.
     func lookup(_ term: String) -> [[String: Any]] {
         let t = term.lowercased()
         return sorted(snapshot().filter { e in
-            ["name", "store_name", "query", "bundle_id"].contains { key in
+            ["name", "store_name", "query"].contains { key in
                 (e[key] as? String)?.lowercased().contains(t) ?? false
-            }
+            } || (e["bundle_id"] as? String)?.lowercased() == t
         })
     }
 

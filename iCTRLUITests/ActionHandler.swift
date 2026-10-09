@@ -1922,14 +1922,16 @@ class ActionHandler {
         builtInApps.first { $0["bundle_id"] == bundleId }
     }
 
-    /// Case-insensitive lookup in the built-in catalog by name / query / bundle_id.
-    /// Returns matches as {name, bundle_id} dicts.
+    /// Case-insensitive lookup in the built-in catalog: substring on name and
+    /// query, but EXACT on bundle_id. A substring match on ids turned "Trip.com"
+    /// into Ctrip ("c·trip.com"), and since an offline hit skips the App Store,
+    /// every rephrasing returned the same wrong app.
     private func lookupBuiltInApps(_ term: String) -> [[String: String]] {
         let t = term.lowercased()
         return Self.builtInApps.filter { app in
             (app["name"]?.lowercased().contains(t) ?? false) ||
             (app["query"]?.lowercased().contains(t) ?? false) ||
-            (app["bundle_id"]?.lowercased().contains(t) ?? false)
+            app["bundle_id"]?.lowercased() == t
         }
     }
 
@@ -1951,6 +1953,61 @@ class ActionHandler {
         let country = cmd.country ?? "cn"
         let limit = min(max(Int(cmd.distance ?? 5), 1), 25)
 
+        // Several candidate names in one call ("Trip.com|携程|Trip"). An app's
+        // name is often not what the user said — a brand vs its store title,
+        // English vs Chinese — and trying them one per round cost a real session
+        // three model turns. Searched in parallel, merged by bundle_id.
+        var terms: [String] = []
+        for part in term.split(separator: "|") {
+            let t = part.trimmingCharacters(in: .whitespaces)
+            if !t.isEmpty, !terms.contains(t) { terms.append(t) }
+        }
+        if terms.count > 1 {
+            return resolveMany(Array(terms.prefix(6)), country: country, limit: limit)
+        }
+        return resolveOne(term: terms.first ?? term, country: country, limit: limit)
+    }
+
+    /// resolve_app for several terms at once: each looked up as resolveOne
+    /// would, concurrently, then merged — opened-on-this-device first, one entry
+    /// per bundle_id, each tagged with the term that found it.
+    private func resolveMany(_ terms: [String], country: String, limit: Int) -> ([String: JSONValue]?, JSONRPCError?) {
+        var results = [([String: JSONValue]?, JSONRPCError?)](repeating: (nil, nil), count: terms.count)
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: terms.count) { i in
+            let r = resolveOne(term: terms[i], country: country, limit: limit)
+            lock.lock(); results[i] = r; lock.unlock()
+        }
+        var verified: [JSONValue] = [], others: [JSONValue] = []
+        var seen = Set<String>()
+        var perTerm: [String: JSONValue] = [:]
+        for (i, (res, err)) in results.enumerated() {
+            if let err = err { perTerm[terms[i]] = .string("error: \(err.message)"); continue }
+            perTerm[terms[i]] = res?["source"] ?? .null
+            guard case .array(let apps)? = res?["apps"] else { continue }
+            for case .object(var o) in apps {
+                guard case .string(let bid)? = o["bundle_id"], !bid.isEmpty, seen.insert(bid).inserted else { continue }
+                o["matched_term"] = .string(terms[i])
+                if case .string("opened_here")? = o["source"] { verified.append(.object(o)) } else { others.append(.object(o)) }
+            }
+        }
+        let apps = Array((verified + others).prefix(limit * 2))
+        return ([
+            "count": .int(apps.count),
+            "terms": .array(terms.map { .string($0) }),
+            "per_term_source": .object(perTerm),
+            "apps": .array(apps),
+            "hint": .string(verified.isEmpty
+                ? "Merged results for every term; matched_term says which one found each app. None of them has " +
+                  "been opened on this device yet — pick the one whose name is the app you want and launch_app it " +
+                  "(an error means not installed)."
+                : "Entries with source 'opened_here' were launched successfully on THIS device before — " +
+                  "launch_app that bundle_id directly."),
+        ], nil)
+    }
+
+    /// resolve_app for one term: offline (learned + built-in), else the App Store.
+    private func resolveOne(term: String, country: String, limit: Int) -> ([String: JSONValue]?, JSONRPCError?) {
         // 1) Offline first: what this device has learned (opened apps, earlier
         //    store lookups) merged with the built-in catalog. Both use the same
         //    {name, bundle_id, query, country} shape and are joined PER BUNDLE
@@ -2154,28 +2211,27 @@ class ActionHandler {
         return (["message": .string("Activated \(bundleId). Actions now target this app.")], nil)
     }
 
-    /// Record `bundleId` in AppMemory as installed — but only once the process
-    /// is demonstrably up. `openApplicationWithBundleID:` returning YES means
-    /// the request was accepted, not that anything launched, and a history that
-    /// lists apps which never opened would repeat list_apps' old lie in reverse.
+    /// An app opened by launch_app/activate_app, not yet confirmed running.
+    private var pendingRemember: String?
+
+    /// Note that `bundleId` was just opened; it is recorded in AppMemory the
+    /// first time a read of it succeeds (see confirmOpened).
     ///
-    /// The name is read once (first launch) and cached; it is one accessibility
-    /// round-trip, bounded so a cold-starting app can't stall launch_app.
+    /// Not confirmed here: asking XCTest for an app's state right after opening
+    /// it blocks ~2s ("Unable to update application state promptly") — which
+    /// made every launch_app take 2.9s instead of 0.9s, then came back
+    /// "unknown", so nothing was remembered either. And YES from
+    /// openApplicationWithBundleID: means the request was accepted, not that
+    /// anything launched, so it can't stand in as proof.
     private func rememberOpened(_ bundleId: String) {
-        let needName = !AppMemory.shared.hasName(bundleId)
-        var state = AppState.unknown
-        var name: String?
-        _ = runWithTimeout(seconds: 2, label: "app-state") {
-            state = AppState(rawValue: ForegroundApp.appState(forBundleID: bundleId)) ?? .unknown
-            if needName, state != .notRunning, state != .unknown {
-                name = ForegroundApp.safeLabel(forBundleID: bundleId)
-            }
-        }
-        let running: Set<AppState> = [.foreground, .background, .backgroundSuspended]
-        guard running.contains(state) || ForegroundApp.currentBundleID() == bundleId else {
-            iCTRLUITests.logBuffer.append("📒 not remembering \(bundleId) — state \(state) after open")
-            return
-        }
+        pendingRemember = bundleId
+    }
+
+    /// A read of `bundleId` succeeded — proof it is installed and running.
+    /// `name` comes from the tree's Application node when the caller has it.
+    private func confirmOpened(_ bundleId: String?, name: String?) {
+        guard let bundleId = bundleId, bundleId == pendingRemember else { return }
+        pendingRemember = nil
         AppMemory.shared.recordOpened(bundleId: bundleId, name: name)
         iCTRLUITests.logBuffer.append("📒 remembered \(bundleId)\(name.map { " as '\($0)'" } ?? "")")
     }
@@ -2790,6 +2846,12 @@ class ActionHandler {
             // on the first page_source after the tag was added.
             "source_channel": .string("ax"),
         ]
+        let rootName = body.split(separator: "\n", maxSplits: 1).first.flatMap { line -> String? in
+            guard line.hasPrefix("Application"), let r = line.range(of: "label: '") else { return nil }
+            let rest = line[r.upperBound...]
+            return rest.firstIndex(of: "'").map { String(rest[..<$0]) }
+        }
+        confirmOpened(inspectedBundleId, name: rootName?.isEmpty == false ? rootName : nil)
         if usedBoundedSnapshot {
             iCTRLUITests.logBuffer.append(
                 "🌲 page_source fetch=\(Int(fetchMs.rounded()))ms render=\(Int(renderMs.rounded()))ms "
@@ -3954,6 +4016,7 @@ class ActionHandler {
                     lastLocateScan = scan
                     lastLocateSnapFrame = best.frame
                     lastLocateSnapLabel = best.label
+                    confirmOpened(bid, name: nil)
                     done("→bounded-\(best.how)/\(best.visibility)")
                     return (live, best.match, idx)
                 }

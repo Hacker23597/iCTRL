@@ -10,7 +10,7 @@ iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, p
 
 ## Rules — read these first
 
-1. **Open apps by bundle id, never by tapping home-screen icons.** `resolve_app{text:"<name>"}` → `launch_app{bundle_id}`. Icon positions are guesses.
+1. **Open apps by bundle id, never by tapping home-screen icons.** `resolve_app` → `launch_app{bundle_id}`. By common sense, pass every name it may go by in **one** call: `resolve_app{text:"Trip.com|携程|Trip"}` (brand, store title, English/Chinese); results are merged and tagged `matched_term`.
 2. **Read before you act.** On any screen you haven't read, call `page_source{visible_only:true, max_children:50}` (~0.4s) to learn which view/tab/date you're really on.
 3. **Tap by `ref`.** `find_element{element_id:"<label>"}` → `tap{ref}`. Check `visibility`: `"offscreen"` or a non-empty `alternatives` means you may have a look-alike — use `scroll_to_element` or a more specific label.
 4. **Never repeat an action "to be safe."** A success reply means it worked. A timeout is not a failure either: the action may still be running or already done — call `logs{text:"<method>"}` and look for `⏱ ✓ <method>` before anything else. A retried tap fires twice.
@@ -71,7 +71,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 
 ## Timing, timeouts and recovery
 
-- Taps and swipes are synthesized and return **without waiting for the UI to settle**. After a tap that changes screens, the next read can catch a half-drawn transition (queries run 5–30x slower and frames are wrong). If a read looks like the old screen or is sparse, wait ~1s and re-read. Don't sleep blindly after every tap.
+- Taps and swipes are synthesized and return **without waiting for the UI to settle**. After a tap that changes screens, the next read can catch a half-drawn transition. If a read looks like the old screen or is sparse, wait ~1s and re-read. Don't sleep blindly after every tap.
 - Typical: `tap` ~0.3s, `page_source` (visible_only) ~0.4s, `find_element` ~1s, `launch_app` ~0.9s + 2–3s render. Much slower usually means a wrong label or a mid-transition screen.
 - The server answers a UI call after **6s** (15s for `page_source`, `tap_element`, `find_and_tap`) even if the work is still running. UI calls run **one at a time**, and a stuck one can't be cancelled. Calls behind it time out too. Their error says *"has NOT run yet: queued behind X"*: they will still run later, so **do not resend them**.
 - After two timeouts in a row, UI calls are rejected immediately. The message names the stuck call and how long it has run. Recovery: `reset` (clears refs and the app binding), then **wait** for the stuck call to end (typically 15–45s; watch `logs`), then retry. `reset` can't stop a call already running.
@@ -80,7 +80,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 
 ## Finding and tapping
 
-- `find_element` matches exact label → accessibility id → (with `match:"contains"`) substring. **An element in view always beats an off-screen one**: a calendar holds "25" in three months, and you get the visible one. The result has `visibility` (`in_view`/`partial`/`offscreen`), and when several matched, `alternatives[]` + `match_count`.
+- `find_element` matches exact label → accessibility id → (with `match:"contains"`) substring. **An element in view always beats an off-screen one**: a calendar holds "25" in three months. The result has `visibility` (`in_view`/`partial`/`offscreen`), and when several matched, `alternatives[]` + `match_count`.
 - A `ref` re-resolves the live element at tap time. If its app has gone to the background (a system sheet, another app), the tap is refused at once: *"belongs to X, which is now in the background"*. Look at the screen before continuing.
 - **Off-screen** → `scroll_to_element{element_id}`. If the target is already in the tree, it drags straight to it in one move. Otherwise it searches, and without `direction` it reverses once at an end. **"NOT anywhere in this view" means it isn't on this screen at all** — check page/tab/date, or whether the data exists; don't keep scrolling.
 - **Text on screen ≠ accessibility label** (common). Copy the label from `page_source`, or use `match:"contains"`. An accessibility `identifier` shown in `page_source` is the most stable `element_id` of all. Duplicate labels → add `element_type`.
@@ -114,7 +114,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 
 ## Apps
 
-- `resolve_app` looks offline first: apps opened on this device before (`source:"opened_here"` — launch directly), then a built-in catalog, then the App Store. Only `opened_here` says anything about *this* device.
+- `resolve_app` looks offline first (`opened_here` = launched on this device before — use it directly; then a built-in catalog), else the App Store. Only `opened_here` says anything about *this* device.
 - **`launch_app` is the real install test**: success = installed, error = not. Newer iOS refuses `list_apps` enumeration; it then returns only apps opened via iCTRL before (`source:"opened_history"`). Never report "not installed" from a lookup or an empty list — if unsure, check Spotlight (home, swipe down, type the name).
 - `open_url{url}` opens any scheme / deep link / universal link. Finish by opening the caller's scheme to hand control back, if you have one.
 - After `launch_app`/`activate_app` that app is the **bound target**. Coordinate and `element_id` actions bring it back to the front if it drifted (`app_note` says so). `ref` actions don't — they refuse instead. If the bound app leaves the screen, reads follow whatever is in front. Pass `bundle_id` to read a specific app.
@@ -127,7 +127,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 
 ## Diagnostics
 
-- `device_info.system`: `screen_locked` (black screenshots, taps doing nothing — `unlock` only presses Home; a passcode needs the user), `foreground_app` (what you're really driving), `foreground_is_browser`, thermal/memory/battery. Screen sleep does not stop the runner. For long unattended runs, ask the user to set Auto-Lock to Never.
+- `device_info.system`: `screen_locked` (black screenshots, taps doing nothing — `unlock` only presses Home; a passcode needs the user), `foreground_app`, `foreground_is_browser`, thermal/memory/battery. Screen sleep does not stop the runner. For long unattended runs, ask the user to set Auto-Lock to Never.
 - `logs{text?, max_elements?}`: recent log lines over the normal channel. `⏱ ✓ <method>` = completed, `⏱ TIMEOUT`, `⛔️`/`✅` channel state. `GET /logs/files` and `GET /logs/history?date=YYYY-MM-DD` keep logs across crashes; byte endpoints (`/logs*`, `/stream`) need a single-use `?ticket=` from the `stream_ticket` RPC.
 - `reset`: clears refs and the binding and rebuilds the UI channel state, then `launch_app` the target. `config{stop_server:true}` stops the runner (keys persist); it must be relaunched on the device.
 - If `/schema` is unreachable, the runner isn't running. The user must start it on the phone, and the Developer Disk Image must be mounted (it is lost on every reboot).
