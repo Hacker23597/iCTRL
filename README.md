@@ -127,10 +127,10 @@ different, though. iCTRL is a phone an **AI agent** operates in real time,
 often from the phone itself, so the work went into speed, robustness and making
 every response usable by a model.
 
-| | WebDriverAgent | iCTRL |
+| | WebDriverAgent (estimated from its source and defaults, not measured) | iCTRL |
 |---|---|---|
-| **Taps** | XCTest element taps wait for the UI to go idle before and after. When a tap navigates, that settling measured **~4s** (**~7.6s** for a native find-and-tap) | Synthesized touch events with no idle waits: **~280ms median** |
-| **Reading long lists** | A full accessibility snapshot. On a long-scrolled X timeline it measured **6.5–8.5s** per read, and a single live element query ran **70s** | Snapshots bounded on the device (`visible_only` + `max_children`): **p50 416ms / p90 593ms across 8 apps, never over 1s**. Element lookups use the same bounded walk (~0.3–1s) |
+| **Taps** | `XCUIElement`/`XCUICoordinate.tap`, which waits for the app to go idle before and after (`waitForIdleTimeout` 10s by default). *Estimated* **~0.5–1s** per tap | Synthesized touch events with no idle waits: **~280ms median** (measured) |
+| **Reading long lists** | A snapshot limited to depth 50 (`snapshotMaxDepth`). That caps nesting but not breadth, so every off-screen row of a long feed is still serialized. *Estimated* **several seconds** per read on a long-scrolled X timeline, sometimes long enough to time out | Snapshots bounded in depth *and* breadth on the device, keeping only what is on screen: **p50 416ms / p90 593ms across 8 apps, never over 1s** (measured). Element lookups use the same bounded walk (~0.3–1s) |
 | **When the tree is empty** (web views, custom-drawn text, sparse recycling lists) | — | On-device **Vision OCR** (`screen_text`, ~0.5s) returns text with tappable point coordinates. `page_source` measures its own coverage and falls back to OCR by itself |
 | **Built for** | Test frameworks (WebDriver/Appium protocol) | AI agents. The device serves its own manual (`GET /skill`) and schema (`GET /schema`). Every response carries a `hint`, and errors say what to do next. `ref`s re-resolve the live element; `visibility`/`alternatives` flag look-alikes; scrolls report whether they moved and where you are |
 | **Security** | Plain HTTP, no authentication | Pairing must be approved on the phone. Every request is encrypted and authenticated (X25519 pairing, per-request HMAC-SHA256 envelope, replay and clock-skew protection) |
