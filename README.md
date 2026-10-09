@@ -12,11 +12,23 @@ model**: `GET /skill` serves a complete operating manual and `GET /schema`
 documents every method with its parameters, so an agent can learn the API at
 runtime and call it correctly without prior knowledge.
 
+**Hand it to your agent in one sentence.** Once the runner is up (with remote
+access enabled, if the agent isn't on the phone), tell your agent:
+
+> *"My iPhone is running iCTRL at 192.168.1.20:8200 — figure out how to drive it."*
+
+It finds the manual at `GET /skill` and the method list at `GET /schema`,
+downloads a client from the device, and asks to pair. Approve the pairing
+notification on the phone, and from there it works out the rest.
+
 - **Bundle ID:** `com.openminis.ictrl`
 - **Transport:** JSON-RPC 2.0 over HTTP, port `8200`
 - **Auth:** encrypted envelope (X25519 pairing → HMAC-SHA256 sealed requests)
 - **Shipped as two IPAs:** `iCTRL.ipa` (host app) + `iCTRLUITests-Runner.ipa`
   (the automation engine — **this is the one that must be running**)
+- **Needs:** a way to sign the IPA (free Apple ID via SideStore, or a paid
+  account) and the Developer Disk Image mounted — see
+  [Installation](#before-you-start--two-things-you-need)
 
 ## How it works
 
@@ -32,65 +44,152 @@ AI agent / curl ──HTTP JSON-RPC──▶ iCTRL runner (XCUITest) ──▶ i
 Interactions are synthesized with `XCSynthesizedEventRecord` / `XCPointerEventPath`,
 which bypasses XCUITest's quiescence waits.
 
+## How it differs from WebDriverAgent
+
+[WebDriverAgent](https://github.com/appium/WebDriverAgent) (WDA) is Appium's
+iOS driver: a heavyweight server built for test suites, usually driven from a
+Mac. iCTRL borrows several of WDA's proven mechanisms: the never-ending XCUITest
+runner, the `distantFuture` run loop and its app-activation handling. Its aim is
+different, though. iCTRL is a phone an **AI agent** operates in real time,
+often from the phone itself, so the work went into speed, robustness and making
+every response usable by a model.
+
+| | WebDriverAgent | iCTRL |
+|---|---|---|
+| **Taps** | XCTest element taps wait for the UI to go idle before and after. When a tap navigates, that settling measured **~4s** (**~7.6s** for a native find-and-tap) | Synthesized touch events with no idle waits: **~280ms median** |
+| **Reading long lists** | A full accessibility snapshot. On a long-scrolled X timeline it measured **6.5–8.5s** per read, and a single live element query ran **70s** | Snapshots bounded on the device (`visible_only` + `max_children`): **p50 416ms / p90 593ms across 8 apps, never over 1s**. Element lookups use the same bounded walk (~0.3–1s) |
+| **When the tree is empty** (web views, custom-drawn text, sparse recycling lists) | — | On-device **Vision OCR** (`screen_text`, ~0.5s) returns text with tappable point coordinates. `page_source` measures its own coverage and falls back to OCR by itself |
+| **Built for** | Test frameworks (WebDriver/Appium protocol) | AI agents. The device serves its own manual (`GET /skill`) and schema (`GET /schema`). Every response carries a `hint`, and errors say what to do next. `ref`s re-resolve the live element; `visibility`/`alternatives` flag look-alikes; scrolls report whether they moved and where you are |
+| **Security** | Plain HTTP, no authentication | Pairing must be approved on the phone. Every request is encrypted and authenticated (X25519 pairing, per-request HMAC-SHA256 envelope, replay and clock-skew protection) |
+| **Clients** | Appium / WebDriver client libraries | Downloaded straight from the device: a Python client, and a **pure-C static CLI** (aarch64-musl, no runtime dependencies, ~9x faster to start than Python) for agents in on-device sandboxes like Minis |
+| **Needs a Mac** | To build, sign and usually to drive | Only optionally. The DDI can be mounted on the device, signing can go through SideStore, and the runner serves on its own |
+| **When things go wrong** | — | Diagnostics stay up while UI calls are stuck (`logs`, `config`, `reset`). A circuit breaker stops queueing behind a stuck call, and timeouts name the call holding the queue. Logs survive a crash |
+
+The runner IPA is about 1MB.
+
 ---
 
 # Installation
 
-The runner is an XCUITest bundle, which makes it harder to install than an
-ordinary app: the `.xctest` inside it must carry its own valid signature, and
-its bundle identifier must match the host runner app. Pick the path that matches
-the Apple account you have.
+## Before you start — two things you need
 
-| You have | Use |
+iCTRL's automation engine is an XCUITest runner, and iOS only runs one when two
+conditions hold. Sort out both before anything else:
+
+**1. A way to sign and install the IPA.** Both a free Apple ID and a paid
+developer account work:
+
+| You have | How |
 |---|---|
-| Free Apple ID | [SideStore](#a-free-apple-id--sidestore-via-iloader) (7-day certs, re-sign weekly) |
-| Paid Developer account ($99/yr) | [Manual signing](#b-paid-developer-account--sign-the-ipa-yourself) or [Xcode](#c-paid-developer-account--run-straight-from-xcode) |
+| Free Apple ID | The **latest SideStore** signs and installs it → [A](#a-free-apple-id--sidestore) |
+| Paid developer account | Sign with [`Scripts/sign-ipa.sh`](Scripts/sign-ipa.sh) → [B](#b-paid-developer-account--scriptssign-ipash), or run from Xcode → [C](#c-paid-developer-account--xcode) |
 
-## A. Free Apple ID — SideStore (via iLoader)
+The runner can't be signed with just any tool. Its IPA contains a nested test
+bundle, `PlugIns/iCTRLUITests.xctest`, which needs its own signature. That
+bundle has to be signed first, from the inside out, and it has to carry the
+runner's bundle id. Most signers only recurse into `.framework`/`.appex` and
+leave the `.xctest` alone. The package then installs fine and **crashes the
+moment it launches**. Use one of the routes above, which handle this.
 
-A free account can only issue 7-day certificates, so the app must be re-signed
-every week. SideStore automates that; iLoader is the easiest way to get
-SideStore itself onto the device.
+**2. The Developer Disk Image (DDI) mounted.** XCUITest talks to the
+`testmanagerd` daemon, and that daemon only exists while a DDI is mounted. A
+reboot unmounts it, so remount after every restart:
 
-**1. Install SideStore using iLoader**
+| You have | How |
+|---|---|
+| A Mac with Xcode | Connect the phone once; Xcode mounts it automatically → [Option 1](#option-1--xcode) |
+| No Mac | [StikDebug](#option-2--stikdebug) **or** the [iCTRL app](#option-3--the-ictrl-app) mounts it on the device. You need only one; with a free Apple ID there is room for only one ([why](#a-free-apple-id--sidestore)) |
 
-Download [iLoader](https://github.com/nab138/iLoader) for your desktop OS, then:
+Once both are in place: [launch the runner](#step-3--launch-the-runner).
 
-- Connect the iPhone over USB and trust the computer.
-- In iLoader, sign in with your Apple ID and install **SideStore**.
-- On the device: **Settings → General → VPN & Device Management** → trust your
-  developer certificate.
+---
 
-**2. Enable the SideStore pairing file**
+## Step 1 — Sign & install
 
-SideStore needs a pairing file to refresh certificates without a computer.
-Follow SideStore's own setup for this — it is a one-time step.
+Enable **Developer Mode** first (iOS 16+: **Settings → Privacy & Security →
+Developer Mode**, then restart). Development-signed apps won't open without it.
 
-**3. Install the runner with SideStore**
+### A. Free Apple ID — SideStore
 
-- Get `iCTRLUITests-Runner.ipa` (from Releases, or build it — see
-  [Building](#building)).
-- Open SideStore → **+** → choose the IPA → install.
-- Optionally install `iCTRL.ipa` the same way for the settings UI.
+A free account issues 7-day certificates, and SideStore re-signs your apps
+before they expire.
 
-**4. Launch it**
+1. **Install SideStore** with [iLoader](https://github.com/nab138/iLoader) on
+   your computer. Connect the phone over USB, sign in with your Apple ID, and
+   install SideStore. iLoader also sets up the pairing file SideStore needs.
+2. **Install [LocalDevVPN](https://apps.apple.com/app/localdevvpn/id6755608044)**
+   from the App Store and connect it. SideStore installs and refreshes apps
+   through it.
+3. **Use the latest SideStore release.** Older builds signed with `ldid`, which
+   skips the `.xctest`, so the runner installs and then crashes on launch.
+4. In SideStore: **My Apps → +** → pick `iCTRLUITests-Runner.ipa`.
+   Optionally install `iCTRL.ipa` the same way (see the app limit below).
+5. On the device: **Settings → General → VPN & Device Management** → trust
+   your Apple ID's developer certificate.
 
-Tap **iCTRLUITests-Runner** on the Home Screen. It starts the HTTP server and
-keeps running in the background.
+> **Free-account limits.**
+> - Certificates last **7 days**. Open SideStore and refresh before they
+>   expire (it can refresh in the background while LocalDevVPN is connected).
+>   Otherwise the runner stops launching.
+> - A free account can have at most **3 sideloaded apps** active at once, and
+>   SideStore itself counts as one. The limit is counted by the device, so a
+>   second Apple ID doesn't raise it. With the runner that leaves room for
+>   **one** more, which is how you mount the DDI without a Mac. Pick **either**
+>   the iCTRL app **or** StikDebug:
+>   - **iCTRL app** if you don't use StikDebug already. It is built for this:
+>     it shows whether the DDI is mounted, remounts in one tap, and starts the
+>     runner.
+>   - **StikDebug** if you already have it for JIT. It mounts the DDI just as
+>     well, and you don't need the iCTRL app at all.
+>
+>   If you mount with Xcode on a Mac instead, you need neither. SideStore plus
+>   the runner is enough.
 
-> **The 7-day limit is real.** Re-open SideStore and refresh before the
-> certificate expires, or the runner stops launching. SideStore can refresh in
-> the background once its pairing file is configured.
+### B. Paid developer account — `Scripts/sign-ipa.sh`
 
-## B. Paid Developer account — sign the IPA yourself
+You need three things:
+- an **Apple Development** certificate in your keychain;
+- a **development** provisioning profile that includes your device. A wildcard
+  `TEAMID.*` App ID covers both packages. Opening the project in Xcode once
+  with automatic signing downloads one.
+- a Mac, because the script uses Apple's `codesign`.
 
-With a paid account you get a 1-year certificate. The signing order matters
-more than the tool: **an XCUITest runner has a nested `.xctest` bundle that needs
-its own signature**, and many signing tools silently skip it — the app then
-installs fine and fails at launch, because `testmanagerd` validates the plugin's
-signature separately.
+```bash
+Scripts/sign-ipa.sh -i iCTRLUITests-Runner.ipa
+# → iCTRLUITests-Runner-signed.ipa
+```
 
-### The structure you are signing
+With no other options, the script picks everything itself:
+
+| Option | Default |
+|---|---|
+| `-t TEAMID` | `$DEVELOPMENT_TEAM`, then `Config/Local.xcconfig`, then the Xcode project's build settings |
+| `-p PROFILE` | the installed development profile for that team that covers the package's bundle id. An exact App ID wins over a wildcard, then the one that expires last. `-p` takes a `.mobileprovision` path, a profile UUID or a profile name. |
+| `-s IDENTITY` | the keychain signing identity whose certificate is in that profile. `-s` takes a name or SHA-1 (`security find-identity -v -p codesigning`). |
+| `-o OUT` | `<input>-signed.ipa` |
+
+It checks up front that the profile and identity actually belong together.
+This is matched on certificate hashes, because the ID in an identity's name is
+the certificate holder's, not the team's. A mismatch is reported before
+anything is signed. Without this check, iOS would reject the install with an
+error that never mentions the profile.
+
+The script does four things, in this order:
+1. sets the `.xctest`'s bundle id to the runner's;
+2. signs from the inside out: loose dylibs → frameworks → `PlugIns/*` → the app;
+3. writes the entitlements a test runner needs, including `get-task-allow`;
+4. verifies every nested binary before it repacks.
+
+It refuses a distribution profile, because a runner signed with one installs
+but never launches. The same command signs `iCTRL.ipa`.
+
+Install the signed IPA with any of:
+- Xcode's **Devices and Simulators → Installed Apps → +**;
+- Apple Configurator;
+- `ideviceinstaller -i <ipa>`.
+
+<details>
+<summary>What the script is working with</summary>
 
 ```
 iCTRLUITests-Runner.app/
@@ -98,105 +197,149 @@ iCTRLUITests-Runner.app/
 ├── Frameworks/
 │   └── libXCTCompatShim.dylib   ← must be signed, or dyld rejects it
 └── PlugIns/
-    └── iCTRLUITests.xctest/     ← sign this FIRST, and separately
+    └── iCTRLUITests.xctest/     ← signed FIRST, separately, with the runner's id
         └── iCTRLUITests
 ```
 
-Two rules that are easy to get wrong:
+`ldid` in particular will not sign the `.xctest`: it only recurses into
+`.framework` and `.appex`. An unsigned dylib fails at launch with *"mapped file
+has no cdhash"*, which looks nothing like a signing problem. That is why the
+script verifies each nested binary before it repacks.
+</details>
 
-1. **Inside out.** Sign the dylibs, then the `.xctest`, then the outer `.app`.
-   Signing the app first invalidates it as soon as you touch anything inside.
-2. **The `.xctest` shares the host's bundle identifier** — it does *not* extend
-   it the way a normal app extension does. Signers that assume the extension ID
-   must be a strict prefix-extension of the host ID will reject or rewrite it.
+### C. Paid developer account — Xcode
 
-`ldid` in particular **will not sign the `.xctest`**: it only recurses into
-`.framework` and `.appex`. Use `codesign` (macOS) or
-[`apple-codesign`](https://github.com/indygreg/apple-platform-rs) / `zsign`,
-which detect bundles by the presence of `Info.plist`.
-
-### Signing with `codesign`
-
-```bash
-IDENT="Apple Development: you@example.com (XXXXXXXXXX)"   # security find-identity -v -p codesigning
-APP="Payload/iCTRLUITests-Runner.app"
-
-unzip -q iCTRLUITests-Runner.ipa
-
-# 1. Align the .xctest bundle id with the runner (must happen BEFORE signing,
-#    so the edited plist is covered by the signature)
-RUNNER_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
-/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $RUNNER_ID" \
-  "$APP/PlugIns/iCTRLUITests.xctest/Info.plist"
-
-# 2. Inside out
-for dylib in "$APP/Frameworks/"*.dylib; do
-  codesign --force --sign "$IDENT" "$dylib"
-done
-codesign --force --sign "$IDENT" "$APP/PlugIns/iCTRLUITests.xctest"
-codesign --force --sign "$IDENT" --entitlements entitlements.plist "$APP"
-
-# 3. Verify EVERY embedded binary — an unsigned dylib fails at launch with
-#    "mapped file has no cdhash", which looks nothing like a signing problem
-for f in "$APP/Frameworks/"*.dylib "$APP/PlugIns/iCTRLUITests.xctest" "$APP"; do
-  codesign -v "$f" || echo "UNSIGNED: $f"
-done
-
-zip -qr iCTRLUITests-Runner-signed.ipa Payload
-```
-
-Minimum entitlements — `get-task-allow` is required for a test runner:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>application-identifier</key>
-    <string>TEAMID.com.openminis.ictrl.uitests.xctrunner</string>
-    <key>com.apple.developer.team-identifier</key>
-    <string>TEAMID</string>
-    <key>get-task-allow</key>
-    <true/>
-</dict>
-</plist>
-```
-
-Then install with any of: Apple Configurator, `ideviceinstaller -i <ipa>`,
-Xcode's **Devices and Simulators → Installed Apps → +**, or SideStore.
-
-> `make ipa` already does all of the above using whatever identity Xcode picked
-> for the build, so a local build needs no manual signing.
-
-## C. Paid Developer account — run straight from Xcode
-
-The simplest path if you have the source and a Mac.
+The simplest route if you have the source and a Mac. It also takes care of
+[the DDI](#option-1--xcode).
 
 ```bash
 brew install xcodegen
-make ipa          # or: xcodegen generate && open iCTRL.xcodeproj
+make build        # fetches dependencies, writes your signing config, generates the project
+open iCTRL.xcodeproj
 ```
 
-1. Open `iCTRL.xcodeproj`.
-2. Select the **iCTRL** scheme and your device.
-3. Set your team under **Signing & Capabilities** for *both* the `iCTRL` and
-   `iCTRLUITests` targets.
-4. **Product → Test** (⌘U).
+1. Select the **iCTRL** scheme and your device.
+2. **Product → Test** (⌘U).
 
-Xcode builds, signs, installs and launches the runner. It keeps running after
-the test session detaches, so you can quit Xcode and keep using the API.
+Your team and bundle-id prefix come from `Config/Local.xcconfig` (see
+[Building](#building)). Change them there rather than under *Signing &
+Capabilities*: the project is regenerated from `project.yml`, which would undo
+edits made in Xcode.
 
-> First run on a new device: **Settings → General → VPN & Device Management** →
-> trust the certificate, and enable **Developer Mode** (iOS 16+) when prompted.
+Xcode builds, signs, installs and launches the runner. The runner keeps running
+after the test session detaches, so you can quit Xcode and keep using the API.
 
-## After installing — verify it works
+---
+
+## Step 2 — Mount the DDI
+
+The image does **not survive a reboot**. After every restart, remount it with
+any one of the options below, then launch the runner again.
+
+### Option 1 — Xcode
+
+Connect the phone to a Mac running Xcode, over USB or the same network. Wait
+until **Window → Devices and Simulators** shows the device as ready. Xcode
+mounts the DDI on its own when it prepares the device for development, and the
+image stays mounted until the next reboot. You can disconnect afterwards.
+
+### Option 2 — StikDebug
+
+[StikDebug](https://github.com/StephenDev0/StikDebug) mounts the DDI on the
+device itself, with no computer involved after setup:
+
+1. Sideload StikDebug (for example with SideStore) and install
+   [LocalDevVPN](https://apps.apple.com/app/localdevvpn/id6755608044) from the
+   App Store.
+2. Give StikDebug a pairing file, following its own setup guide. iLoader can
+   provide one.
+3. Connect LocalDevVPN, then open StikDebug. It mounts the Developer Disk Image
+   by itself at launch. Once it reports the image as mounted, you're done.
+
+### Option 3 — the iCTRL app
+
+`iCTRL.ipa` (the host app) includes the same kind of on-device mounter. It is
+signed and installed like the runner ([Step 1](#step-1--sign--install)). Then:
+
+**Settings → Runtime requirements → Mount without a Mac…**, and follow the
+four steps on that screen:
+
+1. **Start LocalDevVPN.** Tap *Open LocalDevVPN & connect*. The app sends you
+   there and brings you back.
+2. **Import a pairing file.** Use the one iLoader produces, or create one on a
+   Mac with `idevicepair pair` (libimobiledevice) and send it over AirDrop,
+   Files or iCloud.
+3. **Download image files.** About 100 MB, downloaded once and reused.
+4. **Mount Developer Disk Image.**
+
+Two things this option needs:
+- **Wi-Fi.** The tunnel runs over the local network interface, which cellular
+  doesn't provide.
+- **Internet on the first mount.** Apple has to issue a signing ticket for this
+  specific device.
+
+When iCTRL shows *Mounted*, the runner can launch. After a reboot, use
+**Re-mount…** on the same screen.
+
+---
+
+## Step 3 — Launch the runner
+
+Tap **iCTRLUITests-Runner** on the Home Screen, or **Start Server** in the
+iCTRL app.
+
+**The first time, iOS asks for three things. Answer all three:**
+1. **Your device passcode.** iOS may ask for it when a UI-automation session
+   starts; enter it. This can come back after a reboot.
+2. **Notifications → Allow.** The runner has no screen of its own, and its
+   notifications are how you control it (below). If you deny this, you can't
+   approve a pairing request. Fix it later under **Settings → Notifications →
+   iCTRLUITests-Runner**.
+3. **Local Network → Allow.** Without it, other machines can't reach the
+   server.
+
+### Controlling iCTRL from its notification
+
+An XCUITest runner can't show an interface: it opens, starts the server and
+moves to the background. Everything you'd expect on a settings screen is in its
+notifications instead. **Long-press a notification** (or swipe left → *View*)
+to get its menu:
+
+| Notification | Menu |
+|---|---|
+| **🟢 iCTRL Server Ready** — always present while the server runs; refreshes silently every 5 minutes | **🌐 Enable Remote Access** / **🔒 Disable Remote Access**, **🛑 Stop Server** |
+| **Pairing request** from a client | **✅ Allow** / **⛔️ Deny** |
+| **⏹️ iCTRL Server Stopped** | **📋 Copy Logs** |
+
+- **Remote access is off by default.** The server only answers on the device
+  itself (`127.0.0.1`), e.g. an agent running in an on-device sandbox. To drive
+  the phone from another machine, choose **🌐 Enable Remote Access** first.
+- **Allow** and the remote-access switch only work while the phone is
+  unlocked. iOS asks for Face ID / the passcode if it isn't.
+- To start again after **Stop Server**, open the runner (or tap **Start
+  Server** in the iCTRL app) again.
+
+### Check that it's up
+
+With remote access enabled, from another machine on the same Wi-Fi:
 
 ```bash
 curl http://<device-ip>:8200/schema
 ```
 
-A JSON document means the runner is up. If the connection is refused, the runner
-is not running — launch it from the Home Screen.
+If that returns a JSON document, the runner is up.
+
+**If the runner opens and closes immediately:**
+- The DDI isn't mounted, usually because the phone rebooted. Remount it
+  ([Step 2](#step-2--mount-the-ddi)).
+- The `.xctest` wasn't signed. Re-sign with a route from
+  [Step 1](#step-1--sign--install).
+- The free certificate expired. Refresh in SideStore.
+
+**If `curl` can't connect but the runner is running:** remote access is still
+off (see above), Local Network access was denied (**Settings → Privacy &
+Security → Local Network**), or the phone is on cellular. A LAN client can only
+reach it over Wi-Fi.
 
 ---
 
@@ -209,7 +352,8 @@ hand-roll the crypto — download a client from the device itself:
 # Fetch the reference client (unauthenticated)
 curl -o ictrl_rpc.py http://<device-ip>:8200/skill/clients/python
 
-# Pair once — tap Allow on the device (blocks up to 60s)
+# Pair once — long-press the pairing notification on the phone → ✅ Allow
+# (blocks up to 60s). LAN pairing needs: pip install cryptography
 python3 ictrl_rpc.py --host <device-ip>:8200 pair
 
 # Drive it
@@ -220,8 +364,10 @@ python3 ictrl_rpc.py --host <device-ip>:8200 call tap '{"x":100,"y":200}'
 There is also a static aarch64-musl CLI at `/skill/clients/cli` for sandboxes
 with no Python.
 
-**`GET /skill`** returns the full operating manual in Markdown — point an agent
-at it and it can drive the device without further documentation.
+**`GET /skill`** returns the full operating manual in Markdown, so you don't need
+to brief an agent yourself. Give it the address ("*My iPhone is running iCTRL at
+192.168.1.20:8200 — figure out how to drive it.*") and it will read the manual
+and drive the device from there.
 
 ## API surface
 
@@ -278,15 +424,36 @@ the version wasn't bumped), and a `capabilities` array. Feature-detect against
 
 ## Building
 
-Uses `xcodegen` (`project.yml` → `.xcodeproj`) + `xcodebuild build-for-testing`.
+From a fresh clone, with Xcode signed in to an Apple ID (Settings → Accounts —
+a free one works):
 
 ```bash
-make ipa   # builds and signs iCTRL.ipa and iCTRLUITests-Runner.ipa
+brew install xcodegen
+make ipa          # → iCTRL.ipa + iCTRLUITests-Runner.ipa
 ```
 
-`make ipa` strips the XCTest frameworks the runner doesn't need, inserts a
-compat shim for older iOS, aligns the `.xctest` bundle id, re-signs inside out,
-and verifies every embedded binary is signed before packaging.
+Nothing else needs to be set up. On the first run, `make`:
+- **fetches** the idevice xcframework (~215MB, once, `Scripts/fetch-idevice.sh`);
+- **writes `Config/Local.xcconfig`** (gitignored) with your team, read from the
+  Apple Development certificate in your keychain, and a bundle-id prefix derived
+  from it. Explicit App IDs are unique across all accounts, so the prefix has to
+  be yours: `com.openminis.ictrl` belongs to one team only. To choose them
+  yourself: `DEVELOPMENT_TEAM=ABCDE12345 ICTRL_BUNDLE_PREFIX=com.example.you make ipa`,
+  or edit the file. Delete it to have it detected again.
+- **generates `iCTRL.xcodeproj`** with XcodeGen (gitignored; regenerated
+  whenever `project.yml` or the signing config changes).
+
+It then builds with `xcodebuild build-for-testing` and post-processes the
+runner:
+- strips the XCTest frameworks the runner doesn't need;
+- inserts a compat shim for older iOS (`Scripts/insert-dylib.py`, no `optool`
+  needed);
+- aligns the `.xctest` bundle id, re-signs inside out, and verifies that every
+  embedded binary is signed before packaging.
+
+To publish a build, run `Scripts/package-release.sh`. It writes `release/` copies
+stripped of your provisioning profile (your name, team id and device UDIDs) and
+ad-hoc signed. Whoever installs them re-signs anyway.
 
 ## Project layout
 
@@ -296,6 +463,9 @@ iCTRLKit/        Shared lib: JSONRPCServer, AuthManager, SecureEnvelope, RPC reg
 iCTRLUITests/    The automation engine: test entry + run loop, ActionHandler,
                  ForegroundApp / LockStateMonitor / EarlyURLHook (private APIs)
 iCTRLCompat/     Back-compat shim for older iOS XCTest
+Config/          Signing.xcconfig (committed defaults) + Local.xcconfig (yours, gitignored)
+Scripts/         sign-ipa.sh (re-sign with your own identity), ictrl_rpc.py
+                 (reference client), build helpers
 SKILL.md         The operating manual served at GET /skill
 project.yml      xcodegen spec
 Makefile         build + sign + package
@@ -326,11 +496,11 @@ This project would not exist without the following work.
 
 | Project | Used for | License |
 |---|---|---|
-| [jkcoxson/idevice](https://github.com/jkcoxson/idevice) | The Rust library doing all the real protocol work behind `iCTRLApp/DDI` — RSD tunnel, lockdownd, AFC, installation_proxy, image mounter. Fetched as an xcframework by `Scripts/fetch-idevice.sh`. | MIT |
+| [jkcoxson/idevice](https://github.com/jkcoxson/idevice) | The Rust library doing all the real protocol work behind `iCTRLApp/DDI` — RSD tunnel, lockdownd, image mounter. Fetched as an xcframework by `Scripts/fetch-idevice.sh`. | MIT |
 | [StikDebug](https://github.com/StikDebug/StikDebug) (formerly StikJIT) | **The approach this project's DDI mounting is ported from.** Mounting the Developer Disk Image from the device itself, with no privileged entitlement, is StikDebug's idea; `DDIMounter.swift` sequences the same calls. | AGPL-3.0 |
 | [StosVPN](https://github.com/SideStore/StosVPN) / [LocalDevVPN](https://github.com/jkcoxson/LocalDevVPN) | Provides the local tunnel that makes the device's own `remoted` service routable at `10.7.0.1:49152`, which is what lets an on-device app reach its own lockdownd at all. LocalDevVPN is a maintained fork of StosVPN and is what ships on the App Store. | NOASSERTION — check upstream before reuse |
 | [doronz88/DeveloperDiskImage](https://github.com/doronz88/DeveloperDiskImage) | Mirror of the personalized DDI components (`BuildManifest.plist`, `Image.dmg`, `Image.dmg.trustcache`). Apple doesn't publish these for direct download; the same files ship inside Xcode, and you can import your own copy instead. Maintained by the pymobiledevice3 author. | See upstream |
-| [WebDriverAgent](https://github.com/appium/WebDriverAgent) | Prior art for the long-lived XCUITest runner: the `distantFuture` run loop, failure-proof test case, and app-activation handling all follow patterns it established. No code is copied. | Apache-2.0 |
+| [WebDriverAgent](https://github.com/appium/WebDriverAgent) | Prior art for the long-lived XCUITest runner: the `distantFuture` run loop, failure-proof test case, and app-activation handling all follow patterns it established (see [How it differs](#how-it-differs-from-webdriveragent)). No code is copied. | Apache-2.0 |
 
 ### How the pieces fit
 
