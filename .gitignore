@@ -16,7 +16,6 @@ xcuserdata/
 # Fetched by Scripts/fetch-idevice.sh (215MB release asset, not vendored)
 Frameworks/
 build-sim/
-build/altsign-headers/
 release/
 
 # Per-developer signing (Scripts/setup-signing.sh)

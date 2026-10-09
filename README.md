@@ -245,7 +245,7 @@ image stays mounted until the next reboot. You can disconnect afterwards.
 
 ### Option 2 — StikDebug
 
-[StikDebug](https://github.com/StephenDev0/StikDebug) mounts the DDI on the
+[StikDebug](https://github.com/StikDebug/StikDebug) mounts the DDI on the
 device itself, with no computer involved after setup:
 
 1. Sideload StikDebug (for example with SideStore) and install
@@ -488,16 +488,16 @@ Makefile         build + sign + package
 
 ## Credits & licensing
 
-iCTRL is licensed under the **GNU Affero General Public License v3** (see
-`LICENSE`). Note that §13 covers network use, not just distribution: anyone
-interacting with an iCTRL server over a network is entitled to its source.
+iCTRL is licensed under the **Apache License, Version 2.0** (see `LICENSE`).
+Versions before 1.32.0 were released under the AGPL-3.0; see `NOTICE.md` for
+why it changed.
 
 This project would not exist without the following work.
 
 | Project | Used for | License |
 |---|---|---|
 | [jkcoxson/idevice](https://github.com/jkcoxson/idevice) | The Rust library doing all the real protocol work behind `iCTRLApp/DDI` — RSD tunnel, lockdownd, image mounter. Fetched as an xcframework by `Scripts/fetch-idevice.sh`. | MIT |
-| [StikDebug](https://github.com/StikDebug/StikDebug) (formerly StikJIT) | **The approach this project's DDI mounting is ported from.** Mounting the Developer Disk Image from the device itself, with no privileged entitlement, is StikDebug's idea; `DDIMounter.swift` sequences the same calls. | AGPL-3.0 |
+| [StikDebug](https://github.com/StikDebug/StikDebug) (formerly StikJIT) | **Inspired iCTRL's DDI mounting.** Mounting the Developer Disk Image from the device itself, with no privileged entitlement, is StikDebug's idea. `DDIMounter.swift` is an independent implementation against the `idevice` API — no code is copied. | AGPL-3.0 |
 | [StosVPN](https://github.com/SideStore/StosVPN) / [LocalDevVPN](https://github.com/jkcoxson/LocalDevVPN) | Provides the local tunnel that makes the device's own `remoted` service routable at `10.7.0.1:49152`, which is what lets an on-device app reach its own lockdownd at all. LocalDevVPN is a maintained fork of StosVPN and is what ships on the App Store. | NOASSERTION — check upstream before reuse |
 | [doronz88/DeveloperDiskImage](https://github.com/doronz88/DeveloperDiskImage) | Mirror of the personalized DDI components (`BuildManifest.plist`, `Image.dmg`, `Image.dmg.trustcache`). Apple doesn't publish these for direct download; the same files ship inside Xcode, and you can import your own copy instead. Maintained by the pymobiledevice3 author. | See upstream |
 | [WebDriverAgent](https://github.com/appium/WebDriverAgent) | Prior art for the long-lived XCUITest runner: the `distantFuture` run loop, failure-proof test case, and app-activation handling all follow patterns it established (see [How it differs](#how-it-differs-from-webdriveragent)). No code is copied. | Apache-2.0 |

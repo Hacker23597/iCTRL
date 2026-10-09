@@ -1,22 +1,19 @@
 # Third-party components and licensing
 
-iCTRL as a whole is licensed under the **GNU Affero General Public License,
-version 3** (see `LICENSE`).
+iCTRL is licensed under the **Apache License, Version 2.0** (see `LICENSE`).
 
-That choice originally followed from vendoring `ldid` (AGPL-3.0) for on-device
-code signing. That code has since been removed, so nothing currently forces
-AGPL — but the licence stays: versions carrying it have already been
-distributed, and relicensing would not un-publish them. It costs this project
-nothing, since iCTRL is fully open source. It is worth knowing that §13 applies
-to network use, not only distribution: anyone who interacts with an iCTRL server
-over the network is entitled to its complete source.
+Earlier versions were released under the GNU Affero General Public License v3,
+because they vendored `ldid` (AGPL-3.0) for on-device code signing. That code
+has been removed, nothing in the tree derives from AGPL-licensed code any more,
+and iCTRL has a single copyright holder, so it was relicensed. Copies obtained
+under the AGPL remain available under the AGPL; new versions are Apache-2.0.
 
 ## Components
 
 | Component | Upstream | License | Used for |
 |---|---|---|---|
 | `idevice` | [jkcoxson/idevice](https://github.com/jkcoxson/idevice) | MIT | RSD tunnel, lockdownd, image mounter — all of `iCTRLApp/DDI`'s protocol work |
-| StikDebug | [StikDebug/StikDebug](https://github.com/StikDebug/StikDebug) | AGPL-3.0 | **Approach only, no code copied.** On-device DDI mounting without a privileged entitlement is StikDebug's idea; `DDIMounter.swift` sequences the same calls. |
+| StikDebug | [StikDebug/StikDebug](https://github.com/StikDebug/StikDebug) | AGPL-3.0 | **Idea only, no code copied.** On-device DDI mounting without a privileged entitlement is StikDebug's idea. `DDIMounter.swift` is an independent implementation against the `idevice` API, whose calls any client must make in this order. |
 | StosVPN / LocalDevVPN | [SideStore/StosVPN](https://github.com/SideStore/StosVPN), [jkcoxson/LocalDevVPN](https://github.com/jkcoxson/LocalDevVPN) | NOASSERTION | Invoked as a separate app (URL scheme), not vendored. Provides the `10.7.0.1` reflector that lets iCTRL reach this device's own lockdownd. |
 | DeveloperDiskImage mirror | [doronz88/DeveloperDiskImage](https://github.com/doronz88/DeveloperDiskImage) | See upstream | Downloaded at runtime, not redistributed: `BuildManifest.plist`, `Image.dmg`, `Image.dmg.trustcache`. Users may supply their own copy from Xcode instead. |
 | WebDriverAgent | [appium/WebDriverAgent](https://github.com/appium/WebDriverAgent) | Apache-2.0 | **Prior art only, no code copied.** The long-lived-runner patterns (`distantFuture` run loop, failure-proof test case) follow what it established. |
