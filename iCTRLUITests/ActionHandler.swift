@@ -1938,7 +1938,7 @@ class ActionHandler {
     /// Resolve an app name/keyword to its bundle_id (+ basic info). Checks the
     /// built-in catalog first (offline/instant), then the iTunes Search API.
     /// Use this to get the bundle_id for launch_app when you only know the app's
-    /// name. Params: text (query, required), country (default cn), limit (default 5).
+    /// name. Params: text (query, required), country (default us), limit (default 5).
     private func resolveApp(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let term = cmd.text, !term.isEmpty else {
             return (nil, JSONRPCError(
@@ -1950,7 +1950,11 @@ class ActionHandler {
                     "Full parameter list: GET /schema.",
                 data: nil))
         }
-        let country = cmd.country ?? "cn"
+        // The US store by default: it carries far more of the apps people ask
+        // for by an international name (Trip.com is not in the China store,
+        // so a "cn" search for it returns Ctrip). Pass country:"cn" for apps
+        // that only ship in China.
+        let country = cmd.country ?? "us"
         let limit = min(max(Int(cmd.distance ?? 5), 1), 25)
 
         // Several candidate names in one call ("Trip.com|携程|Trip"). An app's
