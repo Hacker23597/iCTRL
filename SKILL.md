@@ -1,7 +1,7 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
-skill_version: "1.32.0"
+skill_version: "1.33.0"
 ---
 
 # iCTRL — control an iPhone over HTTP
@@ -20,15 +20,14 @@ iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, p
 
 ## Connect
 
-In an on-device Alpine/musl sandbox (e.g. Minis) use the static CLI — no Python there, and it starts ~9x faster. The device is `127.0.0.1`:
+In an on-device sandbox (e.g. Minis) use the static CLI — no Python needed, ~9x faster to start. The device is `127.0.0.1`. **Install it in one place, `~/.ictrl/bin`, and check before downloading** — it is usually already there from an earlier session:
 ```bash
-wget -qO ictrl    http://127.0.0.1:8200/skill/clients/cli
-wget -qO ictrl.sh http://127.0.0.1:8200/skill/clients/cli.sh
-sh ictrl.sh pair                        # user taps Allow on the phone
-sh ictrl.sh call tap '{"x":100,"y":200}'
-sh ictrl.sh shot screen.jpg             # screenshot to a file
+C=~/.ictrl/bin; [ -f $C/ictrl ] || { mkdir -p $C && wget -qO $C/ictrl http://127.0.0.1:8200/skill/clients/cli && wget -qO $C/ictrl.sh http://127.0.0.1:8200/skill/clients/cli.sh; }
+sh $C/ictrl.sh call device_info         # works? you're connected; else: sh $C/ictrl.sh pair
+sh $C/ictrl.sh call tap '{"x":100,"y":200}'
+sh $C/ictrl.sh shot screen.jpg          # screenshot to a file
 ```
-Run it as `sh ictrl.sh …` (files arrive without the exec bit; the wrapper fixes it).
+Run it as `sh …/ictrl.sh`. **Not in `/var/minis/workspace`**: that filesystem ignores the exec bit, so it fails with "Permission denied" whatever you `chmod`.
 
 Anywhere with Python:
 ```bash
@@ -38,7 +37,7 @@ python3 ictrl_rpc.py --host <host>:8200 call device_info
 ```
 The CLI defaults to `127.0.0.1:8200`; `--host` or `ICTRL_HOST` targets another device. The Python client needs `pip install cryptography` for LAN pairing (not for `--plain` over localhost/USB via `iproxy 8200 8200`).
 
-Both share `~/.ictrl/token.json`, keyed by `host:port` — **one key per device**, never another device's; several devices can run in parallel. Store `device_name` with each key (hosts move; the name says which phone). Reuse the key: it expires only after 30 days *unused*, whatever its `expires` says. Re-pair only on a real `401`. Pairing blocks until the user taps Allow — ≥60s timeout, no early retry (each pops another prompt). Dev only: a runner started from Xcode with `ICTRL_ALLOW_AUTH_ONCE=1` auto-approves the first pairing.
+Both share `~/.ictrl/token.json`, keyed by `host:port` — **one key per device**, never another device's; several devices can run in parallel. Store `device_name` with each key (hosts move; the name says which phone). Reuse the key: it expires only after 30 days *unused*, whatever its `expires` says. Re-pair only on a real `401`. Pairing blocks until the user taps Allow — ≥60s timeout, no early retry (each pops another prompt).
 
 ## Core workflow
 
@@ -77,8 +76,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 - The server answers a UI call after **6s** (15s for `page_source`, `tap_element`, `find_and_tap`) even if the work is still running. UI calls run **one at a time**, and a stuck one can't be cancelled. Calls behind it time out too. Their error says *"has NOT run yet: queued behind X"*: they will still run later, so **do not resend them**.
 - After two timeouts in a row, UI calls are rejected immediately. The message names the stuck call and how long it has run. Recovery: `reset` (clears refs and the app binding), then **wait** for the stuck call to end (typically 15–45s; watch `logs`), then retry. `reset` can't stop a call already running.
 - **Only `logs`, `config` and `reset` answer while the UI queue is stuck.** `device_info` shares the UI queue, so it's no health probe; use `logs`.
-- Use a generous client timeout (≥30s).
-- Restarting your side? Reuse the cached key and `bundle_id`s, and get back with a deep link (`open_url`) rather than re-navigating from the app's home.
+- Use a client timeout ≥30s. After restarting your side, reuse the cached key and `bundle_id`s and return via a deep link (`open_url`).
 
 ## Finding and tapping
 
@@ -141,7 +139,6 @@ Compare `device_info.skill_version` with this file's frontmatter. Patch gap: ign
 
 ## Protocol (only if you can't use a bundled client)
 
-Reference implementation: the Python client (`/skill/clients/python`).
 - **Pair**: `POST /pair {"client_name","pub":"<b64 X25519 pubkey>"}`, or `{"client_name","plain":true}` from 127.0.0.1 only. Unwrap: `shared=X25519(c_priv,d_pub)`, `K_wrap=HMAC(shared,"ictrl-pair"‖c_pub‖d_pub)`, `K=token_ct XOR HMAC(K_wrap,"ictrl-wrap")`. Denied → 403.
 - **Seal** each `/rpc` call: `tok`=first 4 bytes of SHA256(K) as hex; `nonce`=16 random bytes (never reuse); `ts`=unix seconds (±120s). `K_enc_req=HMAC(K,"ictrl-v1|enc-req"‖nonce)`, `K_enc_resp` likewise with `enc-resp`, `K_mac` with `mac`. Keystream = `HMAC(Kx, nonce‖be32(i))` blocks. `ct = body XOR ks(K_enc_req)`, `tag = HMAC(K_mac,"v1"‖tok‖be64(ts)‖nonce‖ct)`. Send `{"v":1,"tok","ts","nonce":hex,"ct":b64,"tag":hex}`.
 - **Open** the reply (same nonce): check `tag == HMAC(K_mac,"resp"‖nonce‖ct)`, decrypt with `K_enc_resp`.
