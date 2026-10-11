@@ -29,9 +29,11 @@ private final class FrameMetric {
     let submittedAt: CFTimeInterval
     let captureMs: Double
     let pixbufMs: Double
-    init(index: Int64, submittedAt: CFTimeInterval, captureMs: Double, pixbufMs: Double) {
+    let capturedAt: CFTimeInterval
+    init(index: Int64, submittedAt: CFTimeInterval, captureMs: Double, pixbufMs: Double, capturedAt: CFTimeInterval) {
         self.index = index; self.submittedAt = submittedAt
         self.captureMs = captureMs; self.pixbufMs = pixbufMs
+        self.capturedAt = capturedAt
     }
 }
 
@@ -103,6 +105,15 @@ final class VideoBroadcaster {
     private var initSegment: Data?
     private var width = 0, height = 0
     private var frameIndex: Int64 = 0
+    /// Capture times of the stream's first and latest frames. Timestamps
+    /// follow the clock, not the frame count: capture runs below the
+    /// requested rate when the device is hot or the UI thread is busy, and a
+    /// nominal 1/fps per frame would make the player run ahead of the data,
+    /// drain its buffer and stall on every frame.
+    private var streamStartAt: CFTimeInterval = 0
+    private var lastFrameAt: CFTimeInterval = 0
+    /// Capture time of the last fragment sent. Encoder-callback thread only.
+    private var lastEmittedAt: CFTimeInterval = 0
     /// Recycles the ~6 MB BGRA frame buffers instead of allocating one per
     /// frame. At 10 fps a fresh CVPixelBufferCreate every tick was churning
     /// ~60 MB/s through the allocator; the pool also keeps the backing pages
@@ -134,14 +145,13 @@ final class VideoBroadcaster {
                    quality: Quality = .auto,
                    grabFrame: @escaping () -> UIImage?) {
         queue.async {
-            // Ceiling is 15, but the default is 5 for a reason: screen capture,
-            // not encoding, sets the rate, and it gets WORSE the harder you push
-            // it. Measured at a constant 10 fps request: capture started at
-            // ~70ms/frame and degraded to 1000ms+ over three minutes as the
-            // device heated, dragging the achieved rate from 10.2 fps down to
-            // 0.9. Encoding moved 13ms -> 22ms over the same run. So a higher
-            // setting buys a brief burst and then runs slower than a steady 5.
-            let newFps = max(0.5, min(fps, 15))
+            // Screen capture, not encoding, sets the achievable rate. With
+            // the direct testmanagerd JPEG capture a frame costs a few tens
+            // of milliseconds, so 30 is reachable on a cool device; a hot one
+            // sustains less, and the timer then simply runs back to back.
+            // Through XCUIScreen (the fallback) capture alone is ~100ms or
+            // more, which caps the rate near 7 whatever is asked.
+            let newFps = max(0.5, min(fps, 30))
             let restart = (self.timer != nil) && (self.fps != newFps || self.quality != quality)
             self.fps = newFps
             self.quality = quality
@@ -184,10 +194,15 @@ final class VideoBroadcaster {
     /// Request an immediate out-of-band frame. Used by the host after a
     /// UI-mutating RPC (tap, swipe, home…) so the browser reflects the change
     /// without waiting for the next 1/fps tick. Cheap no-op when idle.
-    func nudgeKeyframe() {
+    ///
+    /// A plain predicted frame: every subscriber is already decoding, and a
+    /// forced keyframe costs several times the bytes for nothing. Skipped when
+    /// a frame was captured within the last half interval.
+    func nudgeFrame() {
         queue.async {
             guard self.timer != nil else { return }
-            self.captureAndEncode(forceKeyframe: true)
+            if CACurrentMediaTime() - self.lastFrameAt < 0.5 / self.fps { return }
+            self.captureAndEncode(forceKeyframe: self.initSegment == nil)
         }
     }
 
@@ -221,6 +236,7 @@ final class VideoBroadcaster {
         pixelBufferPool = nil
         sps = Data(); pps = Data()
         frameIndex = 0
+        streamStartAt = 0; lastFrameAt = 0
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: 1.0 / fps)
         t.setEventHandler { [weak self] in self?.captureAndEncode() }
@@ -262,10 +278,13 @@ final class VideoBroadcaster {
         let t2 = CACurrentMediaTime()
 
         let idx = frameIndex; frameIndex += 1
-        let pts = CMTime(value: idx, timescale: Int32(max(1, fps.rounded())))
+        if streamStartAt == 0 { streamStartAt = t0 }
+        lastFrameAt = t0
+        let pts = CMTime(seconds: t0 - streamStartAt, preferredTimescale: 90_000)
         let metric = FrameMetric(index: idx, submittedAt: t2,
                                  captureMs: (t1 - t0) * 1000,
-                                 pixbufMs:  (t2 - t1) * 1000)
+                                 pixbufMs:  (t2 - t1) * 1000,
+                                 capturedAt: t0)
         // Retain across the async encoder callback; released in handleEncoded.
         let refcon = Unmanaged.passRetained(metric).toOpaque()
         var frameProps: CFDictionary?
@@ -389,6 +408,7 @@ final class VideoBroadcaster {
                 if !sps.isEmpty, !pps.isEmpty {
                     muxer = FMP4Muxer(width: width, height: height, sps: sps, pps: pps)
                     initSegment = muxer?.initSegment()
+                    lastEmittedAt = 0
                     log("fMP4 init built (\(initSegment?.count ?? 0) B)")
                 }
             }
@@ -417,8 +437,17 @@ final class VideoBroadcaster {
         }
         guard !vclNalus.isEmpty else { return }
 
-        // Fragment duration in the muxer's 90 kHz timescale.
-        let durationTicks = UInt32(max(1, Int(90_000.0 / fps)))
+        // Fragment duration in the muxer's 90 kHz timescale. Each frame lasts
+        // as long as the gap since the previous fragment, so the media
+        // timeline advances with the clock and stays gap-free (in segments
+        // mode a gap makes MSE drop frames until the next keyframe). Measured
+        // between fragments actually sent, so a frame the encoder dropped
+        // leaves no hole.
+        let nominal = 1.0 / fps
+        let capturedAt = metric?.capturedAt ?? tEncDone
+        let gap = lastEmittedAt > 0 ? min(max(capturedAt - lastEmittedAt, 0.005), 2.0) : nominal
+        lastEmittedAt = capturedAt
+        let durationTicks = UInt32(gap * 90_000)
         let fragData = muxer.fragment(nalus: vclNalus,
                                       durationTicks: durationTicks,
                                       keyframe: isKeyframe)

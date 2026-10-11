@@ -30,7 +30,7 @@ final class FMP4Muxer {
     init?(width: Int, height: Int, sps: Data, pps: Data) {
         guard !sps.isEmpty, !pps.isEmpty, sps.count >= 4 else { return nil }
         self.width = width; self.height = height
-        self.sps = sps; self.pps = pps
+        self.sps = H264LowDelaySPS.rewrite(sps) ?? sps; self.pps = pps
     }
 
     /// RFC 6381 codec string derived from the SPS. Format: `avc1.PPCCLL`
@@ -403,4 +403,136 @@ final class FMP4Muxer {
     private func u32be(_ v: UInt32) -> Data { var b = v.bigEndian; return Data(bytes: &b, count: 4) }
     private func u64be(_ v: UInt64) -> Data { var b = v.bigEndian; return Data(bytes: &b, count: 8) }
     private func i16be(_ v: Int16)  -> Data { var b = v.bigEndian; return Data(bytes: &b, count: 2) }
+}
+
+/// Declares "no frame reordering" in an H.264 SPS that does not say so.
+///
+/// VideoToolbox emits Baseline SPSs without VUI. Lacking
+/// `bitstream_restriction`, a decoder must assume frames may be reordered up
+/// to the whole DPB (about five frames at this size and level) and holds
+/// that many before showing the first: about a second of latency at 5 fps,
+/// and a player that seeks to the live edge again before then never plays at
+/// all. The stream has no B-frames, so appending a VUI with
+/// `max_num_reorder_frames = 0` is true and lets the decoder output each frame
+/// as it arrives. Only the SPS changes; slices do not refer to the VUI.
+///
+/// Returns nil (keep the original) for anything not understood: an SPS that
+/// already has VUI, scaling matrices, or a malformed one.
+enum H264LowDelaySPS {
+    static func rewrite(_ nal: Data) -> Data? {
+        let bytes = [UInt8](nal)
+        guard bytes.count > 4, bytes[0] & 0x1F == 7 else { return nil }
+        var r = BitReader(rbsp: unescape(Array(bytes[1...])))
+        guard let profile = r.u(8), r.u(8) != nil, r.u(8) != nil, r.ue() != nil else { return nil }
+        if [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].contains(profile) {
+            guard let chroma = r.ue() else { return nil }
+            if chroma == 3 { guard r.u(1) != nil else { return nil } }
+            guard r.ue() != nil, r.ue() != nil, r.u(1) != nil, let scaling = r.u(1), scaling == 0 else { return nil }
+        }
+        guard r.ue() != nil, let pocType = r.ue() else { return nil }
+        if pocType == 0 {
+            guard r.ue() != nil else { return nil }
+        } else if pocType == 1 {
+            guard r.u(1) != nil, r.se() != nil, r.se() != nil, let n = r.ue() else { return nil }
+            for _ in 0..<n { guard r.se() != nil else { return nil } }
+        }
+        guard let maxRefFrames = r.ue(), r.u(1) != nil, r.ue() != nil, r.ue() != nil,
+              let frameMbsOnly = r.u(1) else { return nil }
+        if frameMbsOnly == 0 { guard r.u(1) != nil else { return nil } }
+        guard r.u(1) != nil, let crop = r.u(1) else { return nil }
+        if crop == 1 { for _ in 0..<4 { guard r.ue() != nil else { return nil } } }
+        let vuiFlagAt = r.pos
+        guard let vui = r.u(1), vui == 0 else { return nil }
+
+        // Everything before vui_parameters_present_flag, then a VUI that only
+        // carries bitstream_restriction (E.1.1), then rbsp trailing bits.
+        var w = BitWriter()
+        var copy = BitReader(rbsp: r.data)
+        for _ in 0..<vuiFlagAt { w.put(copy.u(1)!, 1) }
+        w.put(1, 1)                       // vui_parameters_present_flag
+        for _ in 0..<5 { w.put(0, 1) }    // aspect, overscan, signal type, chroma loc, timing
+        for _ in 0..<3 { w.put(0, 1) }    // nal hrd, vcl hrd, pic_struct
+        w.put(1, 1)                       // bitstream_restriction_flag
+        w.put(1, 1)                       // motion_vectors_over_pic_boundaries_flag
+        w.ue(2); w.ue(1)                  // max_bytes_per_pic_denom, max_bits_per_mb_denom (defaults)
+        w.ue(15); w.ue(15)                // log2_max_mv_length_horizontal/vertical (defaults)
+        w.ue(0)                           // max_num_reorder_frames
+        w.ue(max(1, maxRefFrames))        // max_dec_frame_buffering
+        w.put(1, 1)                       // rbsp_stop_one_bit
+        w.align()
+        return Data([bytes[0]] + escape(w.bytes))
+    }
+
+    /// Drop emulation-prevention bytes (00 00 03 → 00 00).
+    private static func unescape(_ b: [UInt8]) -> [UInt8] {
+        var out: [UInt8] = []; out.reserveCapacity(b.count)
+        var zeros = 0
+        for x in b {
+            if zeros >= 2 && x == 3 { zeros = 0; continue }
+            out.append(x)
+            zeros = x == 0 ? zeros + 1 : 0
+        }
+        return out
+    }
+
+    /// Insert emulation-prevention bytes before 00 00 0x (x ≤ 3).
+    private static func escape(_ b: [UInt8]) -> [UInt8] {
+        var out: [UInt8] = []; out.reserveCapacity(b.count + 4)
+        var zeros = 0
+        for x in b {
+            if zeros >= 2 && x <= 3 { out.append(3); zeros = 0 }
+            out.append(x)
+            zeros = x == 0 ? zeros + 1 : 0
+        }
+        return out
+    }
+
+    private struct BitReader {
+        let data: [UInt8]
+        var pos = 0
+        init(rbsp: [UInt8]) { data = rbsp }
+        mutating func u(_ n: Int) -> Int? {
+            guard pos + n <= data.count * 8 else { return nil }
+            var v = 0
+            for _ in 0..<n {
+                v = v << 1 | Int(data[pos >> 3] >> (7 - UInt8(pos & 7)) & 1)
+                pos += 1
+            }
+            return v
+        }
+        mutating func ue() -> Int? {
+            var zeros = 0
+            while true {
+                guard let bit = u(1) else { return nil }
+                if bit == 1 { break }
+                zeros += 1
+                if zeros > 31 { return nil }
+            }
+            guard let rest = zeros > 0 ? u(zeros) : 0 else { return nil }
+            return (1 << zeros) - 1 + rest
+        }
+        mutating func se() -> Int? {
+            guard let k = ue() else { return nil }
+            return k & 1 == 1 ? (k + 1) / 2 : -(k / 2)
+        }
+    }
+
+    private struct BitWriter {
+        var bytes: [UInt8] = []
+        var bit = 0
+        mutating func put(_ v: Int, _ n: Int) {
+            for i in stride(from: n - 1, through: 0, by: -1) {
+                if bit == 0 { bytes.append(0) }
+                if (v >> i) & 1 == 1 { bytes[bytes.count - 1] |= UInt8(0x80 >> bit) }
+                bit = (bit + 1) & 7
+            }
+        }
+        mutating func ue(_ v: Int) {
+            let x = v + 1
+            let len = Int.bitWidth - x.leadingZeroBitCount
+            put(0, len - 1)
+            put(x, len)
+        }
+        mutating func align() { while bit != 0 { put(0, 1) } }
+    }
 }

@@ -92,6 +92,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private static let captureJPEGQuality = 0.25
     /// nil = not probed yet, false = unavailable on this OS, true = usable.
     private static var jpegCaptureAvailable: Bool?
+    /// Asking testmanagerd directly (see ObjCException.daemonScreenshot)
+    /// instead of going through XCUIScreen. nil = not tried, true = working;
+    /// off after `daemonCaptureMaxFailures` failures in a row.
+    private static var daemonCaptureWorks: Bool?
+    private static var daemonCaptureFailures = 0
+    private static let daemonCaptureMaxFailures = 3
 
     /// Capture a frame that the system compressed for us, or nil if this OS
     /// doesn't expose the private encoding-aware capture path.
@@ -134,6 +140,26 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 failStep = "makeImageEncoding returned nil [\(diag ?? "no diagnosis")]"; return
             }
             _ = newShape
+            // The direct request first: same capture, a fraction of the time.
+            if daemonCaptureWorks != false {
+                var why: NSString?
+                if let data = ObjCException.daemonScreenshot(withEncoding: encoding, timeout: 2, why: &why),
+                   let img = UIImage(data: data), img.cgImage != nil {
+                    if daemonCaptureWorks == nil {
+                        logBuffer.append("📷 direct testmanagerd capture active (\(data.count / 1024) KB/frame)")
+                    }
+                    daemonCaptureWorks = true
+                    daemonCaptureFailures = 0
+                    result = img
+                    sizeKB = data.count / 1024
+                    return
+                }
+                daemonCaptureFailures += 1
+                if daemonCaptureWorks == nil || daemonCaptureFailures >= daemonCaptureMaxFailures {
+                    daemonCaptureWorks = false
+                    logBuffer.append("📷 direct testmanagerd capture off: \(why ?? "no image") — using XCUIScreen")
+                }
+            }
             // Through objc_msgSend, not a Swift protocol cast: on Xcode 27 the
             // encoding object no longer bridges to XCTImageEncoding, so the
             // cast failed and every frame took the slow bitmap path.
@@ -179,6 +205,26 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                              + "Stopped at: \(raised ?? failStep)")
         }
         return nil
+    }
+
+    /// nil = not tried yet, true = the JPEG capture works off the main thread.
+    private static var offMainCaptureWorks: Bool?
+
+    /// A stream frame captured on the caller's thread, so it does not queue
+    /// behind an action holding the main thread (a drag blocks it for its
+    /// whole duration, which froze the stream for as long). Tried once the
+    /// capture path has been probed on the main thread; an exception or a
+    /// missing frame turns it off for good.
+    static func offMainFrame() -> UIImage? {
+        guard jpegCaptureAvailable != nil, offMainCaptureWorks != false else { return nil }
+        var img: UIImage?
+        let raised = ObjCException.catching { img = captureFrame() }
+        if offMainCaptureWorks == nil || img == nil {
+            offMainCaptureWorks = img != nil
+            logBuffer.append(img != nil ? "📷 stream capture runs off the main thread"
+                                        : "📷 off-main capture failed (\(raised ?? "no frame")) — stream captures on the main thread")
+        }
+        return img
     }
 
     /// One screen frame, cheapest path first: a JPEG the capture side
@@ -1197,9 +1243,9 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // so `GET /logs` shows encoder start/stop/failure alongside RPC calls.
         VideoBroadcaster.onLog = { msg in Self.logBuffer.append(msg) }
         // Cut click-to-reflect latency: when a UI-mutating RPC completes,
-        // capture + encode a fresh keyframe instead of waiting for the next
+        // capture + encode a fresh frame instead of waiting for the next
         // 1/fps tick (a full 500 ms at 2 fps).
-        srv.onRPCUIChanged = { VideoBroadcaster.shared.nudgeKeyframe() }
+        srv.onRPCUIChanged = { VideoBroadcaster.shared.nudgeFrame() }
         srv.onVideoStream = { [weak self] connection, fps, qualityRaw, verbose in
             guard self != nil else { connection.cancel(); return }
             // Verbose logging is global to the shared broadcaster (all clients
@@ -1212,6 +1258,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             VideoBroadcaster.shared.configure(fps: fps, quality: quality) {
                 let grab: () -> UIImage? = { Self.captureFrame() }
                 if Thread.isMainThread { return grab() }
+                if let img = Self.offMainFrame() { return img }
                 var img: UIImage?
                 DispatchQueue.main.sync { img = grab() }
                 return img

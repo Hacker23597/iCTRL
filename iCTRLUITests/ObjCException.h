@@ -21,6 +21,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// screenshotWithPreferredEncoding:rect:error: then the 4-argument form.
 + (nullable id)screenshotOf:(id)screen encoding:(id)encoding;
 
+/// A screenshot straight from the testmanagerd session, in the given
+/// encoding: XCTRunnerDaemonSession's requestScreenshotWithRequest:withReply:.
+/// The XCUIScreen methods reach the same capture but take about 100ms per
+/// frame whatever the format; asked directly, a quarter-quality JPEG of the
+/// whole screen comes back in a few tens of milliseconds. Returns the
+/// encoded bytes, or nil with the reason in `why` (missing API, error, or
+/// no reply within `timeout` seconds).
++ (nullable NSData *)daemonScreenshotWithEncoding:(id)encoding
+                                          timeout:(double)timeout
+                                              why:(NSString * _Nullable * _Nullable)why;
+
 + (nullable id)makeImageEncoding:(Class)encodingClass
                              uti:(NSString *)uti
                          quality:(double)quality

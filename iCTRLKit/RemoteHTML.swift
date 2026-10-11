@@ -347,15 +347,14 @@ enum RemoteHTML {
         <div>
           <label class="label">FPS</label>
           <select class="input" id="fpsSel"
-                  title="Requested rate. Capture is the limit and it degrades as the device heats up, so a higher setting often ends up slower than 5.">
-            <option value="1">1</option>
+                  title="Requested rate. Capture sets the real limit: up to 30 on a cool device, less when it is hot.">
             <option value="2">2</option>
-            <option value="3">3</option>
-            <option value="5" selected>5</option>
-            <option value="8">8</option>
+            <option value="5">5</option>
             <option value="10">10</option>
-            <option value="12">12</option>
-            <option value="15">15</option>
+            <option value="15" selected>15</option>
+            <option value="20">20</option>
+            <option value="24">24</option>
+            <option value="30">30</option>
           </select>
         </div>
         <div>
@@ -692,8 +691,14 @@ enum RemoteHTML {
   }
 
   // ── RPC ──
+  // A person watching the live stream is the settle check: waiting for the
+  // screen to stop changing would only hold the reply (and the device's UI
+  // thread, which the stream's capture also needs) for up to seconds.
+  const NO_SETTLE = new Set(['tap', 'double_tap', 'long_press', 'swipe', 'scroll', 'drag',
+                             'page', 'page_down', 'page_up', 'type', 'clear_text']);
   async function rpc(method, params = {}) {
     if (!key) throw new Error('not paired');
+    if (NO_SETTLE.has(method) && params.settle === undefined) params = { ...params, settle: false };
     const body = enc.encode(JSON.stringify({ jsonrpc: '2.0', method, params, id: Date.now() }));
     const nonce = crypto.getRandomValues(new Uint8Array(16));
     const ts = Math.floor(Date.now() / 1000);
@@ -850,6 +855,9 @@ enum RemoteHTML {
 
   // ── input handling on the video ──
   overlay.addEventListener('pointerdown', e => {
+    // Left button (or a touch) only: the right button is Home.
+    lastPointerType = e.pointerType;
+    if (e.button !== 0) return;
     overlay.setPointerCapture(e.pointerId);
     dragStart = { x: e.clientX, y: e.clientY, t: Date.now() };
     overlay.focus();
@@ -862,6 +870,14 @@ enum RemoteHTML {
     try {
       if (dist < 6) {
         const p = clientToPoint(e.clientX, e.clientY); if (!p) return;
+        // Held in place → long press, for as long as it was held.
+        const held = (Date.now() - s.t) / 1000;
+        if (held >= 0.5) {
+          await rpc('long_press', { x: Math.round(p.x), y: Math.round(p.y),
+                                    duration: Math.min(3, Math.max(0.6, held)) });
+          setStatus(`long_press (${Math.round(p.x)},${Math.round(p.y)})`, 'ok');
+          return;
+        }
         await rpc('tap', { x: Math.round(p.x), y: Math.round(p.y) });
         setStatus(`tap (${Math.round(p.x)},${Math.round(p.y)})`, 'ok');
       } else {
@@ -889,17 +905,51 @@ enum RemoteHTML {
     try { await rpc('double_tap', { x: Math.round(p.x), y: Math.round(p.y) }); setStatus(`double_tap`, 'ok'); }
     catch (err) { setStatus(err.message, 'err'); }
   });
-  // Right-click → long_press
+  // Right-click → Home (long press is a left press held in place). A held
+  // finger on a touch screen also raises contextmenu; that one is the long
+  // press already handled on pointerup, not Home.
+  let lastPointerType = 'mouse';
   overlay.addEventListener('contextmenu', async e => {
     e.preventDefault();
-    const p = clientToPoint(e.clientX, e.clientY); if (!p) return;
-    try { await rpc('long_press', { x: Math.round(p.x), y: Math.round(p.y) }); setStatus(`long_press`, 'ok'); }
+    if (lastPointerType !== 'mouse') return;
+    try { await rpc('home'); setStatus('home', 'ok'); }
     catch (err) { setStatus(err.message, 'err'); }
   });
-  // Wheel → page or swipe. Trackpad up = feed moves down = swipe up gesture.
+  // Wheel → page (vertical) or a horizontal swipe. Trackpad up = feed moves
+  // down = swipe up gesture. Sideways (trackpad, tilt wheel, shift+wheel) is
+  // a swipe from under the pointer: carousels, pagers, back gestures.
+  // deltaX > 0 means "scroll right", i.e. the finger moves left.
   let wheelAcc = 0, wheelTimer = null;
+  let sideAcc = 0, sideLock = null, sidePoint = null;
   overlay.addEventListener('wheel', e => {
     e.preventDefault();
+    const dx = e.deltaX || (e.shiftKey ? e.deltaY : 0);
+    const sideways = Math.abs(dx) > Math.abs(e.deltaY) || (e.shiftKey && !e.deltaX);
+    if (sideways || sideLock) {
+      // One swipe per gesture: a trackpad keeps sending (momentum) events
+      // after the fingers lift; they extend the lock instead of swiping again.
+      if (sideLock) {
+        clearTimeout(sideLock);
+        sideLock = setTimeout(() => { sideLock = null; sideAcc = 0; }, 350);
+        return;
+      }
+      if (!sidePoint) sidePoint = clientToPoint(e.clientX, e.clientY);
+      sideAcc += dx;
+      if (Math.abs(sideAcc) < 30 || !sidePoint || !deviceInfo) return;
+      const w = deviceInfo.point_width;
+      const dist = w * 0.45;
+      const dir = sideAcc > 0 ? -1 : 1;
+      // Keep both ends on the screen.
+      const fromX = Math.max(8 + (dir < 0 ? dist : 0), Math.min(w - 8 - (dir > 0 ? dist : 0), sidePoint.x));
+      const y = Math.round(sidePoint.y);
+      sidePoint = null; sideAcc = 0;
+      sideLock = setTimeout(() => { sideLock = null; }, 350);
+      rpc('drag', { from_x: Math.round(fromX), from_y: y, to_x: Math.round(fromX + dir * dist), to_y: y, duration: 0.2 })
+        .then(() => setStatus(`swipe ${dir < 0 ? 'left' : 'right'}`, 'ok'))
+        .catch(err => setStatus(err.message, 'err'));
+      return;
+    }
+    sidePoint = null; sideAcc = 0;
     wheelAcc += e.deltaY;
     if (wheelTimer) clearTimeout(wheelTimer);
     wheelTimer = setTimeout(async () => {
@@ -1148,23 +1198,32 @@ enum RemoteHTML {
     ms.addEventListener('sourceopen', () => { sourceOpen = true; maybeStart(); });
     ms.addEventListener('sourceclose', () => { running = false; });
 
-    // Watchdog: every 500 ms, mark old data for removal + chase live if the
-    // player drifted more than 0.6 s behind the buffered edge. Both are done
-    // OUTSIDE updateend so they can't compete with the append pipeline.
+    // Live edge: every 100 ms. Frame timestamps follow the device clock, so
+    // after the stream stalls (capture blocked, network hiccup) the player is
+    // behind by exactly the stall. A small lag is caught up by playing faster
+    // — no visible jump; a large one (a long stall, a hidden tab) by a seek,
+    // only when sb is idle (seeking during an update throws).
+    const live = setInterval(() => {
+      if (!running || !sb) return;
+      try {
+        const bl = videoEl.buffered.length;
+        if (!bl) return;
+        const lag = videoEl.buffered.end(bl - 1) - videoEl.currentTime;
+        if (lag > 1.0 && !sb.updating) {
+          videoEl.currentTime = videoEl.buffered.end(bl - 1) - 0.05;
+          videoEl.playbackRate = 1;
+        } else {
+          const rate = lag > 0.35 ? Math.min(2, 1 + lag) : 1;
+          if (videoEl.playbackRate !== rate) videoEl.playbackRate = rate;
+        }
+        if (videoEl.paused && running) videoEl.play().catch(() => {});
+      } catch (_) {}
+    }, 100);
+
+    // Watchdog: every 500 ms, mark old data for removal. Done OUTSIDE
+    // updateend so it can't compete with the append pipeline.
     const watchdog = setInterval(() => {
       if (!running || !sb) return;
-      // Live chase — only safe when sb is idle.
-      if (!sb.updating) {
-        try {
-          const bl = videoEl.buffered.length;
-          if (bl) {
-            const end = videoEl.buffered.end(bl - 1);
-            if (end - videoEl.currentTime > 0.6) {
-              videoEl.currentTime = end - 0.1;
-            }
-          }
-        } catch (_) {}
-      }
       // Ask tick to remove a chunk next time it's idle.
       try {
         if (videoEl.buffered.length &&
@@ -1207,6 +1266,7 @@ enum RemoteHTML {
       stop() {
         running = false;
         clearInterval(watchdog);
+        clearInterval(live);
         try { ac.abort(); } catch (_) {}
         try { if (ms.readyState === 'open') ms.endOfStream(); } catch (_) {}
         try { URL.revokeObjectURL(videoEl.src); } catch (_) {}

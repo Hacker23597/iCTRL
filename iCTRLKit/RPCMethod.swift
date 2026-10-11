@@ -373,7 +373,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.96.0"
+    static let serverVersion = "1.96.1"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///
@@ -433,7 +433,7 @@ struct RPCMethodRegistry {
                 "skill": "GET /skill — START HERE. The operating manual in Skill (Markdown) format; read it ONCE to learn the fast-path workflow and best practices, then treat iCTRL as a Skill.",
                 "pair": "POST /pair  {client_name, plain:true | pub:<b64 raw 32B X25519>} → the 32-byte key K. IMPORTANT: this BLOCKS until the device user manually taps Allow/Deny on an on-screen prompt — use a long client timeout (at least 60s) and do NOT retry early; a retry queues another prompt. `plain:true` returns K in the clear and is accepted ONLY from 127.0.0.1 (USB/iproxy); over the LAN send `pub` and unwrap: K = token_ct XOR HMAC(HMAC(X25519(c_priv,d_pub), \"ictrl-pair\"||c_pub||d_pub), \"ictrl-wrap\"). Returns 403 if denied.",
                 "rpc": "POST /rpc   an ENCRYPTED v1 envelope (no plaintext path, no Bearer header): {v:1, tok, ts, nonce:<32 hex>, ct:<b64>, tag:<64 hex>} wrapping the JSON-RPC body. See guidance.authorization for the construction.",
-                "stream": "GET /stream[.ts]?ticket=<t>  live H.264 screen video (default 5 fps, ?fps=N in 0.5-15 to change). Screen capture is the limit, not encoding, and it degrades as the device heats: a sustained 10 fps request measured 70ms/frame capture initially and 1000ms+ after three minutes, ending SLOWER than a steady 5. A byte pipe can't carry a per-request envelope, so it takes a SINGLE-USE ~60s ticket minted over the encrypted channel by the `stream_ticket` RPC. One shared encoder fans out to all clients; encoding stops when the last client disconnects.",
+                "stream": "GET /stream[.ts]?ticket=<t>  live H.264 screen video (default 5 fps, ?fps=N in 0.5-30 to change). Screen capture is the limit, not encoding: where XCTest can capture straight to JPEG the full 30 is reachable on a cool device and somewhat less on a hot one; where it can't, capture caps the rate near 7. A byte pipe can't carry a per-request envelope, so it takes a SINGLE-USE ~60s ticket minted over the encrypted channel by the `stream_ticket` RPC. One shared encoder fans out to all clients; encoding stops when the last client disconnects.",
                 "remote": "GET /remote  browser control page (shadcn-styled): plays the stream via MSE and drives the device with tap/swipe/scroll/keyboard + a side panel of buttons. Paste the 64-hex pairing key once; the page does the v1 crypto in-browser (WebCrypto) and keeps K in localStorage — it is never sent.",
                 "logs": "GET /logs?ticket=<t>   plain-text recent logs (current process, in-memory). Browser-issued GET, so it uses the same single-use ticket as /stream. Sensitive values are redacted",
                 "logs_files": "GET /logs/files?ticket=<t>   list persisted daily log files (survive crashes/restarts)",
