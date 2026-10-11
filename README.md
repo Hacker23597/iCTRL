@@ -28,6 +28,15 @@ model**: `GET /skill` serves a complete operating manual and `GET /schema`
 documents every method with its parameters, so an agent can learn the API at
 runtime and call it correctly without prior knowledge.
 
+**Works with any agent.** The JSON-RPC API and the skill are built in and
+progressively discoverable: an agent starts from the manual and drills into the
+schema only as it needs to. Any agent that can make HTTP requests can use it,
+such as OpenClaw, Hermes, Minis, Claude Code or Codex. All it needs is the
+phone's IP address and port; these agents usually explore the endpoint and
+install the skill themselves to learn how to drive the phone. Minis is
+additionally optimized for iCTRL, so it carries out interactions on the phone
+faster.
+
 **Hand it to your agent in one sentence.** Once the runner is up (with remote
 access enabled, if the agent isn't on the phone), tell your agent:
 
@@ -36,6 +45,36 @@ access enabled, if the agent isn't on the phone), tell your agent:
 It finds the manual at `GET /skill` and the method list at `GET /schema`,
 downloads a client from the device, and asks to pair. Approve the pairing
 notification on the phone, and from there it works out the rest.
+
+```mermaid
+flowchart LR
+  subgraph setup["Set up once"]
+    direction TB
+    S1["① Sign and install<br/>SideStore · sign-ipa.sh · Xcode"]
+    S2["② Mount the DDI<br/>iCTRL app · StikDebug · Xcode"]
+    S3["③ Launch the runner<br/>allow Notifications and Local Network"]
+    S1 --> S2 --> S3
+  end
+
+  subgraph phone["iPhone"]
+    direction TB
+    R["iCTRL runner :8200<br/>127.0.0.1 only by default"]
+    N["🔔 Runner notifications<br/>✅ Allow pairing · 🌐 Remote Access · 🛑 Stop"]
+    N -. "🌐 Remote Access opens it to the LAN" .-> R
+  end
+
+  A["🤖 Agent<br/>OpenClaw · Hermes · Minis · Claude Code · Codex<br/>given only IP:port"]
+
+  S3 --> R
+  A -- "1 · GET /skill, /schema: learn the API" --> R
+  A -- "2 · POST /pair: X25519 key exchange" --> R
+  R -- "pairing request" --> N
+  A == "3 · encrypted JSON-RPC: tap, swipe, type, read UI, screenshot" ==> R
+```
+
+An agent on the phone itself, such as Minis, reaches the runner on
+`127.0.0.1`. An agent on another machine needs **🌐 Remote Access** turned on
+and the same Wi-Fi network.
 
 - **Bundle ID:** `com.openminis.ictrl`
 - **Transport:** JSON-RPC 2.0 over HTTP, port `8200`
