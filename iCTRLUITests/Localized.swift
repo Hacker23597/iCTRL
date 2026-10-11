@@ -68,6 +68,8 @@ enum L10n {
         case ddiComponentTitle, ddiDownloadHint, ddiDownloaded, downloadImageFiles, ddiSourceFooter
         case mountButton, mountedOK, mountFailed, mountNotPersistentFooter, firstMountNetworkFooter
         case finishStepsFirst, vpnNotConnected, vpnNotInstalled, noPairingFile, imagesNotDownloaded
+        case localNetworkDeniedDetail, openSettings, interfacesSeen
+        case networkPermissionTitle, networkPermissionBody, networkDataPermission, localNetworkPermission, laterButton
         case wifiRequired, wifiConnected, wifiMissing, wifiFooter, notOnWiFi
         case mountIntro, uploadingImage
     }
@@ -146,7 +148,7 @@ enum L10n {
         .runtimeRequirements: [.en: "Runtime Requirements", .zhHans: "运行环境要求", .zhHant: "執行環境需求"],
         .developerDiskImage: [.en: "Developer Disk Image", .zhHans: "开发者磁盘镜像", .zhHant: "開發者磁碟映像"],
         .mountPoint: [.en: "Mount point", .zhHans: "挂载位置", .zhHant: "掛載位置"],
-        .mountWithoutMac: [.en: "Mount without a Mac…", .zhHans: "无需 Mac 挂载…", .zhHant: "無需 Mac 掛載…"],
+        .mountWithoutMac: [.en: "Start local mount…", .zhHans: "开始本地挂载…", .zhHant: "開始本地掛載…"],
         .remount: [.en: "Re-mount…", .zhHans: "重新挂载…", .zhHant: "重新掛載…"],
         .ddiReadyFooter: [.en: "The automation runner can launch on this device. The image is dropped by a reboot — re-mount if the runner stops starting.",
                           .zhHans: "自动化 runner 可以在这台设备上启动。镜像会在重启后丢失——如果 runner 起不来，重新挂载即可。",
@@ -207,9 +209,9 @@ enum L10n {
                             .zhHant: "未安裝。它讓本機的除錯服務變得可達——iCTRL 隨後以 Mac 上 Xcode 的同樣方式與之通訊。"],
         .openVPNAndConnect: [.en: "Open LocalDevVPN & connect", .zhHans: "打开 LocalDevVPN 并连接", .zhHant: "開啟 LocalDevVPN 並連線"],
         .getVPNFromAppStore: [.en: "Get LocalDevVPN on the App Store", .zhHans: "在 App Store 获取 LocalDevVPN", .zhHant: "在 App Store 取得 LocalDevVPN"],
-        .tunnelDetectedFooter: [.en: "Detected by the tunnel's address being present on this device.",
-                                .zhHans: "依据本机是否出现隧道地址来判断。",
-                                .zhHant: "依據本機是否出現通道位址來判斷。"],
+        .tunnelDetectedFooter: [.en: "Detected by connecting to this device's debug service through the tunnel.",
+                                .zhHans: "依据能否经隧道连上本机调试服务来判断。",
+                                .zhHant: "依據能否經通道連上本機除錯服務來判斷。"],
         .cannotStartVPNFooter: [.en: "iCTRL can't connect the VPN for you — tapping above opens it to do that. If mounting still fails to connect, check it there first.",
                                 .zhHans: "iCTRL 无法替你连接 VPN——点击上面会打开它去连接。如果挂载仍然连不上，请先去那里检查。",
                                 .zhHant: "iCTRL 無法替你連線 VPN——點擊上面會開啟它去連線。如果掛載仍然連不上，請先去那裡檢查。"],
@@ -224,9 +226,9 @@ enum L10n {
         .pairingImported: [.en: "Imported", .zhHans: "已导入", .zhHant: "已匯入"],
 
         .ddiComponentTitle: [.en: "Developer Disk Image", .zhHans: "开发者磁盘镜像", .zhHant: "開發者磁碟映像"],
-        .ddiDownloadHint: [.en: "About 100 MB. Downloaded once and reused — only the mount has to be repeated after a reboot.",
-                           .zhHans: "约 100 MB。只需下载一次并重复使用——重启后只需重新挂载。",
-                           .zhHant: "約 100 MB。只需下載一次並重複使用——重新開機後只需重新掛載。"],
+        .ddiDownloadHint: [.en: "About 100 MB up to iOS 26.3, about 17 MB from iOS 26.4. Downloaded once and reused — only the mount has to be repeated after a reboot.",
+                           .zhHans: "iOS 26.3 及以下约 100 MB，iOS 26.4 起约 17 MB。只需下载一次并重复使用——重启后只需重新挂载。",
+                           .zhHant: "iOS 26.3 及以下約 100 MB，iOS 26.4 起約 17 MB。只需下載一次並重複使用——重新開機後只需重新掛載。"],
         .ddiDownloaded: [.en: "Downloaded", .zhHans: "已下载", .zhHant: "已下載"],
         .downloadImageFiles: [.en: "Download image files", .zhHans: "下载镜像文件", .zhHant: "下載映像檔案"],
         .ddiSourceFooter: [.en: "Fetched from the DeveloperDiskImage mirror maintained by the pymobiledevice3 author. Apple doesn't publish these for direct download; the same files ship inside Xcode.",
@@ -258,8 +260,20 @@ enum L10n {
                       .zhHant: "任意 Wi-Fi 都可以。通道走本機網路介面，行動網路不提供這個。"],
         .notOnWiFi: [.en: "not connected to Wi-Fi", .zhHans: "未连接 Wi-Fi", .zhHant: "未連線 Wi-Fi"],
         .uploadingImage: [.en: "Uploading image…", .zhHans: "正在上传镜像…", .zhHant: "正在上傳映像…"],
-        .mountIntro: [.en: "Mount the Developer Disk Image without a Mac. iOS needs it before the automation runner can launch, and it does not survive a reboot.",
-                      .zhHans: "无需 Mac 即可挂载开发者磁盘镜像。iOS 要求先有它，自动化 runner 才能启动；且它在重启后会丢失。",
-                      .zhHant: "無需 Mac 即可掛載開發者磁碟映像。iOS 要求先有它，自動化 runner 才能啟動；且它在重新開機後會遺失。"],
+        .mountIntro: [.en: "Mount the Developer Disk Image locally, on this device. iOS needs it before the automation runner can launch, and it does not survive a reboot.",
+                      .zhHans: "在本机直接挂载开发者磁盘镜像。iOS 要求先有它，自动化 runner 才能启动；且它在重启后会丢失。",
+                      .zhHant: "在本機直接掛載開發者磁碟映像。iOS 要求先有它，自動化 runner 才能啟動；且它在重新開機後會遺失。"],
+        .localNetworkDeniedDetail: [.en: "The tunnel is blocked: Local Network access is off for iCTRL. Turn it on in Settings, then come back.",
+                                    .zhHans: "隧道被拦截：iCTRL 的“本地网络”权限已关闭。请在设置中打开后再回来。",
+                                    .zhHant: "通道被攔截：iCTRL 的「區域網路」權限已關閉。請在設定中開啟後再回來。"],
+        .openSettings: [.en: "Open Settings", .zhHans: "打开设置", .zhHant: "開啟設定"],
+        .interfacesSeen: [.en: "Addresses on this device:", .zhHans: "本机地址：", .zhHant: "本機位址："],
+        .networkPermissionTitle: [.en: "Network access is off", .zhHans: "网络权限未开启", .zhHant: "網路權限未開啟"],
+        .networkPermissionBody: [.en: "iCTRL can't work without: %@. Turn it on in Settings → iCTRL.",
+                                 .zhHans: "iCTRL 需要以下权限才能工作：%@。请在 设置 → iCTRL 中打开。",
+                                 .zhHant: "iCTRL 需要以下權限才能運作：%@。請在 設定 → iCTRL 中開啟。"],
+        .networkDataPermission: [.en: "Wireless Data", .zhHans: "无线数据", .zhHant: "無線資料"],
+        .localNetworkPermission: [.en: "Local Network", .zhHans: "本地网络", .zhHant: "區域網路"],
+        .laterButton: [.en: "Later", .zhHans: "稍后", .zhHant: "稍後"],
     ]
 }

@@ -7,6 +7,7 @@ enum DDIError: LocalizedError {
     case missingImage
     case tunnelUnavailable(String)
     case tunnelDown
+    case localNetworkDenied
     case ffi(String, String)          // operation, message
     case downloadFailed(String, String)
 
@@ -21,6 +22,9 @@ enum DDIError: LocalizedError {
         case .tunnelDown:
             return "LocalDevVPN isn't connected. The tunnel doesn't survive a reboot — "
                  + "open LocalDevVPN and connect it (step 1), then mount again."
+        case .localNetworkDenied:
+            return "iOS blocked the connection to the tunnel: Local Network access is off for iCTRL. "
+                 + "Turn it on in Settings → Privacy & Security → Local Network (or Settings → iCTRL), then mount again."
         case .tunnelUnavailable(let why):
             return "Can't reach the device's debug service: \(why)"
         case .ffi(let op, let msg):
@@ -89,12 +93,15 @@ final class DDIMounter: ObservableObject {
             // VPN surfaces as "device socket io failed", which names a socket
             // rather than the step the user has to fix — and the tunnel is down
             // after every reboot, so this is the common case, not an edge one.
-            guard LocalDevVPN.isTunnelUp() else { throw DDIError.tunnelDown }
+            switch await LocalDevVPN.probeTunnel() {
+            case .reachable: break
+            case .localNetworkDenied: throw DDIError.localNetworkDenied
+            case .unreachable: throw DDIError.tunnelDown
+            }
 
             let pairingPath = PairingFileStore.storedURL.path
-            let image = try Data(contentsOf: DeveloperDiskImageStore.url(for: .image))
-            let trustCache = try Data(contentsOf: DeveloperDiskImageStore.url(for: .trustCache))
-            let manifest = try Data(contentsOf: DeveloperDiskImageStore.url(for: .buildManifest))
+            let method = DeveloperDiskImageStore.mountMethod
+            let imageDir = DeveloperDiskImageStore.directory.path
 
             // A dedicated Thread with an explicit stack, not a Task.
             //
@@ -106,9 +113,8 @@ final class DDIMounter: ObservableObject {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 let thread = Thread {
                     do {
-                        try Self.performMount(pairingPath: pairingPath,
-                                              image: image, trustCache: trustCache,
-                                              manifest: manifest) { phase in
+                        try Self.performMount(pairingPath: pairingPath, method: method,
+                                              imageDir: imageDir) { phase in
                             Task { @MainActor in self.phase = phase }
                         }
                         cont.resume()
@@ -159,6 +165,33 @@ final class DDIMounter: ObservableObject {
         return count
     }
 
+    /// Whether the DDI cryptex (iOS 26.4+) is installed. False when cryptexd
+    /// can't be asked — an older OS has no such service.
+    nonisolated static func cryptexDDIInstalled(adapter: OpaquePointer, handshake: OpaquePointer) -> Bool {
+        var installed: UnsafeMutablePointer<InstalledCryptexC>?
+        if let err = cryptexd_installed_ddi(adapter, handshake, &installed) {
+            idevice_error_free(err)
+        }
+        defer { if let installed { cryptexd_free_installed_cryptex(installed) } }
+        return installed != nil
+    }
+
+    /// Install the DDI as a cryptex (iOS 26.4+). cryptexd takes the whole
+    /// restore directory — image, trust cache, manifest, cryptex info and root
+    /// hash — and does the personalization itself, so there is no ECID to read
+    /// and no upload progress to report.
+    nonisolated private static func installCryptex(adapter: OpaquePointer, handshake: OpaquePointer,
+                                                   imageDir: String,
+                                                   report: @escaping (Phase) -> Void) throws {
+        var assets: OpaquePointer?
+        try check("Reading the DDI cryptex files") { cryptex1_assets_load(imageDir, &assets) }
+        guard let assets else { throw DDIError.ffi("Reading the DDI cryptex files", "nothing loaded") }
+        defer { cryptex1_assets_free(assets) }
+        report(.uploading(0))
+        try check("Installing the DDI cryptex") { cryptexd_install_ddi(adapter, handshake, assets, nil) }
+        report(.finalizing)
+    }
+
 
     /// Force the rustls crypto provider to be installed before anything needs it.
     ///
@@ -204,10 +237,11 @@ final class DDIMounter: ObservableObject {
         }
     }
 
-    nonisolated private static func performMount(pairingPath: String, image: Data, trustCache: Data,
-                                     manifest: Data,
-                                     report: @escaping (Phase) -> Void) throws {
-        ictrlLog("DDI mount starting — image \(image.count)B, trustcache \(trustCache.count)B, manifest \(manifest.count)B")
+    nonisolated private static func performMount(pairingPath: String,
+                                                 method: DeveloperDiskImageStore.MountMethod,
+                                                 imageDir: String,
+                                                 report: @escaping (Phase) -> Void) throws {
+        ictrlLog("DDI mount starting — \(method.rawValue) image from \(imageDir)")
         primeCryptoProvider()
 
         var pairing: OpaquePointer?
@@ -243,7 +277,13 @@ final class DDIMounter: ObservableObject {
 
         // Already mounted? iOS answers a second mount with a bare
         // "ImageMountFailed", which reads like a real failure rather than
-        // "nothing to do". Ask first and treat that case as success.
+        // "nothing to do". Ask first and treat that case as success. Both
+        // kinds are asked about whatever this OS uses: an image mounted by
+        // Xcode, or before an OS update, counts just the same.
+        if cryptexDDIInstalled(adapter: adapter, handshake: handshake) {
+            ictrlLog("✅ The developer disk image cryptex is already installed — nothing to do")
+            return
+        }
         if let mounted = mountedImageCount(adapter: adapter, handshake: handshake) {
             ictrlLog("Device reports \(mounted) mounted image(s)")
             if mounted > 0 {
@@ -251,6 +291,17 @@ final class DDIMounter: ObservableObject {
                 return
             }
         }
+
+        if method == .cryptex {
+            try installCryptex(adapter: adapter, handshake: handshake, imageDir: imageDir, report: report)
+            return
+        }
+
+        // Mapped, not read: the personalized image is about 100MB.
+        let image = try Data(contentsOf: URL(fileURLWithPath: imageDir).appendingPathComponent("Image.dmg"),
+                             options: .mappedIfSafe)
+        let trustCache = try Data(contentsOf: URL(fileURLWithPath: imageDir).appendingPathComponent("Image.dmg.trustcache"))
+        let manifest = try Data(contentsOf: URL(fileURLWithPath: imageDir).appendingPathComponent("BuildManifest.plist"))
 
         // The ECID identifies this specific device to Apple's signing service.
         // A personalized image is signed for one device and one nonce, which is

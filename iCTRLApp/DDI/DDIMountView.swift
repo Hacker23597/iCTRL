@@ -19,6 +19,10 @@ struct DDIMountView: View {
     @State private var downloadError: String?
     @State private var vpnInstalled = false
     @State private var tunnelUp = false
+    /// Last connection test through the tunnel, and the interfaces seen then.
+    @State private var tunnelProbe: LocalDevVPN.TunnelProbe?
+    @State private var interfacesSeen = ""
+    @State private var probing = false
     @State private var onWiFi = false
     @State private var networkObserved = false
 
@@ -67,6 +71,11 @@ struct DDIMountView: View {
             .onReceive(NotificationCenter.default.publisher(
                 for: UIApplication.didBecomeActiveNotification)) { _ in refreshVPNState() }
             .onOpenURL { _ in refreshVPNState() }   // LocalDevVPN bounced us back
+            // LocalDevVPN bounces back a fixed second after it starts
+            // connecting, often before the tunnel is up: keep checking until it is.
+            .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+                if !tunnelUp { refreshVPNState() }
+            }
             .fileImporter(isPresented: $showPairingPicker,
                           allowedContentTypes: PairingFileStore.supportedContentTypes) { result in
                 switch result {
@@ -91,6 +100,7 @@ struct DDIMountView: View {
         if !imagesReady { return L10n.t(.imagesNotDownloaded) }
         if !onWiFi { return L10n.t(.notOnWiFi) }
         if !tunnelUp {
+            if tunnelProbe == .localNetworkDenied { return L10n.t(.localNetworkDeniedDetail) }
             return vpnInstalled ? L10n.t(.vpnNotConnected) : L10n.t(.vpnNotInstalled)
         }
         return "something is missing"
@@ -117,7 +127,20 @@ struct DDIMountView: View {
 
     private func refreshVPNState() {
         vpnInstalled = LocalDevVPN.isInstalled
-        tunnelUp = LocalDevVPN.isTunnelUp()
+        // Up means a connection through the tunnel worked — not that some
+        // address looks right: another VPN can use the same range, and
+        // LocalDevVPN's addresses are configurable. One probe at a time; the
+        // timer fires faster than a failing probe returns.
+        if !probing {
+            probing = true
+            Task { @MainActor in
+                let result = await LocalDevVPN.probeTunnel()
+                tunnelProbe = result
+                interfacesSeen = LocalDevVPN.interfaceSummary()
+                tunnelUp = result == .reachable
+                probing = false
+            }
+        }
         // Read the current value on every refresh…
         onWiFi = NetworkTypeMonitor.shared.current == .wifi
     }
@@ -131,11 +154,17 @@ struct DDIMountView: View {
                     title: L10n.t(.startLocalDevVPN),
                     detail: tunnelUp
                         ? "\(L10n.t(.tunnelUpDetail)) (\(DDIMounter.tunnelAddress))"
-                        : vpnInstalled
-                          ? "\(L10n.t(.vpnInstalledDetail)) (\(DDIMounter.tunnelAddress))"
-                          : L10n.t(.vpnMissingDetail))
+                        : tunnelProbe == .localNetworkDenied
+                          ? L10n.t(.localNetworkDeniedDetail)
+                          : vpnInstalled
+                            ? "\(L10n.t(.vpnInstalledDetail)) (\(DDIMounter.tunnelAddress))"
+                            : L10n.t(.vpnMissingDetail))
 
-            if !tunnelUp {
+            if !tunnelUp, tunnelProbe == .localNetworkDenied {
+                actionButton(L10n.t(.openSettings)) {
+                    UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!)
+                }
+            } else if !tunnelUp {
                 actionButton(vpnInstalled ? L10n.t(.openVPNAndConnect) : L10n.t(.getVPNFromAppStore)) {
                     // enable? starts the tunnel and bounces back to us; the bare
                     // App Store link is the fallback when it isn't installed.
@@ -148,6 +177,10 @@ struct DDIMountView: View {
         } footer: {
             if tunnelUp {
                 Text(L10n.t(.tunnelDetectedFooter))
+            } else if case .unreachable? = tunnelProbe, vpnInstalled {
+                // Connected but still not found: show what is there, so a
+                // changed tunnel address is visible at a glance.
+                Text(L10n.t(.cannotStartVPNFooter) + "\n\n" + L10n.t(.interfacesSeen) + " " + interfacesSeen)
             } else {
                 Text(L10n.t(.cannotStartVPNFooter))
             }

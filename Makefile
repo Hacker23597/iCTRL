@@ -221,5 +221,8 @@ help:
 
 # The idevice xcframework is a 215MB release asset, not vendored (see
 # Scripts/fetch-idevice.sh). Fetch it on demand so a fresh clone builds.
+# Phony so the script runs every build: it is a no-op when the pinned version
+# is already there, and replaces an older copy after a version bump.
+.PHONY: Frameworks/IDevice.xcframework
 Frameworks/IDevice.xcframework:
 	@bash Scripts/fetch-idevice.sh

@@ -45,7 +45,7 @@ targets:
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "iCTRL needs local network access to serve the automation API."
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "iCTRL reaches this device's debug service through LocalDevVPN to mount the Developer Disk Image, and serves the automation API on your network."
         # LSApplicationQueriesSchemes can't be expressed as an INFOPLIST_KEY_
         # setting — Xcode only maps an allowlist of keys and drops this one
         # silently — so it lives in a real plist that gets merged in. Without it

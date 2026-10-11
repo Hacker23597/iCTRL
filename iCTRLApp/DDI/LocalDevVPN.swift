@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import UIKit
 
 /// Talking to LocalDevVPN, the app that makes this device's debug service
@@ -28,33 +29,84 @@ enum LocalDevVPN {
         UIApplication.shared.canOpenURL(probeURL)
     }
 
-    /// Whether the tunnel is actually up.
+    enum TunnelProbe: Equatable {
+        /// The device's own service answered through the tunnel.
+        case reachable
+        /// iOS refused the connection: Local Network access is off for iCTRL.
+        case localNetworkDenied
+        /// Nothing answered (tunnel down, or set to other addresses).
+        case unreachable(String)
+    }
+
+    /// Whether the tunnel actually works: a TCP connection to the service the
+    /// mount talks to.
     ///
-    /// Installed is not the same as connected, and this is the difference the
-    /// user cares about — a mount fails identically either way. There is no API
-    /// to ask another app's `NEVPNStatus`, so this looks for the address the
-    /// tunnel assigns: if 10.7.0.x is on a local interface, it's up.
-    static func isTunnelUp(targetAddress: String = DDIMounter.tunnelAddress) -> Bool {
-        // Compare on the /24 rather than the exact host: the device's own end of
-        // the tunnel is a neighbour of the target, not the target itself.
-        let prefix = targetAddress.split(separator: ".").prefix(3).joined(separator: ".") + "."
+    /// Not "is there a 10.7.0.x address": LocalDevVPN's addresses are
+    /// user-configurable, another VPN can use the same range, and another
+    /// app's tunnel interface is not always listed. A connection is exactly
+    /// what the mount needs, and it tells a Local Network denial apart from
+    /// "nothing there".
+    static func probeTunnel(timeout: TimeInterval = 1.5) async -> TunnelProbe {
+        let host = NWEndpoint.Host(DDIMounter.tunnelAddress)
+        guard let port = NWEndpoint.Port(rawValue: DDIMounter.tunnelPort) else { return .unreachable("bad port") }
+        let conn = NWConnection(host: host, port: port, using: .tcp)
+        let queue = DispatchQueue(label: "ictrl.tunnel.probe")
+        let result: TunnelProbe = await withCheckedContinuation { cont in
+            var done = false
+            func finish(_ r: TunnelProbe) {
+                guard !done else { return }
+                done = true
+                conn.cancel()
+                cont.resume(returning: r)
+            }
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    finish(.reachable)
+                case .waiting(let err), .failed(let err):
+                    if #available(iOS 14.2, *), conn.currentPath?.unsatisfiedReason == .localNetworkDenied {
+                        finish(.localNetworkDenied)
+                    } else if case .waiting = state {
+                        // Keep waiting: a refused connect retries until the timeout.
+                        _ = err
+                    } else {
+                        finish(.unreachable(err.localizedDescription))
+                    }
+                default:
+                    break
+                }
+            }
+            conn.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + timeout) {
+                if #available(iOS 14.2, *), conn.currentPath?.unsatisfiedReason == .localNetworkDenied {
+                    finish(.localNetworkDenied)
+                } else {
+                    finish(.unreachable("no answer in \(timeout)s"))
+                }
+            }
+        }
+        ictrlLog("Tunnel probe \(DDIMounter.tunnelAddress):\(DDIMounter.tunnelPort) → \(result); interfaces: \(interfaceSummary())")
+        return result
+    }
 
+    /// Every IPv4 address on an up interface, as "name address" — for the log
+    /// and the screen when the tunnel can't be found.
+    static func interfaceSummary() -> String {
         var head: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&head) == 0, let first = head else { return false }
+        guard getifaddrs(&head) == 0, let first = head else { return "unavailable" }
         defer { freeifaddrs(head) }
-
+        var out: [String] = []
         for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
             let flags = Int32(ptr.pointee.ifa_flags)
-            guard flags & IFF_UP != 0, let addr = ptr.pointee.ifa_addr else { continue }
-            guard addr.pointee.sa_family == UInt8(AF_INET) else { continue }
-
+            guard flags & IFF_UP != 0, let addr = ptr.pointee.ifa_addr,
+                  addr.pointee.sa_family == UInt8(AF_INET) else { continue }
             var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len),
-                              &host, socklen_t(host.count),
+            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count),
                               nil, 0, NI_NUMERICHOST) == 0 else { continue }
-            let ip = String(cString: host)
-            if ip == targetAddress || ip.hasPrefix(prefix) { return true }
+            let name = String(cString: ptr.pointee.ifa_name)
+            if name == "lo0" { continue }
+            out.append("\(name) \(String(cString: host))")
         }
-        return false
+        return out.isEmpty ? "none" : out.joined(separator: ", ")
     }
 }
