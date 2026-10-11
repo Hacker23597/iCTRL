@@ -58,14 +58,25 @@ build:
 ipa: build
 	@echo ""
 	@# === Runner IPA ===
-	@echo "🎨 Copying app icon to Runner..."
-	@# Copy main app's icon assets into Runner so it shows the same icon
-	@if [ -d "$(BUILD_DIR)/$(MAIN_APP)/Assets.car" ]; then \
-		cp "$(BUILD_DIR)/$(MAIN_APP)/Assets.car" "$(BUILD_DIR)/$(RUNNER_APP)/Assets.car"; \
-	fi
-	@# Also copy the AppIcon directly for iOS to pick up
-	@for f in $(BUILD_DIR)/$(MAIN_APP)/AppIcon*.png; do \
-		[ -f "$$f" ] && cp "$$f" "$(BUILD_DIR)/$(RUNNER_APP)/" || true; \
+	@echo "🎨 Adding the app icon to Runner..."
+	@# The XCTRunner template declares no icon (no CFBundleIcons, no
+	@# Assets.car), so iOS shows a placeholder. Ship plain PNGs and point at
+	@# them with CFBundleIconFiles only: a CFBundleIconName would send iOS to
+	@# an Assets.car the Runner doesn't have, and it would fall back to the
+	@# placeholder (notifications included). Icons: Scripts/make-runner-icons.py.
+	@set -e; \
+	APP="$(BUILD_DIR)/$(RUNNER_APP)"; PLIST="$$APP/Info.plist"; PB=/usr/libexec/PlistBuddy; \
+	rm -f "$$APP"/AppIcon*.png; \
+	cp Config/RunnerIcon/*.png "$$APP/"; \
+	$$PB -c "Delete :CFBundleIcons" "$$PLIST" 2>/dev/null || true; \
+	$$PB -c "Delete :CFBundleIcons~ipad" "$$PLIST" 2>/dev/null || true; \
+	$$PB -c "Add :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles array" "$$PLIST"; \
+	i=0; for n in AppIcon20x20 AppIcon29x29 AppIcon40x40 AppIcon60x60; do \
+		$$PB -c "Add :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:$$i string $$n" "$$PLIST"; i=$$((i+1)); \
+	done; \
+	$$PB -c "Add :CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles array" "$$PLIST"; \
+	i=0; for n in AppIcon20x20 AppIcon29x29 AppIcon40x40 AppIcon76x76 AppIcon83.5x83.5; do \
+		$$PB -c "Add :CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles:$$i string $$n" "$$PLIST"; i=$$((i+1)); \
 	done
 	@echo "🔧 Stripping XCTest frameworks from Runner..."
 	rm -rf "$(BUILD_DIR)/$(RUNNER_APP)/Frameworks/XCTAutomationSupport.framework"
