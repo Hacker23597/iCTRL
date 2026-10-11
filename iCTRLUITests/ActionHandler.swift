@@ -31,10 +31,6 @@ class ActionHandler {
     private let app: XCUIApplication
     private let fastHandler: FastActionHandler
 
-    /// Last app we brought to the foreground via launch_app/activate_app.
-    /// Used as a fallback for page_source when private-API detection fails.
-    private var lastForegroundBundleId: String?
-
     /// A resolvable element reference. Re-queries the LIVE tree each time it's
     /// used, so it stays valid across small layout changes (unlike a coordinate).
     struct ElementRef {
@@ -64,8 +60,14 @@ class ActionHandler {
         refCounter += 1
         let id = "el_\(refCounter)"
         refStore[id] = ref
+        // A button of a system alert: remember which alert. Alerts chain
+        // (e.g. tracking → notifications → location), share button labels,
+        // and a ref re-resolves by label — so it would press the NEXT
+        // alert's "Allow"/"Don't Allow". Checked before the tap.
+        if ref.bundleId == "com.apple.springboard", let title = alertTitle() { refAlertTitle[id] = title }
         return id
     }
+    private var refAlertTitle: [String: String] = [:]
 
     /// Drop expired refs (TTL) and enforce the count cap (oldest-first).
     private func pruneRefs() {
@@ -144,17 +146,14 @@ class ActionHandler {
     }
 
     private func elementQuery(in target: XCUIApplication, type: String?) -> XCUIElementQuery {
-        switch type?.lowercased() {
-        case "button":                  return target.buttons
-        case "textfield", "text_field": return target.textFields
-        case "textview", "text_view":   return target.textViews
-        case "label", "static_text":    return target.staticTexts
-        case "image":                   return target.images
-        case "cell":                    return target.cells
-        case "switch":                  return target.switches
-        case "icon":                    return target.icons
-        default:                        return target.descendants(matching: .any)
+        // Same names as the bounded walk's filter, so a live re-resolve
+        // counts ordinals over exactly the types the walk matched.
+        guard let raws = Self.typeFilterRaws(type), !raws.isEmpty else { return target.descendants(matching: .any) }
+        let types = raws.map { $0.uintValue }
+        if types.count == 1, let t = XCUIElement.ElementType(rawValue: types[0]) {
+            return target.descendants(matching: t)
         }
+        return target.descendants(matching: .any).matching(NSPredicate(format: "elementType IN %@", raws))
     }
 
     init(app: XCUIApplication) {
@@ -162,53 +161,99 @@ class ActionHandler {
         self.fastHandler = FastActionHandler(app: app)
     }
 
-    /// Resolve which app subsequent actions target.
+    /// The app actually in front, or nil if it can't be told.
     ///
-    /// Priority (per user design): the app we most recently OPENED via
-    /// launch_app/activate_app is the "sticky target" — element queries and taps
-    /// stay bound to it even if the user later switches to another app in the
-    /// foreground. Only when we've never opened an app do we fall back to the
-    /// live-detected foreground app. An explicit bundle_id on the call overrides
-    /// everything (handled by callers passing it through).
+    /// There is no "target app" any more: reads and actions follow the screen.
+    /// A sticky binding to the last launched app kept pointing at it after the
+    /// app jumped elsewhere or the user switched, and pulled it back in front
+    /// on the next tap — undoing exactly what had just happened on screen.
+    ///
+    /// Older iOS names the front app directly. iOS 27 doesn't (Xcode 27's
+    /// XCTest lost the pid → bundle id lookup), but still gives its pid: that
+    /// is matched against apps known to this runner by asking each whether it
+    /// is in front (testmanagerd answers in milliseconds), and cached by pid.
+    /// The last front app named, and when — for the static precheck.
+    private static var lastFront: (bid: String, at: TimeInterval)?
+
     private func resolveForegroundBundleId() -> String? {
-        // The binding is a PREFERENCE, not a fact. It used to win
-        // unconditionally, which meant that once the bound app was closed or
-        // switched away from, every read stayed pointed at it — reporting a
-        // stale bundle id from device_info, refusing page_source as
-        // "backgrounded", and in the worst case returning a tree belonging to
-        // an app that is no longer on screen. Reported in the wild: screenshots
-        // showed Minis while page_source served an Apple Store checkout tree.
-        //
-        // So the binding only holds while the app it names is actually usable.
-        if let bound = boundBundleId, !bound.isEmpty {
-            let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bound)) ?? .unknown
-            if state == .foreground || state == .unknown {
-                return bound
-            }
-            // Bound app is background/suspended/gone — defer to what is really
-            // in front, and drop the binding so it stops misleading later calls.
-            if let live = ForegroundApp.currentBundleID(), !live.isEmpty, live != bound {
-                // SpringBoard in front means an alert or the home screen over
-                // the app, not a new target: read it, but keep the binding so
-                // we snap back when the app returns. Rebinding to SpringBoard
-                // would stick for good — it reports foreground permanently.
-                if live == "com.apple.springboard" {
-                    iCTRLUITests.logBuffer.append(
-                        "🔀 bound app \(bound) is \(state) — SpringBoard is in front (alert/home), reading it")
-                    return live
-                }
-                iCTRLUITests.logBuffer.append(
-                    "🔀 bound app \(bound) is \(state) — following live foreground \(live)")
-                boundBundleId = live
-                return live
-            }
-            return bound
+        let bid = resolveForegroundBundleIdUncached()
+        if let bid = bid { Self.lastFront = (bid, nowMonotonic) }
+        return bid
+    }
+
+    private func resolveForegroundBundleIdUncached() -> String? {
+        // On iOS 27 currentBundleID is always nil, and asking still costs
+        // a few hundred ms — paid several times per call. After a few nils
+        // in a row, stop asking.
+        if currentBundleIDMisses < 3 {
+            if let bid = ForegroundApp.currentBundleID(), !bid.isEmpty { currentBundleIDMisses = 0; return bid }
+            currentBundleIDMisses += 1
         }
-        // Never opened anything explicitly — use the live foreground app.
-        if let bid = ForegroundApp.currentBundleID(), !bid.isEmpty {
-            return bid
+        let pid = ForegroundApp.frontmostPID()
+        guard pid > 0 else { return nil }
+        let springboard = "com.apple.springboard"
+        if springboardPID == 0 { springboardPID = ForegroundApp.processID(forBundleID: springboard) }
+        if pid == springboardPID { return springboard }
+        // A pid names one process for its whole life, so a learned mapping
+        // needs no re-check. Re-checking asked XCTest for the app's state,
+        // which can block for seconds, on every call that names the front
+        // app (several per screen_text — most of the call's time).
+        if let cached = frontByPID[pid] { return cached }
+        var candidates: [String] = recentApps
+        for e in AppMemory.shared.openedApps().prefix(12) {
+            if let b = e["bundle_id"] as? String, !candidates.contains(b) { candidates.append(b) }
         }
-        return lastForegroundBundleId
+        // Apps the user or a link opened never pass through launch_app; the
+        // usual system ones are worth a probe each before giving up.
+        for b in Self.commonSystemApps where !candidates.contains(b) { candidates.append(b) }
+        for b in candidates.prefix(30) where b != springboard {
+            if AppState(rawValue: ForegroundApp.appState(forBundleID: b)) == .foreground {
+                frontByPID[pid] = b
+                return b
+            }
+        }
+        // Opened before a runner restart, or by a link: not among the 12
+        // most recent, and reads would otherwise fall back to SpringBoard's
+        // tree with no warning. iOS 26+ won't list installed apps, so ask
+        // every app this runner ever opened, then the built-in catalog. The
+        // answer is cached by pid: paid once per process.
+        let t0 = nowMonotonic
+        var tried = Set(candidates.prefix(30))
+        var more: [String] = AppMemory.shared.openedApps().compactMap { $0["bundle_id"] as? String }
+        more += Self.builtInApps.compactMap { $0["bundle_id"] }
+        for b in more where b != springboard && tried.insert(b).inserted {
+            if AppState(rawValue: ForegroundApp.appState(forBundleID: b)) == .foreground {
+                frontByPID[pid] = b
+                iCTRLUITests.logBuffer.append(String(format: "🔍 front app %@ found by asking known apps (%.0fms)",
+                                                     b, (nowMonotonic - t0) * 1000))
+                return b
+            }
+        }
+        iCTRLUITests.logBuffer.append(String(format: "🔍 front pid %d matched no known app (%.0fms)",
+                                             pid, (nowMonotonic - t0) * 1000))
+        return nil
+    }
+
+    private static let commonSystemApps = [
+        "com.apple.AppStore", "com.apple.mobilesafari", "com.apple.Preferences", "com.apple.mobileslideshow",
+        "com.apple.camera", "com.apple.Maps", "com.apple.MobileSMS", "com.apple.mobilephone",
+        "com.apple.mobilemail", "com.apple.weather", "com.apple.mobilecal", "com.apple.mobilenotes",
+        "com.apple.Music", "com.apple.podcasts", "com.apple.DocumentsApp", "com.apple.Health",
+        "com.apple.reminders", "com.apple.shortcuts", "com.apple.mobiletimer", "com.apple.TestFlight",
+    ]
+
+    private var currentBundleIDMisses = 0
+
+    /// Front-app pid → bundle id, learned by resolveForegroundBundleId.
+    private var frontByPID: [pid_t: String] = [:]
+    private var springboardPID: pid_t = 0
+    /// Apps opened through this runner, most recent first — the first
+    /// candidates when naming the front app by pid.
+    private var recentApps: [String] = []
+    private func noteOpened(_ bundleId: String) {
+        recentApps.removeAll { $0 == bundleId }
+        recentApps.insert(bundleId, at: 0)
+        if recentApps.count > 8 { recentApps.removeLast() }
     }
 
     /// Browsers render their page into a web view that XCUITest does not walk:
@@ -250,10 +295,6 @@ class ActionHandler {
         "they cannot help here. Next: call screenshot, read the target's position off the image, convert " +
         "pixel→point by dividing by the `scale` field in that same screenshot response, then tap{x,y}."
 
-    /// The sticky target app: the last one opened via launch_app/activate_app.
-    /// nil until the caller opens an app, after which every action binds here
-    /// unless the call passes an explicit bundle_id.
-    private var boundBundleId: String?
 
     // MARK: - Screen Geometry (for progressive disclosure)
 
@@ -340,22 +381,11 @@ class ActionHandler {
         ])
     }
 
-    /// Methods that operate on the on-screen UI. Before running any of these we
-    /// make sure the sticky target app (from launch_app/activate_app) is actually
-    /// in the foreground — so a coordinate tap / element query lands on it even if
-    /// the user drifted to another app. No-op when nothing is bound or the target
-    /// is already foreground.
-    // Methods that we re-focus the bound app for before running. Only INTERACTIONS
-    // are here. Deliberately EXCLUDED:
-    //  - 'type' — re-activating dismisses the keyboard / drops focus.
-    //  - 'page_source'/'screenshot'/'find_element' — READ-ONLY. WDA doesn't
-    //    activate the app to read its source; it just resolves the active app and
-    //    snapshots. Activating here triggers a foreground transition/animation that
-    //    the snapshot then blocks on (observed 13-16s snapshot hangs). Reads use the
-    //    resolved target app WITHOUT forcing it forward.
+    /// Interactions refused while a system alert covers the app, unless aimed
+    /// by raw coordinates (see systemAlertBlocks).
     private static let uiActionMethods: Set<String> = [
         "tap", "double_tap", "long_press", "swipe", "scroll", "drag",
-        "page", "page_down", "page_up",
+        "page", "page_down", "page_up", "collect",
         "scroll_to_element", "scroll_to", "tap_element",
     ]
 
@@ -365,110 +395,611 @@ class ActionHandler {
         case background = 3, foreground = 4
     }
 
-    /// Prepare the target app for a UI action, mirroring WebDriverAgent's
-    /// `activeApplication` logic but returning an AI-friendly diagnostic instead
-    /// of silently doing the wrong thing:
-    ///   - if a SYSTEM ALERT is up, stop and tell the caller to handle it first;
-    ///   - if the bound app has CRASHED/EXITED, stop and tell the caller to relaunch;
-    ///   - if it's merely backgrounded, bring it forward (bounded, exception-safe);
-    ///   - if it's already frontmost (or was just launched), no-op.
-    /// Returns an error to abort the action, or nil to proceed. `note` (if set) is
-    /// attached to the successful response so the model learns what happened.
-    private func ensureBoundAppForeground(allowOverAlert: Bool = false,
-                                          refBased: Bool = false) -> (error: JSONRPCError?, note: String?) {
-        // A system alert (permission prompt, etc.) sits above the app. A ref/
-        // element interaction on the bound app underneath would misfire, so we
-        // surface guidance — BUT a raw coordinate tap can legitimately target the
-        // alert's own button, so allowOverAlert lets those through.
-        if !allowOverAlert, ForegroundApp.hasSystemAlert() {
-            return (JSONRPCError(code: -32000, message:
-                "A system alert/permission dialog is currently on screen, covering the app. To tap ITS buttons, " +
-                "use raw coordinates: page_source{bundle_id:\"com.apple.springboard\"} to read the alert's button " +
-                "frames, then tap{x,y} (coordinate taps are allowed to hit the alert). Ref/element actions on the " +
-                "app underneath won't work until the alert is dismissed.", data: nil), nil)
-        }
+    /// A system alert (permission prompt, etc.) sits above the app. A ref or
+    /// element interaction on the app underneath would misfire, so it is
+    /// refused with guidance; a raw coordinate touch may be aimed at the
+    /// alert's own button, so those go through.
+    static let systemAlertHint = "A system alert (permission, network, sign-in…) is on screen over the app. " +
+        "Answer it first: find_element{element_id:\"<button text>\", bundle_id:\"com.apple.springboard\"} → " +
+        "tap{ref} (or tap a button's center; a coordinate tap off its buttons is refused). Ref actions on the " +
+        "app underneath are refused until it is gone."
 
-        guard let bound = boundBundleId, !bound.isEmpty else { return (nil, nil) }
-
-        // Just opened/activated it — skip the (possibly slow) re-check; the app is
-        // already coming to the front. Avoids a redundant ~3-5s activate right
-        // after launch_app.
-        if nowMonotonic - lastBoundActivateAt < 4.0 { return (nil, nil) }
-
-        // If it's already frontmost, nothing to do.
-        if ForegroundApp.currentBundleID() == bound { return (nil, nil) }
-
-        // Check the bound app's actual state before touching it. (WDA throws
-        // FBApplicationCrashedException here; we return a clear, recoverable error.)
-        let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bound)) ?? .unknown
-        switch state {
-        case .notRunning:
-            // The bound app exited (closed or reclaimed). Don't dead-end every
-            // later action on "you must relaunch it": clear the binding so we fall
-            // back to the live foreground app (global mode), and let THIS action
-            // proceed against whatever is now frontmost. We deliberately do NOT
-            // auto-relaunch — that would be a fresh cold start with lost context,
-            // silently doing the wrong thing. Re-bind explicitly with launch_app
-            // if/when the caller wants that app again.
-            boundBundleId = nil
-            lastBoundActivateAt = 0
-            return (nil, "The previously bound app '\(bound)' had exited, so it was unbound; " +
-                "actions now target the live foreground app. Re-open it with " +
-                "launch_app{bundle_id:\"\(bound)\"} to bind to it again.")
-        case .background where refBased, .backgroundSuspended where refBased:
-            // A ref names an element in THAT app, so pulling the app back is
-            // tempting — but activate() is the XCTest call that hangs (it waits
-            // for the app to go idle), and the 3s bound below only stops us
-            // waiting, not the call. On App Store that combination held the UI
-            // queue for 97.9s. The app may also have left on purpose (a system
-            // sign-in sheet). Leave it; resolveRef refuses at once and says why.
-            return (nil, nil)
-        case .background, .backgroundSuspended, .unknown:
-            // Bring it forward — exception-safe, bounded.
-            _ = runWithTimeout(seconds: 3, label: "activate") {
-                _ = ForegroundApp.safeActivateBundleID(bound)
-            }
-            lastBoundActivateAt = nowMonotonic
-            usleep(300_000)  // let the switch settle
-            return (nil, "Re-focused '\(bound)' (it had gone to the background) before this action.")
-        case .foreground:
-            return (nil, nil)
-        }
+    private func systemAlertBlocks() -> JSONRPCError? {
+        guard systemAlertUp() else { return nil }
+        // Name it and its buttons: alerts pop up on their own (a permission
+        // asked a few seconds after launch) and the caller otherwise spends a
+        // read just to learn what to tap.
+        let buttons = alertButtons().map { $0.label }.filter { !$0.isEmpty }
+        let what = (alertTitle().map { " (\"\($0)\")" } ?? "") +
+            (buttons.isEmpty ? "" : ", buttons: " + buttons.map { "'\($0)'" }.joined(separator: ", "))
+        return JSONRPCError(code: -32000, message:
+            "A system alert/permission dialog\(what) is on screen, covering the app. Answer it first: " +
+            "find_element{element_id:\"<button text>\", bundle_id:\"com.apple.springboard\"} → tap{ref}, or tap " +
+            "one of its buttons' centers. Ref/element actions on the app underneath won't work until it is gone.", data: nil)
     }
-
-    /// Monotonic time of the last activate of the bound app (launch/activate or a
-    /// foreground-enforcement). Used to skip redundant re-activations.
-    private var lastBoundActivateAt: TimeInterval = 0
 
     func dispatch(method: String, params: [String: JSONValue]?) -> ([String: JSONValue]?, JSONRPCError?) {
         let cmd = ActionCommand(method: method, params: params)
+        readFrame = nil
+        if let t = cmd.elementType, let raws = Self.typeFilterRaws(t), raws.isEmpty {
+            return (nil, JSONRPCError(code: -32602, message:
+                "Unknown element_type '\(t)'. Use a type name as page_source prints it — e.g. Button, StaticText, " +
+                "TextField (also matches SearchField/SecureTextField), SearchField, Cell, Image, Switch, Link, " +
+                "TextView — or leave element_type out.", data: nil))
+        }
+        fastHandler.lastTouchPoint = nil
+        tapTargetFrame = nil
+        pageKeyboardTop = nil
 
-        // Keep the sticky target app in front for UI actions — unless the caller
-        // passed an explicit bundle_id for this call (they want that app instead).
-        var foregroundNote: String? = nil
         if Self.uiActionMethods.contains(method), cmd.bundleId == nil {
-            // A raw coordinate tap/swipe (x,y given) synthesizes a touch at that
-            // exact screen point regardless of which layer owns it — so it CAN hit
-            // a system alert's button. Don't block those on an alert; only block
-            // ref/element interactions on the bound app (those act on the app
-            // underneath and would misfire while an alert covers it).
-            let hasCoords = cmd.x != nil && cmd.y != nil
-            let hasCoordPair = cmd.fromX != nil && cmd.fromY != nil
-            let coordinateBased = hasCoords || hasCoordPair
-            let refBased = cmd.ref != nil || cmd.fromRef != nil || cmd.toRef != nil
-            let prep = ensureBoundAppForeground(allowOverAlert: coordinateBased, refBased: refBased)
-            if let err = prep.error { return (nil, err) }   // alert up / app crashed → abort with guidance
-            foregroundNote = prep.note
+            let coordinateBased = (cmd.x != nil && cmd.y != nil) || (cmd.fromX != nil && cmd.fromY != nil)
+            // A ref into SpringBoard is the alert's own button (find_element
+            // with bundle_id springboard hands those out): refusing it "because
+            // an alert is up" made the alert impossible to answer by ref.
+            let targetsSystem = cmd.ref.flatMap { refStore[$0]?.bundleId } == "com.apple.springboard"
+            if !coordinateBased, !targetsSystem, let err = systemAlertBlocks() { return (nil, err) }
+            if targetsSystem, let r = cmd.ref, let was = refAlertTitle[r], let now = alertTitle(), now != was {
+                return (nil, JSONRPCError(code: -32602, message:
+                    "The alert changed since \(r) was found: it was \"\(was)\", now it is \"\(now)\". Not tapped — the " +
+                    "same button label on the new alert may mean something else. Read the new alert and find its button again.",
+                    data: nil))
+            }
         }
 
-        let result = dispatchInner(method: method, cmd: cmd)
-        // Surface the re-focus note so the model learns the app had drifted.
-        if let note = foregroundNote, var data = result.0 {
-            data["app_note"] = .string(note)
-            return (data, result.1)
+        // A drag on an anti-bot slider is an attempt to solve it: refused.
+        if ["swipe", "drag", "scroll"].contains(method), let c = lastChallenge, nowMonotonic - c.at < 120,
+           c.bid == resolveForegroundBundleId() {
+            let start = cmd.fromX.flatMap { x in cmd.fromY.map { CGPoint(x: x, y: $0) } }
+                ?? cmd.x.flatMap { x in cmd.y.map { CGPoint(x: x, y: $0) } }
+                ?? CGPoint(x: pointSize.width / 2, y: pointSize.height / 2)
+            if c.area.contains(start) {
+                iCTRLUITests.logBuffer.append("🛑 \(method) refused: it starts on an anti-bot check")
+                return (nil, JSONRPCError(code: -32602, message:
+                    "Not done: this \(method) starts on the anti-bot check read moments ago (slider / puzzle). iCTRL " +
+                    "doesn't solve verification. Close it (its 关闭 / ×), back out, or stop and report the step as blocked " +
+                    "by verification.", data: nil))
+            }
+        }
+
+        // Settle check: a frame before the action, then watch until the
+        // screen stops reacting, so the caller can read right away instead of
+        // sleeping a guessed delay. On by default — callers that most need it
+        // are the ones that never pass options.
+        let dispatchStart = nowMonotonic
+        let settleOn = Self.settleMethods.contains(method) && cmd.settle != false
+        // Aimed by coordinates or at the focused field: it lands on whatever is
+        // there now, which may not be what the caller last saw.
+        let blind = Self.blindActionMethods.contains(method)
+            && cmd.ref == nil && cmd.fromRef == nil && cmd.toRef == nil
+            && (method == "type" || method == "clear_text" || (cmd.x != nil && cmd.y != nil) || cmd.fromX != nil)
+        // A tap keeps the pre-action capture: if the coarse frames say nothing
+        // changed, the area around where the finger landed (known only after
+        // a ref resolves) gets one fine look.
+        var imageBefore: UIImage?
+        let baseline: ScreenSettle.Frame?
+        if settleOn, Self.pointTapMethods.contains(method), let img = iCTRLUITests.captureFrame() {
+            baseline = ScreenSettle.frame(from: img)
+            imageBefore = img
+        } else {
+            baseline = (settleOn || (blind && lastSeen != nil)) ? ScreenSettle.sample() : nil
+        }
+        // A deep link is meant to switch apps and names where it landed; while
+        // an app launches each of these process queries costs a noticeable delay.
+        let pidBefore = settleOn && !Self.switchingMethods.contains(method) ? ForegroundApp.frontmostPID() : 0
+        // An alert puts SpringBoard's pid in front; answering it hands the
+        // front back to the app — that's not the action switching apps.
+        let alertBefore = pidBefore > 0 && systemAlertUp()
+        let pageCheck = blind ? samePageCheck(before: baseline, typing: method == "type" || method == "clear_text") : nil
+
+        readLaps = []
+        var result = dispatchInner(method: method, cmd: cmd)
+        if !readLaps.isEmpty { iCTRLUITests.logBuffer.append("🐢 \(method) slow parts: " + readLaps.joined(separator: " ")) }
+
+        if settleOn, result.1 == nil, var data = result.0 {
+            // Stay well inside the 6s call limit: a long type or a slow drag
+            // leaves less room, and too little room means no check at all.
+            let room = Self.settleCallBudget - (nowMonotonic - dispatchStart)
+            // A learned slow app gets the room its learned windows need.
+            let learnedNeed = resolveForegroundBundleId().map {
+                max(lateReactQuiet[$0] ?? 0, (lateLoaderWatch[$0] ?? 0) + 0.6) + 0.3
+            } ?? 0
+            let budget = min(max(cmd.settleTimeout ?? max(Self.settleDefaultTimeout, learnedNeed), 0),
+                             Self.settleMaxTimeout, room)
+            iCTRLUITests.logBuffer.append(String(format: "🧘 settle %@ start: budget %.0fms, call at %.0fms",
+                                                 method, budget * 1000, (nowMonotonic - dispatchStart) * 1000))
+            if budget >= 0.3 {
+                // A tap aimed at a control should make something happen, and
+                // some apps start late: give those the longer quiet window.
+                let hitControl: Bool = {
+                    if method == "tap_element" || method == "find_and_tap" { return true }
+                    if ["tap", "double_tap", "long_press"].contains(method) {
+                        if cmd.ref != nil { return true }
+                        if case .object? = data["hit"] { return true }
+                    }
+                    return false
+                }()
+                let settleBid = resolveForegroundBundleId()
+                let baseQuiet = hitControl ? ScreenSettle.quietWindowForControls : ScreenSettle.quietWindow
+                // What moved between the caller's last look and the moment
+                // before this action is the screen's own animation.
+                let ambientOnly: [Bool]? = {
+                    guard let seen = lastSeen, let base = baseline, nowMonotonic - seen.at < 15 else { return nil }
+                    let m = ScreenSettle.changedCells(seen.frame, base)
+                    let share = Double(m.filter { $0 }.count) / Double(m.count)
+                    // Small only: carousels and rotating placeholders are. A
+                    // dialog that animated in after the last read is bigger,
+                    // and masking it would hide its own dismissal (a consent tap
+                    // that moved the app on would read as "no change").
+                    return share > 0 && share < 0.1 ? m : nil
+                }()
+                // A Picture-in-Picture video floats over every app and changes
+                // every frame: unmasked, every no-op tap would read "changed".
+                // Its window is SpringBoard's.
+                let ambient: [Bool]? = {
+                    guard let pip = pipWindowFrame() else { return ambientOnly }
+                    let m = ScreenSettle.cells(covering: [pip.insetBy(dx: -4, dy: -4)], screen: pointSize.size)
+                    guard let a = ambientOnly else { return m }
+                    return zip(a, m).map { $0 || $1 }
+                }()
+                var s = ScreenSettle.wait(baseline: baseline, budget: budget,
+                                          quiet: max(baseQuiet, settleBid.flatMap { lateReactQuiet[$0] } ?? 0),
+                                          focus: fastHandler.lastTouchPoint, screen: pointSize.size,
+                                          newScreenWatch: settleBid.flatMap { lateLoaderWatch[$0] } ?? ScreenSettle.newScreenWatch,
+                                          ignore: ambient)
+                // The coarse grid saw nothing: one fine look around the tap
+                // (~0.1s, only on this path).
+                if s.stable, s.changed == false, let p = fastHandler.lastTouchPoint, let shot = imageBefore,
+                   case let area = fineLookArea(point: p, element: tapTargetFrame),
+                   let before = ScreenSettle.patch(from: shot, in: area, screen: pointSize.size),
+                   let img = iCTRLUITests.captureFrame(),
+                   let after = ScreenSettle.patch(from: img, in: area, screen: pointSize.size),
+                   ScreenSettle.patchChanged(before, after) {
+                    s.changed = true
+                    s.nearTap = true
+                    s.last = ScreenSettle.frame(from: img) ?? s.last
+                    iCTRLUITests.logBuffer.append("🔬 settle: small change near the tap (fine look)")
+                }
+                imageBefore = nil
+                // Watched too briefly to settle and nothing moved yet: that is
+                // "don't know", not "no change" — a slow ref tap can leave about a
+                // second to watch, and the screen may still navigate after it.
+                let unknown = !s.stable && s.changed == false
+                if unknown { s.changed = nil }
+                // A new page or a launching app is when permission alerts
+                // come — often 1–4s later, after this call returned. Look
+                // for one on every call for a few seconds.
+                if s.newScreen { alertWatchUntil = nowMonotonic + Self.alertWatchSeconds }
+                if let last = s.last {
+                    noteSeen(last)
+                    // The home screen isn't a page that loads; paging its icons
+                    // read as "late content" and taught a wrong watch.
+                    if s.stable, s.changed == true, let bid = settleBid, bid != "com.apple.springboard" {
+                        lastSettle = (bid, last, nowMonotonic)
+                    }
+                    lastNoChange = nil
+                    if s.stable, s.changed == false, let bid = settleBid, bid != "com.apple.springboard" {
+                        lastNoChange = (bid, last, nowMonotonic, baseQuiet)
+                    }
+                }
+                // "Nothing labelled there" is moot once the screen reacted: an
+                // unlabelled back button or list row was hit, and the warning
+                // would send callers to re-check a tap that worked.
+                if s.changed == true { data["hit_warning"] = nil }
+                // A scroll's `moved` comes from a capped tree fingerprint; a big
+                // container (a calendar's 60+ day cells) can be cut off so the
+                // fingerprint looks unchanged while the screen visibly scrolled
+                // (reporting moved:false, at_end:true mid-list). The pixels win.
+                // With a keyboard up before the action, the pixels can't
+                // tell: closing it moves the screen (and the search field with
+                // it) without scrolling anything. The tree comparison decides.
+                let keyboardWasUp = pageKeyboardTop != nil
+                // The content, not just anything, must have changed: at the
+                // end of a feed a rotating search placeholder and a playing
+                // video card would otherwise read as "moved" page after page.
+                let contentScrolled = s.changed == true && {
+                    guard let b = baseline, let l = s.last else { return true }
+                    return ScreenSettle.contentDiff(b, l) >= ScreenSettle.scrolledShare
+                }()
+                if contentScrolled, !keyboardWasUp, case .bool(false)? = data["moved"] {
+                    data["moved"] = .bool(true)
+                    data["at_end"] = nil
+                    data["moved_by"] = .string("screen")
+                    data["hint"] = nil   // scrollOutcome's "did not change — at the end"
+                }
+                if s.changed == true, keyboardWasUp, case .bool(false)? = data["moved"] {
+                    data["keyboard_closed"] = .bool(true)
+                    data["at_end"] = nil
+                    data["hint"] = .string("Only the keyboard closed; the content did not scroll. Page again to scroll it.")
+                }
+                // Nothing on screen moved, so nothing scrolled — whatever the
+                // tree says (a label that changes on its own, a lazy list).
+                if s.stable, s.changed == false, case .bool(true)? = data["moved"] {
+                    data["moved"] = .bool(false)
+                    data["at_end"] = .bool(true)
+                    data["moved_by"] = .string("screen")
+                    data["hint"] = .string("The content did not move — you are most likely at the end in this " +
+                        "direction (or the page can't scroll). If it was still loading, read again before concluding that.")
+                }
+                // "At the end" is wrong when a login wall or dialog covers the
+                // page: the list behind it can't scroll, so every page would
+                // report the end.
+                if method.hasPrefix("page"), case .bool(true)? = data["at_end"], let cover = coveringLayer() {
+                    data["at_end"] = nil
+                    data["covered"] = .bool(true)
+                    data["hint"] = .string("Nothing scrolled because \(cover) covers the page — this is not the end of " +
+                        "the content. Close it (or log in, if the task allows) and page again.")
+                }
+                data["settle"] = s.json
+                iCTRLUITests.logBuffer.append("🧘 settle \(method) stable=\(s.stable) changed=\(s.changed.map(String.init) ?? "?") " +
+                                              "\(s.waitedMs)ms/\(s.samples) frames last=\(String(format: "%.1f", s.lastDiff * 100))% " +
+                                              "first=\(s.firstChangeMs.map { "\($0)ms" } ?? "-")")
+                // Said in `hint`, which callers already read: whether they can
+                // read now or should look again. Prepended, so it comes first.
+                let settleHint: String
+                if unknown {
+                    settleHint = "The action left only \(s.waitedMs)ms to watch the screen and nothing had changed " +
+                        "yet — it may still react. Read before deciding it missed, and don't repeat it blindly."
+                } else if !s.stable, budget < 1.2 {
+                    // The action itself (several drags) used most of the call:
+                    // too short a look to say it is still moving (a multi-screen page
+                    // can read "still changing" while the next read is already final).
+                    settleHint = "The action left only \(s.waitedMs)ms to watch the screen, too short to confirm it " +
+                        "settled. Read it now; it is usually final."
+                } else if !s.stable {
+                    settleHint = "Screen still changing after \(s.waitedMs)ms (long transition, loading or animation): " +
+                        "read it now; if it shows the old or a loading screen, read again."
+                } else if s.changed == false {
+                    // Some apps start reacting only after ~1s (e.g. a sheet that opens
+                    // late), past the quiet window — so "no change" can be "not
+                    // yet". One more read tells them apart; a repeat may not.
+                    settleHint = "No visible change within \(s.waitedMs)ms. Some apps react late: read once more " +
+                        "before concluding the action missed — and before repeating it."
+                } else if s.nearTap {
+                    settleHint = "Screen has settled — only a small change near the tap point (a checkmark, a " +
+                        "counter, a toggle): the tap registered. Read it now; don't repeat it."
+                } else if s.motion {
+                    settleHint = "Screen has settled around continuous motion (a video playing) — read it now; " +
+                        "the moving area will keep changing."
+                } else {
+                    settleHint = "Screen has settled — read it now; no need to wait."
+                }
+                if case .string(let old)? = data["hint"] {
+                    data["hint"] = .string(settleHint + " " + old)
+                } else {
+                    data["hint"] = .string(settleHint)
+                }
+                // A permission or system alert raised by this action sits in
+                // SpringBoard, so a plain read of the app doesn't show it and
+                // the next ref action is refused. Say so now. Only checked
+                // when the screen changed: an alert can't appear unseen.
+                if s.changed == true, systemAlertUp(precise: true) { flagAlert(&data) }
+                result = (data, nil)
+            }
+        }
+        // The action took the caller to another app (a banner, a deep link,
+        // a "turn on notifications" button opening Settings): say so, or the
+        // next calls act on an app they don't know is in front.
+        if settleOn, pidBefore > 0, !alertBefore, var data = result.0 {
+            let pidAfter = ForegroundApp.frontmostPID()
+            if pidAfter > 0, pidAfter != pidBefore, pidAfter != springboardPID || !systemAlertUp() {
+                let now = resolveForegroundBundleId() ?? "another app"
+                data["app_switched_to"] = .string(now)
+                let old: String
+                if case .string(let h)? = data["hint"] { old = " " + h } else { old = "" }
+                data["hint"] = .string("This action switched apps: \(now) is in front now (a link, banner or button " +
+                    "opened it). Read before going on; activate_app returns to the previous app." + old)
+                result = (data, result.1)
+            }
+        }
+
+        // After the settle hint, so this one — the more important — reads first.
+        if let check = pageCheck, var data = result.0 {
+            data["page_check"] = check.json
+            if !check.same {
+                let hint = "Heads-up: this acted on a screen that differs from what you last saw (" + check.why +
+                    "). Check the result before going on, and correct course if it hit the wrong thing."
+                if case .string(let old)? = data["hint"] { data["hint"] = .string(hint + " " + old) }
+                else { data["hint"] = .string(hint) }
+            }
+            result = (data, result.1)
+        }
+
+        // A read of the app doesn't show a system alert over it (the alert
+        // lives in SpringBoard), and callers then act on a screen they can't
+        // see. Say it's there.
+        if Self.alertCheckedReads.contains(method), cmd.bundleId != "com.apple.springboard",
+           result.1 == nil, var data = result.0, timedAlertCheck() {
+            flagAlert(&data)
+            result = (data, nil)
+        }
+
+        // "No visible change", yet the next read shows one: this app reacts
+        // late (a sheet, an error page or an alert ~1s after the tap).
+        // Lengthen its quiet window, and tell the reader the last action
+        // did take effect.
+        if Self.seenOnRead.contains(method), result.1 == nil, var data = result.0,
+           let quiet = lastNoChange, nowMonotonic - quiet.at < 10,
+           let frame = readFrame ?? ScreenSettle.sample(),
+           quiet.bid == resolveForegroundBundleId(),
+           ScreenSettle.diff(quiet.frame, frame) >= 0.1 {
+            let learned = min(2.5, max(lateReactQuiet[quiet.bid] ?? quiet.base, quiet.base) + 0.5)
+            lateReactQuiet[quiet.bid] = learned
+            lastNoChange = nil
+            iCTRLUITests.logBuffer.append("🐢 \(quiet.bid) reacts late — quiet window now \(learned)s")
+            let old: String
+            if case .string(let h)? = data["hint"] { old = " " + h } else { old = "" }
+            data["hint"] = .string("The screen changed after your last action reported \"no visible change\" — it " +
+                "did take effect, just late. Don't repeat it. iCTRL now waits longer for this app's reactions." + old)
+            result = (data, nil)
+        }
+
+        // The screen moved on after settle called it stable: this app draws
+        // a skeleton or spinner first and its content arrives late (taps
+        // settle on grey placeholders). Watch its new screens longer from
+        // now on, and tell this reader to look again.
+        if Self.seenOnRead.contains(method), result.1 == nil, var data = result.0,
+           let settled = lastSettle, nowMonotonic - settled.at < 10,
+           let frame = readFrame ?? ScreenSettle.sample(),
+           settled.bid == resolveForegroundBundleId(),
+           ScreenSettle.diff(settled.frame, frame) >= 0.25 {
+            let watch = min(2.0, (lateLoaderWatch[settled.bid] ?? ScreenSettle.newScreenWatch) + 0.5)
+            lateLoaderWatch[settled.bid] = watch
+            lastSettle = nil
+            iCTRLUITests.logBuffer.append("📈 \(settled.bid) loads late — new-screen watch now \(watch)s")
+            let old: String
+            if case .string(let h)? = data["hint"] { old = " " + h } else { old = "" }
+            data["hint"] = .string("This screen kept changing after the last action reported it settled (content " +
+                "loading late); this read is newer than that verdict. iCTRL now waits longer on this app's new screens." + old)
+            result = (data, nil)
+        }
+
+        // Reads show the caller the screen: remember what it looked like —
+        // from the read's own capture when it took one.
+        if Self.seenOnRead.contains(method), result.1 == nil, let frame = readFrame ?? ScreenSettle.sample() {
+            noteSeen(frame)
         }
         return result
     }
+
+    /// Set by a read that captured the screen anyway (screenshot, OCR), so
+    /// recording what the caller saw costs no second capture.
+    private var readFrame: ScreenSettle.Frame?
+    /// The last settled navigation, to notice an app whose content lands
+    /// after settle said stable.
+    private var lastSettle: (bid: String, frame: ScreenSettle.Frame, at: TimeInterval)?
+    /// Per app, how long to keep watching a new screen (learned, ≤2s).
+    private var lateLoaderWatch: [String: Double] = [:]
+    /// The last action settle saw no change for, and the quiet window it had.
+    private var lastNoChange: (bid: String, frame: ScreenSettle.Frame, at: TimeInterval, base: Double)?
+    /// Per app, a learned (longer) quiet window for late reactions, ≤2.5s.
+    private var lateReactQuiet: [String: Double] = [:]
+
+    // MARK: - "Is this still the page the caller saw?"
+
+    /// The screen as the caller last saw it: at their last read, or as the
+    /// last action left it. Compared before a blind action so the reply can
+    /// say the screen had changed underneath — not to refuse anything.
+    private var lastSeen: (frame: ScreenSettle.Frame, pid: pid_t, at: TimeInterval)?
+    private static let seenOnRead: Set<String> = ["page_source", "screen_text", "screenshot", "collect"]
+    private static let alertCheckedReads: Set<String> = ["page_source", "screen_text", "find_element", "collect"]
+
+    /// Whether a system alert is up. A system alert puts SpringBoard's
+    /// pid in front, so that cheap check gates the real one — a walk of
+    /// SpringBoard that can take seconds on a busy phone, and would
+    /// otherwise be paid on every read and changed-screen action.
+    /// The buttons of the system alert on screen, from a capped SpringBoard walk.
+    private func alertButtons() -> [(label: String, frame: CGRect)] {
+        guard let root = ForegroundApp.boundedSnapshot(forBundleID: "com.apple.springboard",
+                                                       maxDepth: Self.defaultMaxDepth, maxChildren: 50) else { return [] }
+        var n = 0
+        var t: ObjCBool = false
+        guard let body = ForegroundApp.renderBoundedSnapshot(
+                root, maxDepth: Self.defaultMaxDepth, maxElements: 600,
+                visibleRect: CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height),
+                nodesWritten: &n, truncated: &t) else { return [] }
+        var out: [(String, CGRect)] = []
+        var alertIndent: Int?
+        for line in body.split(separator: "\n") {
+            let indent = line.prefix { $0 == " " }.count
+            let text = line.dropFirst(indent)
+            if let ai = alertIndent, indent <= ai { alertIndent = nil }
+            if text.hasPrefix("Alert,") { alertIndent = indent; continue }
+            guard alertIndent != nil, text.hasPrefix("Button,"),
+                  let r = line.range(of: "{{"),
+                  let end = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { continue }
+            let v = line[r.lowerBound..<end.upperBound]
+                .split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
+            guard v.count >= 4, v[2] > 0, v[3] > 0 else { continue }
+            var label = ""
+            if let lr = line.range(of: ", label: '") {
+                let rest = line[lr.upperBound...]
+                if let le = rest.range(of: "'") { label = String(rest[..<le.lowerBound]) }
+            }
+            out.append((label, CGRect(x: v[0], y: v[1], width: v[2], height: v[3])))
+        }
+        return out
+    }
+
+    /// The title of the system alert on screen (e.g. "Allow “App” to Use
+    /// Wireless Data?"), so the caller knows whose alert it is — it may
+    /// belong to another app, such as a background install.
+    private func alertTitle() -> String? {
+        guard let root = ForegroundApp.boundedSnapshot(forBundleID: "com.apple.springboard",
+                                                       maxDepth: 6, maxChildren: 50) else { return nil }
+        var n = 0
+        var t: ObjCBool = false
+        guard let body = ForegroundApp.renderBoundedSnapshot(root, maxDepth: 6, maxElements: 200,
+                                                             nodesWritten: &n, truncated: &t) else { return nil }
+        // Alerts stack (tracking, then notifications…): the LAST in the tree
+        // is the one on top, the one a tap would answer. Taking the first
+        // would name a covered alert.
+        var title: String?
+        for line in body.split(separator: "\n") where line.drop(while: { $0 == " " }).hasPrefix("Alert,") {
+            if let r = line.range(of: ", label: '") {
+                let rest = line[r.upperBound...]
+                if let e = rest.range(of: "'") { title = String(rest[..<e.lowerBound]) }
+            }
+        }
+        return title
+    }
+
+    private func flagAlert(_ data: inout [String: JSONValue]) {
+        data["system_alert"] = .bool(true)
+        let title = alertTitle()
+        if let title = title { data["system_alert_title"] = .string(title) }
+        let old: String
+        if case .string(let h)? = data["hint"] { old = " " + h } else { old = "" }
+        data["hint"] = .string((title.map { "System alert: \"\($0)\". " } ?? "") + Self.systemAlertHint + old)
+    }
+
+    /// `precise`: always walk SpringBoard. Some alerts (tracking, local
+    /// network) leave the app's pid in front, so the pid gate misses
+    /// them; reads and changed-screen actions pay the walk.
+    private func systemAlertUp(precise: Bool = false) -> Bool {
+        if !precise, nowMonotonic >= alertWatchUntil {
+            if springboardPID == 0 { springboardPID = ForegroundApp.processID(forBundleID: "com.apple.springboard") }
+            let front = ForegroundApp.frontmostPID()
+            if springboardPID > 0, front > 0, front != springboardPID { return false }
+        }
+        return Self.springboardHasAlert()
+    }
+
+    /// One capped request instead of XCTest's live `alerts.count`, which
+    /// walks all of SpringBoard — home-screen icons included, ~0.7s, twice
+    /// per action on the home screen. An alert sits ~3 levels down.
+    static func springboardHasAlert() -> Bool {
+        let t0 = ProcessInfo.processInfo.systemUptime
+        guard let root = ForegroundApp.boundedSnapshot(forBundleID: "com.apple.springboard",
+                                                       maxDepth: 5, maxChildren: 30) else {
+            let r = ForegroundApp.hasSystemAlert()
+            iCTRLUITests.logBuffer.append(String(format: "🐌 alert check fell back to the full query (%.0fms)",
+                                                 (ProcessInfo.processInfo.systemUptime - t0) * 1000))
+            return r
+        }
+        var n = 0
+        var t: ObjCBool = false
+        guard let body = ForegroundApp.renderBoundedSnapshot(root, maxDepth: 5, maxElements: 300,
+                                                             nodesWritten: &n, truncated: &t) else {
+            return ForegroundApp.hasSystemAlert()
+        }
+        return body.split(separator: "\n").contains { $0.drop(while: { $0 == " " }).hasPrefix("Alert,") }
+    }
+    private func timedAlertCheck() -> Bool {
+        let t = nowMonotonic
+        let r = systemAlertUp(precise: true)
+        iCTRLUITests.logBuffer.append(String(format: "🚨 alert check %.0fms → %@", (nowMonotonic - t) * 1000, r ? "yes" : "no"))
+        return r
+    }
+    private static let switchingMethods: Set<String> = ["open_url", "open"]
+    /// A coordinate tap with an alert up must land on one of its buttons.
+    /// A guess aimed from a screenshot a few points off "Allow" can hit the
+    /// alert's title with no warning — a little further and it grants tracking.
+    private func offAlertButtons(x: Double, y: Double) -> JSONRPCError? {
+        let buttons = alertButtons()
+        guard !buttons.isEmpty, !buttons.contains(where: { $0.frame.contains(CGPoint(x: x, y: y)) }) else { return nil }
+        let list = buttons.map { "'\($0.label)' at (\(Int($0.frame.midX)),\(Int($0.frame.midY)))" }
+            .joined(separator: ", ")
+        return JSONRPCError(code: -32602, message:
+            "A system alert is up and (\(Int(x)),\(Int(y))) is on none of its buttons — not tapped, so a " +
+            "near-miss can't press the wrong one. Its buttons: \(list). Tap one of those centers, or use " +
+            "find_element{element_id:\"<button>\", bundle_id:\"com.apple.springboard\"} → tap{ref}.", data: nil)
+    }
+
+    /// Right before the touch, while late alerts are expected (after a
+    /// launch or a new page): the check at the start of the call can be up to
+    /// ~0.7s old by then (the hit probe, a ref resolving), and an alert that
+    /// comes up in between would take the touch.
+    /// Without a point (an element tap) any alert stops it; with one, only a
+    /// point off the alert's buttons does.
+    private func alertRaisedBeforeTouch(x: Double? = nil, y: Double? = nil) -> JSONRPCError? {
+        guard nowMonotonic < alertWatchUntil, Self.springboardHasAlert() else { return nil }
+        iCTRLUITests.logBuffer.append("🚨 alert came up just before the touch — not tapped")
+        if let x = x, let y = y { return offAlertButtons(x: x, y: y) }
+        let title = alertTitle().map { " (\"\($0)\")" } ?? ""
+        return JSONRPCError(code: -32000, message:
+            "A system alert\(title) came up just before this tap, so it was not tapped: it would have landed on the " +
+            "alert, not on the app. Answer it first: find_element{element_id:\"<button text>\", " +
+            "bundle_id:\"com.apple.springboard\"} → tap{ref}.", data: nil)
+    }
+
+    /// The element a ref/find tap aimed at, for the fine look.
+    private var tapTargetFrame: CGRect?
+    /// Where to look closely after a tap: ±120pt around a coordinate tap; for
+    /// a tapped element its own frame plus a margin — a row's checkmark sits
+    /// at its right edge, ~150pt from the centre a ref tap lands on.
+    private func fineLookArea(point p: CGPoint, element: CGRect?) -> CGRect {
+        let r = ScreenSettle.patchRadius
+        let around = CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)
+        guard let f = element, f.width * f.height <= pointSize.width * pointSize.height * 0.5 else { return around }
+        return f.insetBy(dx: -24, dy: -24)
+    }
+    private static let pointTapMethods: Set<String> = ["tap", "double_tap", "long_press", "tap_element", "find_and_tap"]
+    /// Until then every alert check walks SpringBoard instead of trusting the
+    /// front pid: set after a launch or a new page, when late permission
+    /// alerts (tracking leaves the app's pid in front) show up.
+    private var alertWatchUntil: TimeInterval = 0
+    private static let alertWatchSeconds = 5.0
+    /// Actions aimed by coordinates or at the focused field, not at an element.
+    private static let blindActionMethods: Set<String> = [
+        "tap", "double_tap", "long_press", "swipe", "drag", "type", "clear_text",
+    ]
+    /// Share of the screen that must differ to call it another page: a
+    /// playing video or a new badge stays well under it, a navigation, sheet
+    /// or app switch well over it.
+    private static let otherPageShare = 0.25
+
+    private func noteSeen(_ frame: ScreenSettle.Frame) {
+        lastSeen = (frame, ForegroundApp.frontmostPID(), nowMonotonic)
+    }
+
+    private struct PageCheck {
+        let same: Bool
+        let why: String
+        let changedPct: Double
+        let appChanged: Bool
+        let seenAgoMs: Int
+        var json: JSONValue {
+            .object([
+                "same_page": .bool(same),
+                "changed_pct": .double((changedPct * 1000).rounded() / 10),
+                "app_changed": .bool(appChanged),
+                "seen_ms_ago": .int(seenAgoMs),
+                // Read as "after the action" it looked stale (same_page:true on
+                // a type that then navigated). It is about where the action
+                // landed, so say so.
+                "compares": .string("the screen just before this action vs. what you last saw"),
+            ])
+        }
+    }
+
+    private func samePageCheck(before: ScreenSettle.Frame?, typing: Bool = false) -> PageCheck? {
+        guard let seen = lastSeen, let now = before else { return nil }
+        let pid = ForegroundApp.frontmostPID()
+        let appChanged = pid > 0 && seen.pid > 0 && pid != seen.pid
+        // Typing follows the tap that raised the keyboard, which covers the
+        // bottom ~40%: compared whole, that reads as a different page.
+        // Compare what the keyboard can't cover.
+        let d = ScreenSettle.diff(seen.frame, now, topShare: typing ? 0.55 : 1)
+        let same = !appChanged && d < Self.otherPageShare
+        let why = appChanged ? "another app or the home screen is in front now"
+            : "\(Int(d * 100))% of the screen is different"
+        return PageCheck(same: same, why: why, changedPct: d, appChanged: appChanged,
+                         seenAgoMs: Int((nowMonotonic - seen.at) * 1000))
+    }
+
+    /// Actions followed by a settle check (see ScreenSettle).
+    private static let settleMethods: Set<String> = [
+        "tap", "double_tap", "long_press", "swipe", "scroll", "drag",
+        "page", "page_down", "page_up", "type", "clear_text",
+        "tap_element", "find_and_tap",
+        // A deep link lands on a page that is still loading (a maps route
+        // can read "no info available" on the first look).
+        "open_url", "open",
+    ]
+    private static let settleDefaultTimeout = 2.0
+    private static let settleMaxTimeout = 3.0
+    /// The whole call — action plus settle — ends by this, under the 6s limit.
+    private static let settleCallBudget = 4.3
 
     private func dispatchInner(method: String, cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         switch method {
@@ -486,6 +1017,8 @@ class ActionHandler {
             return swipe(cmd)
         case "page", "page_down", "page_up":
             return pageScroll(cmd, method: method)
+        case "collect":
+            return collect(cmd)
         case "scroll":
             return scroll(cmd)
         case "type":
@@ -519,7 +1052,8 @@ class ActionHandler {
                 "total": .int(all.count),
                 "hint": .string(
                     "Most recent last. After a timeout, look for '⏱ ✓ <method>' — that means the action "
-                    + "COMPLETED on the device and must not be retried; '⏱ ✗' or '⏱ TIMEOUT' mean it did not. "
+                    + "COMPLETED on the device and must not be retried; '⏱ ✗' means it failed. '⏱ TIMEOUT' only means "
+                    + "the reply went out before it finished — it keeps running, so wait for its '⏱ ✓' line. "
                     + "Pass text:\"<method>\" to filter, max_elements to change how many lines come back."),
             ], nil)
         case "snapshot_api":
@@ -545,7 +1079,18 @@ class ActionHandler {
         case "terminate_app":
             return terminateApp(cmd)
         case "page_source", "view_tree", "ui_tree":
-            return pageSource(cmd)
+            // Right after a launch XCTest may not know the process yet ("is not
+            // running" a couple of seconds after launch_app): a short retry
+            // instead of an error the caller has to work around.
+            var out = pageSource(cmd)
+            for _ in 0..<2 {
+                guard let e = out.1, e.message.hasPrefix("Could not snapshot"),
+                      let at = launchedAt.values.max(), nowMonotonic - at < 10 else { break }
+                iCTRLUITests.logBuffer.append("🔁 page_source: no snapshot right after a launch — retrying")
+                usleep(700_000)
+                out = pageSource(cmd)
+            }
+            return out
         case "scroll_to_element", "scroll_to":
             return scrollToElement(cmd)
         case "find_element":
@@ -766,7 +1311,7 @@ class ActionHandler {
     /// timing out. What this can and can't do is worth being precise about:
     ///
     /// It clears OUR state — element refs (now pointing into a dead tree), the
-    /// sticky bound app, and the cached screen size. It cannot restart XCTest's
+    /// learned front-app pids, and the cached screen size. It cannot restart XCTest's
     /// accessibility session; that belongs to the framework and has no public
     /// reset. The reconnect, if it happens, comes from the next query against a
     /// foregrounded app. So this is a cheap thing to try before the guaranteed
@@ -778,27 +1323,25 @@ class ActionHandler {
     func reset() -> ([String: JSONValue]?, JSONRPCError?) {
         let refCount = refStore.count
         refStore.removeAll()
-        let previouslyBound = boundBundleId
-        boundBundleId = nil
         cachedPointSize = nil
+        frontByPID.removeAll()
+        lastSeen = nil
 
-        iCTRLUITests.logBuffer.append("♻️ reset — cleared \(refCount) refs"
-                                    + (previouslyBound.map { ", unbound \($0)" } ?? ""))
+        iCTRLUITests.logBuffer.append("♻️ reset — cleared \(refCount) refs")
 
         // Report the foreground app so the caller can decide what to re-launch;
         // this reads a private API, not XCUITest, so it can't block.
-        let foreground = ForegroundApp.currentBundleID()
+        let foreground = resolveForegroundBundleId()
         var out: [String: JSONValue] = [
             "reset": .bool(true),
             "cleared_refs": .double(Double(refCount)),
             "hint": .string(
-                "Cleared cached refs, the sticky app binding and the screen-size cache. "
+                "Cleared cached refs and the screen-size cache. "
                 + "Re-establishing the accessibility connection is up to XCTest: call launch_app "
                 + "(or activate_app) on the target app, then retry. If UI calls still time out, "
                 + "the runner itself must be restarted — config{stop_server:true}, then relaunch it."
             ),
         ]
-        if let prev = previouslyBound { out["unbound"] = .string(prev) }
         if let fg = foreground { out["foreground_app"] = .string(fg) }
         return (out, nil)
     }
@@ -888,7 +1431,7 @@ class ActionHandler {
         // Target selection:
         //   - explicit bundle_id → screenshot ONLY that app's window (opt-in)
         //   - otherwise → the WHOLE SCREEN (XCUIScreen) — always fast (~0.4s).
-        // IMPORTANT: we DO NOT use the sticky boundBundleId here. App-scoped
+        // IMPORTANT: we DO NOT screenshot a specific app here. App-scoped
         // XCUIApplication.screenshot() can block for 8s+ while the app is in a
         // transition (page switch / loading), which blocked the main thread long
         // enough for XCTest to terminate the test (observed crash, twice).
@@ -920,6 +1463,7 @@ class ActionHandler {
             fullImage = XCUIScreen.main.screenshot().image
             scopedTo = nil
         }
+        if scopedTo == nil { readFrame = ScreenSettle.frame(from: fullImage) }
 
         // Resize on the server to targetScale so the client gets a smaller PNG.
         let targetPixelW = frame.width * targetScale
@@ -1026,16 +1570,82 @@ class ActionHandler {
         return resized.pngData() ?? image.pngData() ?? Data()
     }
 
+
+    /// Why an element that exists can't be tapped, said so the caller does
+    /// the right next thing. "Scroll it into view" alone is wrong for
+    /// elements already on screen under a popup — it sends callers
+    /// scrolling under a privacy dialog or permission alert.
+    ///
+    /// nil = nothing explains it: on screen, no system alert, nothing in the
+    /// tree drawn over it. XCTest's isHittable then is often just wrong (it
+    /// can refuse a plain back button with nothing on top; WebDriverAgent
+    /// ignores it for the same reason), so callers tap the center instead of refusing.
+    private func notHittableAdvice(label: String, frame f: CGRect) -> String? {
+        let s = pointSize
+        let onScreen = f.width > 0 && f.height > 0 && f.midX >= 0 && f.midX <= s.width
+            && f.midY >= 0 && f.midY <= s.height
+        let at = "(\(Int(f.midX)),\(Int(f.midY)))"
+        guard onScreen else {
+            return "it is off-screen at \(at). Scroll it into view (scroll_to_element), then retry."
+        }
+        if systemAlertUp() {
+            return "it is on screen at \(at) but a system alert covers the app. " + Self.systemAlertHint
+        }
+        // Tree order is not z-order: a later node "over" the element may be a
+        // hidden pull-to-refresh label, and refusing on it would block a plain
+        // back-button tap. Tap; settle and page_check show whether it took.
+        return nil
+    }
+
     // MARK: - Tap
 
     /// Resolve a ref for a spatial action, returning the live element or a
     /// descriptive error. Shared by tap/double_tap/long_press.
+    /// The ref's element, in view, from a capped walk of its app — or nil,
+    /// and the caller takes the live route (which also explains failures).
+    /// The ordinal must agree: a ref names the n-th element with its label.
+    /// A capped walk can cut off earlier look-alikes and shift ordinals, so
+    /// it is trusted only when it holds a single match.
+    private func boundedRefHit(_ ref: ElementRef) -> LocateHit? {
+        guard let bid = ref.bundleId else { return nil }
+        let want: String
+        let byLabel: Bool
+        switch ref.match {
+        case .exactLabel(let l): want = l; byLabel = true
+        case .identifier(let i): want = i; byLabel = false
+        case .containsLabel: return nil
+        }
+        func pick(_ scan: LocateScan?) -> LocateHit? {
+            scan?.candidates.first {
+                $0.ordinal == ref.index && $0.byLabel == byLabel && (byLabel ? $0.label : $0.identifier) == want
+            }
+        }
+        let quick = scanCandidates(query: want, type: ref.elementType, matchMode: "exact", bundleId: bid,
+                                   maxChildren: Self.childrenLadder[0])
+        let same = quick?.candidates.filter { $0.byLabel == byLabel && ($0.byLabel ? $0.label : $0.identifier) == want }
+        func miss(_ why: String, _ scan: LocateScan?) -> LocateHit? {
+            let seen = (scan?.candidates ?? []).map { "\($0.ordinal)/\($0.byLabel ? "L" : "I")/\($0.visibility)" }
+            iCTRLUITests.logBuffer.append("🎯 ref \(ref.index) '\(want)' bounded miss: \(why) [\(seen.joined(separator: " "))]")
+            return nil
+        }
+        if same?.count == 1, let h = pick(quick) { return h.inView ? h : miss("not in view", quick) }
+        // None in the capped walk: the live route (a wider walk here could
+        // cost seconds on a long list, and then the live route anyway).
+        guard (same?.count ?? 0) > 1 else { return miss("\(same?.count ?? -1) in capped walk", quick) }
+        // Several share the label: the ref's ordinal came from find_element's
+        // own capped walk, so match it in this one first. The uncapped walk can
+        // take seconds on a heavy app and come back empty, turning a tab tap into a hang.
+        if let h = pick(quick) { return h.inView ? h : miss("not in view", quick) }
+        let full = scanCandidates(query: want, type: ref.elementType, matchMode: "exact", bundleId: bid)
+        guard let h = pick(full) else { return miss("no ordinal match", full) }
+        return h.inView ? h : miss("not in view", full)
+    }
+
     private func resolveRefForAction(_ refId: String) -> (XCUIElement?, JSONRPCError?) {
         let (resolved, err) = resolveRef(refId)
         guard let el = resolved else { return (nil, err) }
-        guard el.safeIsHittable else {
-            let f = el.frame
-            return (nil, JSONRPCError(code: -32602, message: "Element for ref '\(refId)' exists but isn't hittable; scroll it fully into view (scroll_to_element) or tap its center by coordinate (\(Int(f.midX)),\(Int(f.midY))).", data: nil))
+        if !el.safeIsHittable, let why = notHittableAdvice(label: el.label, frame: el.frame) {
+            return (nil, JSONRPCError(code: -32602, message: "Element for ref '\(refId)' can't be tapped: " + why, data: nil))
         }
         return (el, nil)
     }
@@ -1061,6 +1671,41 @@ class ActionHandler {
     }
 
     private func tap(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+        // A ref to a system alert's button: tap where that button is on the
+        // alert up NOW. The live query can match a stale button left in
+        // SpringBoard by an earlier alert at another position, and the tap
+        // would miss the current alert.
+        if let refId = cmd.ref, let ref = refStore[refId], ref.bundleId == "com.apple.springboard" {
+            let want: String
+            switch ref.match {
+            case .exactLabel(let l), .containsLabel(let l), .identifier(let l): want = l
+            }
+            let buttons = alertButtons()
+            if let b = buttons.first(where: { $0.label == want }) ?? buttons.first(where: { $0.label.contains(want) }) {
+                let r = fastHandler.fastTap(x: b.frame.midX, y: b.frame.midY)
+                if r.1 != nil { return r }
+                return (["message": .string("Tapped ref \(refId) ('\(b.label)') at (\(Int(b.frame.midX)),\(Int(b.frame.midY)))")], nil)
+            }
+        }
+        // A ref re-found in ONE capped walk, tapped at its frame. The live
+        // route below costs ~5 whole-app walks (exists, hittable, frame,
+        // label, type) — ~0.1s each on a light app, seconds each on a heavy
+        // one, where a walk can also time out and be retried.
+        if cmd.fast != false, let refId = cmd.ref, let ref = refStore[refId], nowMonotonic - ref.createdAt <= Self.refTTL,
+           let bid = ref.bundleId, bid != "com.apple.springboard", resolveForegroundBundleId() == bid,
+           let hit = boundedRefHit(ref) {
+            let f = hit.frame
+            let (cx, cy) = humanizedPoint(in: f)
+            if let err = alertRaisedBeforeTouch() { return (nil, err) }
+            if [.textField, .searchField, .secureTextField, .textView].contains(hit.elementType) {
+                lastKeyboardSeen = (bid, nowMonotonic)
+            }
+            tapTargetFrame = f
+            let r = fastHandler.fastTap(x: cx, y: cy)
+            if r.1 == nil {
+                return (["message": .string("Tapped ref \(refId) ('\(hit.label.isEmpty ? hit.identifier : hit.label)') at (\(Int(cx)),\(Int(cy)))")], nil)
+            }
+        }
         // Prefer a stable element ref if provided (re-resolves the live element).
         if let refId = cmd.ref {
             let (el, err) = resolveRefForAction(refId)
@@ -1074,6 +1719,12 @@ class ActionHandler {
             let f = el!.frame
             let label = el!.label
             let (cx, cy) = humanizedPoint(in: f)
+            if refStore[refId]?.bundleId != "com.apple.springboard", let err = alertRaisedBeforeTouch() { return (nil, err) }
+            if [.textField, .searchField, .secureTextField, .textView].contains(el!.elementType),
+               let bid = refStore[refId]?.bundleId ?? resolveForegroundBundleId() {
+                lastKeyboardSeen = (bid, nowMonotonic)   // its keyboard comes up: page must stay above it
+            }
+            tapTargetFrame = f
             let r = fastHandler.fastTap(x: cx, y: cy)
             if r.1 != nil {
                 // Fallback to element tap only if the synthesized tap failed.
@@ -1090,24 +1741,36 @@ class ActionHandler {
         // Fast (event synthesis) is the DEFAULT — it doesn't wait for UI quiescence,
         // which on animation-heavy apps could block for up to 60s. Pass fast:false
         // only if you specifically need XCUITest's element-aware tap.
+        // Off every button of a system alert: refuse and say where they are.
+        if systemAlertUp(), let err = offAlertButtons(x: x, y: y) { return (nil, err) }
+
         if cmd.fast != false {
             // Sample what sits under the point BEFORE tapping: afterwards the UI
             // may have moved (a keyboard appearing shifts everything up), so a
             // post-tap probe would describe the new layout, not what was hit.
             let hit = elementUnder(x: x, y: y)
+            if let err = alertRaisedBeforeTouch(x: x, y: y) { return (nil, err) }
             var r = fastHandler.fastTap(x: x, y: y)
             if var data = r.0 {
-                if let h = hit {
+                if var h = hit {
+                    if case .string(let note)? = h.removeValue(forKey: "note") { data["hint"] = .string(note) }
+                    if case .string(let t)? = h["element_type"], ["TextField", "SearchField", "SecureTextField", "TextView"].contains(t),
+                       let bid = resolveForegroundBundleId() {
+                        lastKeyboardSeen = (bid, nowMonotonic)
+                    }
                     data["hit"] = .object(h)
+                } else if hitSkipped {
+                    data["hit_skipped"] = .string("This app's accessibility tree is very slow right now, so what " +
+                        "sits under the point wasn't checked. Confirm the result with a screenshot.")
                 } else {
                     // Nothing interactive there. The synthesized event still
                     // "succeeds" — iOS delivers it to empty space — so without
                     // this the caller sees success and only finds out from a
                     // screenshot that the keyboard never appeared.
                     data["hit_warning"] = .string(
-                        "No labelled element at (\(Int(x)),\(Int(y))). Either the tap hit empty space, or "
-                        + "the content there isn't in the accessibility tree (web or custom-drawn) — "
-                        + "expected if you aimed from OCR. Confirm with a fresh read. Coordinates also go "
+                        "No labelled element at (\(Int(x)),\(Int(y))) — an unlabelled control, content not in the "
+                        + "accessibility tree (web, custom-drawn — expected if you aimed from OCR), or empty space. "
+                        + "The screen didn't visibly react, so confirm with a fresh read. Coordinates also go "
                         + "stale when the layout shifts (a keyboard appearing moves everything up).")
                 }
                 if Self.isHomeScreen() { data["hint"] = .string(Self.homeScreenAdvice) }
@@ -1228,61 +1891,99 @@ class ActionHandler {
         else if method == "page_down" { goingDown = true }
         else if let d = cmd.direction?.lowercased() { goingDown = (d != "up") }
 
-        // Number of screenfuls (default 1). One "page" moves 75% of the height,
-        // leaving ~25% overlap between consecutive reads — about 220pt, which is
-        // most of a typical feed card (~330pt on RED), so an item on the boundary
-        // is fully readable in one of the two reads.
+        // Number of screenfuls (default 1). One "page" moves 66% of the height,
+        // leaving ~a third overlapping between consecutive reads — about 300pt,
+        // close to a typical feed card's height, so an item on the
+        // boundary is fully readable in one of the two reads.
         //
         // Overlap only means something now that the drag actually lands where it
         // is aimed (see the velocity note below). It was 85% with a fixed-duration
         // drag that overshot by up to 61%, so the intended "sliver of overlap"
         // was consumed by overshoot and consecutive reads shared nearly nothing.
         let pages = max(0.1, min(cmd.distance ?? 1.0, 5.0))   // reuse `distance` as page count
-        let pageTravel = size.height * 0.75 * pages
+
+        let fpStart = nowMonotonic
+        // On a heavy list the two tree walks can take most of a page call
+        // (seconds each, enough to time out); the pixels decide movement there.
+        let heavy = resolveForegroundBundleId().map { bid in
+            (heavyList[bid].map { nowMonotonic - $0 < 300 } ?? false) || (grownTree[bid].map { nowMonotonic - $0 < 300 } ?? false)
+                || (treeCost[bid] ?? 0) > 1.2 } ?? false
+        // There the visible cells give the fingerprint (~0.3s); the tree walk
+        // only when the app has no cell list.
+        let cellsBid = heavy ? resolveForegroundBundleId() : nil
+        // One read each side, no stale-retries: a lagging list just reads
+        // as unmoved and the pixels decide (retries stretch a page far past its budget).
+        func fingerprint() -> String? {
+            if let bid = cellsBid, let fast = visibleListBody(bid, verifyFresh: false) {
+                return Self.fingerprint(ofBody: fast.body, height: pointSize.height)
+            }
+            return cellsBid == nil ? scrollFingerprint() : nil
+        }
+        let before = fingerprint()
+        if !heavy, let bid = resolveForegroundBundleId() { noteCappedCost(bid, seconds: nowMonotonic - fpStart) }
+        // A keyboard is often not in the capped tree: ask as page_source does,
+        // so that closing it isn't taken for a scroll.
+        // Only when a keyboard was seen in this app lately: the probe walks
+        // the app, which on a heavy feed costs seconds per page.
+        if pageKeyboardTop == nil, let seen = lastKeyboardSeen, seen.bid == resolveForegroundBundleId(),
+           nowMonotonic - seen.at < 120,
+           case .object(let k) = keyboardState(), case .double(let top)? = k["covers_from_y"] {
+            pageKeyboardTop = top
+        }
+        iCTRLUITests.logBuffer.append(String(format: "⌨️ page: fingerprint+keyboard %.0fms, keyboard %@",
+                                             (nowMonotonic - fpStart) * 1000, pageKeyboardTop.map { "at \(Int($0))" } ?? "none"))
+        let band = pageBand(pages: pages)
+        let bandBottom = band.bottom, pageTravel = band.travel
 
         // Scroll within the middle band, away from the very top/bottom (nav bars,
         // home indicator, pull-to-refresh zones).
         let fromY: Double, toY: Double
+        // A page is the band one drag can cover, 66% of the height: wider
+        // bands failed — a drag starting in the bottom 20% (tab bars, iOS 27's
+        // floating search bar) or ending in the top 6% (status bar) moved
+        // nothing. So consecutive reads overlap by about a third.
         if goingDown {
-            fromY = size.height * 0.78
+            fromY = bandBottom
             toY = max(size.height * 0.12, fromY - pageTravel)
         } else {
             fromY = size.height * 0.22
-            toY = min(size.height * 0.88, fromY + pageTravel)
+            toY = min(pageKeyboardTop == nil ? size.height * 0.88 : bandBottom, fromY + pageTravel)
         }
 
-        // Hold the drag SPEED below the momentum threshold, rather than using a
-        // fixed duration. A constant 0.45s meant velocity grew with travel, and
-        // iOS starts adding inertia above ~350pt/s — measured on this device:
+        // A fast drag, then the finger rests on the end point before lifting.
+        // iOS adds momentum from the velocity at lift-off, which at speed can
+        // overshoot a whole screen. Holding the drag slow avoids that but costs
+        // seconds per page. Resting samples at the end (see fastSwipe) bring
+        // lift-off velocity to zero instead: a short drag plus a brief rest moves
+        // the content by about the finger travel, the same in both directions.
         //
-        //   889pt/s -> moved 1.61x the finger travel
-        //   500pt/s -> 1.27x
-        //   344pt/s -> 0.97x   (precise)
-        //   275pt/s -> 0.97x   (precise)
-        //
-        // So the old "NO iOS momentum" claim held only for short drags. At one
-        // full page it overshot past a whole screen, which silently ate the
-        // overlap between consecutive reads — items could pass between two
-        // page_source calls with nothing to indicate it.
-        //
-        // 300pt/s keeps a margin below the threshold. The floor stops very short
-        // drags from becoming absurdly slow; the ceiling bounds the worst case,
-        // since an XCUITest gesture blocks the (serial) UI queue while it runs.
-        let travel = abs(fromY - toY)
-        let dragDuration = min(max(travel / 300.0, 0.30), 2.5)
-        // Sampled before and after so the response can say whether the gesture
-        // actually moved anything — see scrollOutcome.
-        let before = scrollFingerprint()
-        let r = fastHandler.fastSwipe(fromX: cx, fromY: fromY, toX: cx, toY: toY, duration: dragDuration)
-        if r.1 != nil { return r }
-        // Let the content settle before sampling, or an in-flight scroll reads
-        // as "didn't move".
-        usleep(350_000)
+        // More than one screenful is several such drags: the band a drag can
+        // use is ~66% of the height, and a longer `toY` would be silently clamped
+        // (several screenfuls asked, less than one moved).
+        let perDrag = abs(fromY - toY)
+        var remaining = pageTravel
+        var drags = 0
+        // On a busy screen (a video playing) the walk is slow; doing it twice
+        // would leave no time for settle.
+        let fingerprintAfter = heavy || nowMonotonic - fpStart < 0.8
+        while remaining > 1, drags < 4 {
+            let t = min(remaining, perDrag)
+            let endY = goingDown ? fromY - t : fromY + t
+            let r = fastHandler.fastSwipe(fromX: cx, fromY: fromY, toX: cx, toY: endY,
+                                          duration: cmd.duration ?? 0.35, hold: 0.25)
+            if r.1 != nil { return r }
+            remaining -= t
+            drags += 1
+        }
+        usleep(100_000)
+        let moved = (pageTravel - remaining) / (size.height * 0.66)
         var out: [String: JSONValue] = [
-            "message": .string("Paged \(goingDown ? "down" : "up") \(pages) screenful(s) — 75% of the screen each, so consecutive reads overlap by ~25% and nothing falls between them. Precise scroll (no momentum). Re-read with page_source/screenshot."),
+            "message": .string("Paged \(goingDown ? "down" : "up") \(String(format: "%.2g", moved)) screenful(s) — two thirds of the screen each, so consecutive reads overlap by about a third and nothing falls between them. Precise scroll (no momentum). Re-read with page_source/screenshot."),
             "screen": coordinateHint,
         ]
-        for (k, v) in scrollOutcome(before: before, after: scrollFingerprint()) { out[k] = v }
+        if fingerprintAfter {
+            for (k, v) in scrollOutcome(before: before, after: fingerprint()) { out[k] = v }
+        }
         return (out, nil)
     }
 
@@ -1335,6 +2036,11 @@ class ActionHandler {
             let r = fastHandler.fastSwipe(fromX: x, fromY: y, toX: clampedEndX, toY: clampedEndY, duration: moveDuration)
             if var data = r.0 {
                 data["from"] = .object(["x": .double(x), "y": .double(y)])
+                if clampedEndX != endX || clampedEndY != endY {
+                    let travel = hypot(clampedEndX - x, clampedEndY - y)
+                    data["clamped"] = .string("The end point was off-screen, so the finger travelled \(Int(travel))pt, " +
+                        "not \(Int(distance))pt. For long moves use page (several screens per call) or repeat the swipe.")
+                }
                 data["velocity"] = .string(velocity)
                 data["note"] = .string("Started at (\(Int(x)),\(Int(y))) — default is screen center. velocity=\(velocity): 'fast' adds momentum (scrolls farther), 'slow' is a precise drag.")
                 return (data, r.1)
@@ -1434,15 +2140,18 @@ class ActionHandler {
     /// slowest and this is only for a soft hint, never to block or fail typing).
     private func keyboardWarningAfterType() -> String? {
         let bid = resolveForegroundBundleId()
+        // A whole-app walk; on a slow tree it cost seconds per type call.
+        if let bid = bid, isSlowTree(bid) { return nil }
         let target: XCUIApplication = bid.map { XCUIApplication(bundleIdentifier: $0) } ?? app
         if target.keyboards.count > 0 { return nil }
         return "Could not confirm a focused text field / visible keyboard (detection can't see all keyboards). " +
             "VERIFY BEFORE RETRYING — screenshot and check whether the text landed; typing again would enter it twice. " +
-            "If it did NOT land, tap a real textfield first (find_element{element_id:\"<placeholder text>\", element_type:\"textfield\", match:\"contains\"} → tap{ref}), wait ~1s, then type again. " +
+            "If it did NOT land, tap a real textfield first (find_element{element_id:\"<placeholder text>\", element_type:\"textfield\", match:\"contains\"} → tap{ref}), read again until the field is focused, then type again. " +
             "A home-screen 'search bar' is often a button that opens a separate search page."
     }
 
     private func typeText(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+        if let bid = resolveForegroundBundleId() { lastKeyboardSeen = (bid, nowMonotonic) }
         let clearFirst = cmd.clear == true
         // text is optional when clear:true (type{clear:true} just empties the field).
         guard let text = cmd.text ?? (clearFirst ? "" : nil) else {
@@ -1499,12 +2208,15 @@ class ActionHandler {
 
         if cmd.fast == true {
             let r = fastHandler.fastTypeText(text)
+            // Before Return: submitting a search hides the keyboard, which
+            // read as "no focused field" and warned on text that had landed.
+            let keyboardWarning = r.1 == nil ? keyboardWarningAfterType() : nil
             if submit, r.1 == nil { sendReturnKey() }
             if var data = r.0 {
                 let prefix = clearFirst ? "Cleared then typed: " : "Typed: "
                 data["message"] = .string(text.isEmpty && clearFirst ? "Cleared focused field" : (prefix + text + (submit ? " + Return" : "")))
                 if let a = appendWarning() { data["append_warning"] = .string(a) }
-                if let w = keyboardWarningAfterType() { data["warning"] = .string(w) }
+                if let w = keyboardWarning { data["warning"] = .string(w) }
                 return (data, r.1)
             }
             return r
@@ -1517,12 +2229,15 @@ class ActionHandler {
 
         do {
             try eventRecord.synthesize()
+            // Before Return: submitting a search hides the keyboard, which
+            // read as "no focused field" and warned on text that had landed.
+            let keyboardWarning = keyboardWarningAfterType()
             if submit { sendReturnKey() }
             let prefix = clearFirst ? "Cleared then typed: " : "Typed: "
             let msg = text.isEmpty && clearFirst ? "Cleared focused field" : (prefix + text + (submit ? " + Return" : ""))
             var out: [String: JSONValue] = ["message": .string(msg)]
             if let a = appendWarning() { out["append_warning"] = .string(a) }
-            if let w = keyboardWarningAfterType() { out["warning"] = .string(w) }
+            if let w = keyboardWarning { out["warning"] = .string(w) }
             return (out, nil)
         } catch {
             let guidance = focusedByTap
@@ -1549,11 +2264,21 @@ class ActionHandler {
     private func focusedFieldValue() -> String? {
         guard let bid = resolveForegroundBundleId() else { return nil }
         let target = XCUIApplication(bundleIdentifier: bid)
-        for query in [target.textFields, target.secureTextFields, target.searchFields] {
-            let el = query.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-            if el.safeExists, let v = el.value as? String { return v }
-        }
-        return nil
+        // One query over the three field types and one snapshot of the match:
+        // a single walk of the app. Probing each type with exists + value +
+        // placeholderValue is up to nine walks, ~1–2s of every type call.
+        let types = [XCUIElement.ElementType.textField, .secureTextField, .searchField].map { $0.rawValue }
+        let el = target.descendants(matching: .any).matching(NSPredicate(
+            format: "hasKeyboardFocus == true AND elementType IN %@", types)).firstMatch
+        // exists first: snapshotting a query with no match makes XCTest retry
+        // it three times at about a second each — most of a type call when the
+        // field doesn't report keyboard focus.
+        guard el.safeExists,
+              let snap = ForegroundApp.safeSnapshot(ofElement: el) as? XCUIElementSnapshot else { return nil }
+        // An empty field reports its placeholder as its value: that would read
+        // as existing text and raise a false append warning.
+        guard let v = snap.value as? String else { return nil }
+        return v == snap.placeholderValue ? "" : v
     }
 
     /// Clear the currently-focused text field. Requires the field to already have
@@ -1564,8 +2289,12 @@ class ActionHandler {
     /// Returns the number of delete keystrokes sent — exactly 1 means select-all worked.
     @discardableResult
     private func clearFocusedField() -> Int {
-        // Best-effort read of the focused field's current text.
-        let count = focusedFieldValue()?.count ?? 0
+        // Best-effort read of the focused field's current text. nil means
+        // unknown, so clear anyway; a field read as empty needs nothing
+        // (select-all + delete there costs about a second for no effect).
+        let current = focusedFieldValue()
+        if current == "" { return 0 }
+        let count = current?.count ?? 0
         // Select-all, then one delete. Backspacing character-by-character was
         // wrong in two ways that compounded:
         //
@@ -1623,19 +2352,19 @@ class ActionHandler {
     private func selectAllInFocusedField() -> Bool {
         guard let bid = resolveForegroundBundleId() else { return false }
         let target = XCUIApplication(bundleIdentifier: bid)
-        for query in [target.textFields, target.secureTextFields, target.searchFields, target.textViews] {
-            let el = query.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-            guard el.safeExists else { continue }
-            // Obj-C @try: typeKey raises on an element that cannot accept keys,
-            // and an NSException here would take the runner down with it.
-            var ok = false
-            _ = ObjCException.catching {
-                el.typeKey("a", modifierFlags: .command)
-                ok = true
-            }
-            if ok { return true }
+        // One query over every text-input type (one walk, not one per type).
+        let types = [XCUIElement.ElementType.textField, .secureTextField, .searchField, .textView].map { $0.rawValue }
+        let el = target.descendants(matching: .any).matching(NSPredicate(
+            format: "hasKeyboardFocus == true AND elementType IN %@", types)).firstMatch
+        guard el.safeExists else { return false }
+        // Obj-C @try: typeKey raises on an element that cannot accept keys,
+        // and an NSException here would take the runner down with it.
+        var ok = false
+        _ = ObjCException.catching {
+            el.typeKey("a", modifierFlags: .command)
+            ok = true
         }
-        return false
+        return ok
     }
 
     /// clear_text method: clear the focused field without typing anything new.
@@ -1646,10 +2375,10 @@ class ActionHandler {
         // back to blind backspacing, which is worth knowing when a field turns
         // out not to be empty afterwards.
         var out: [String: JSONValue] = [
-            "message": .string(sent == 1
-                ? "Cleared focused field (select-all + delete)"
+            "message": .string(sent == 0 ? "The focused field was already empty"
+                : sent == 1 ? "Cleared focused field (select-all + delete)"
                 : "Cleared focused field by deleting characters (\(sent) keystrokes) — this field doesn't support select-all"),
-            "method": .string(sent == 1 ? "select_all" : "backspaces"),
+            "method": .string(sent == 0 ? "none" : sent == 1 ? "select_all" : "backspaces"),
         ]
         if !keyboardConfirmed {
             out["warning"] = .string(
@@ -1662,11 +2391,8 @@ class ActionHandler {
     // MARK: - Device Buttons
 
     private func pressHome() -> ([String: JSONValue]?, JSONRPCError?) {
-        // Which app we are leaving. The live detector is first, but it returns
-        // nil on iOS 26 (activeApplications is empty there), so fall back to the
-        // sticky binding — the app we most recently launched is the one still in
-        // front in practice, and it is the only handle we have to verify against.
-        let before = ForegroundApp.currentBundleID() ?? boundBundleId
+        // Which app we are leaving.
+        let before = resolveForegroundBundleId()
         let springboard = "com.apple.springboard"
 
         // `press(.home)` normally blocks until SpringBoard is frontmost — but that
@@ -1683,12 +2409,17 @@ class ActionHandler {
         // and reports success for a press that did nothing. XCUIApplication.state
         // is public, works, and answers the question that actually matters: did
         // the app we were in stop being foreground?
+        if springboardPID == 0 { springboardPID = ForegroundApp.processID(forBundleID: springboard) }
         func leftForeground() -> Bool {
             guard let bid = before, bid != springboard else {
                 // Nothing was in front (already home), or SpringBoard itself —
                 // there is nothing to leave, so the press has nothing to prove.
                 return true
             }
+            // SpringBoard's pid in front is direct proof. The app's own state
+            // below can lag: on iOS 27 it can keep saying "foreground" for seconds
+            // after the home screen is up, failing a press that worked.
+            if springboardPID > 0, ForegroundApp.frontmostPID() == springboardPID { return true }
             let state = AppState(rawValue: ForegroundApp.appState(forBundleID: bid)) ?? .unknown
             return state != .foreground
         }
@@ -1719,10 +2450,6 @@ class ActionHandler {
             }
         }
 
-        // Home changes what's in front, so the sticky binding is now stale —
-        // leaving it set would silently re-activate the old app on the next
-        // element action, undoing the very thing the caller asked for.
-
         guard landed else {
             return (nil, .serverError(
                 "Could not leave '\(before ?? "the foreground app")': both the Home button and "
@@ -1731,10 +2458,9 @@ class ActionHandler {
                 + "(call is_locked)."
             ))
         }
-        // The caller has explicitly left the app, so the sticky binding must go:
-        // leaving it set would silently re-activate that app on the next element
-        // action, undoing the thing that was just asked for.
-        boundBundleId = nil
+        // At the home screen the front pid is SpringBoard's: learn it, for
+        // when XCTest can't report it directly.
+        if springboardPID == 0 { springboardPID = ForegroundApp.frontmostPID() }
         return ([
             "message": .string("Returned to the home screen"),
             "foreground_app": .string(springboard),
@@ -2157,6 +2883,19 @@ class ActionHandler {
     /// or a deep-linked feature — e.g. "weixin://", "alipays://platformapi/…",
     /// "https://…", "tel:…", or a callback like "minis://done?x=1". Uses the same
     /// XCTest-daemon path that reliably opens URLs from inside the runner.
+    private static func bundleForScheme(_ scheme: String?) -> String? {
+        switch scheme {
+        case "itms-apps", "itms-appss", "itms", "itmss": return "com.apple.AppStore"
+        case "http", "https": return "com.apple.mobilesafari"
+        case "app-prefs", "prefs": return "com.apple.Preferences"
+        case "maps": return "com.apple.Maps"
+        case "tel", "telprompt": return "com.apple.mobilephone"
+        case "sms": return "com.apple.MobileSMS"
+        case "mailto": return "com.apple.mobilemail"
+        default: return nil
+        }
+    }
+
     private func openURL(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let raw = cmd.url ?? cmd.text, !raw.isEmpty else {
             return (nil, JSONRPCError(code: -32602, message: "open_url requires a 'url' (e.g. 'weixin://', 'https://example.com', 'alipays://platformapi/startapp?...')", data: nil))
@@ -2171,13 +2910,18 @@ class ActionHandler {
                 "For opening an app by identity, use launch_app with a bundle_id instead."
             ))
         }
-        // If the URL scheme maps to a known app coming to the foreground, the sticky
-        // target will be re-detected on the next action; we don't force-bind here
-        // because a URL can also just trigger an in-app action.
-        usleep(500_000)
-        return ([
+        // The front app is known by pid only, and only apps opened through
+        // this runner are candidates for naming it. A page opened by URL right
+        // after a restart (e.g. in the App Store) would read as "nil" in front,
+        // and every read and find_element would miss it. The scheme says where it went.
+        if let bid = Self.bundleForScheme(url.scheme?.lowercased()) { noteOpened(bid) }
+        alertWatchUntil = nowMonotonic + Self.settleCallBudget + Self.alertWatchSeconds
+        usleep(150_000)   // the switch itself; settle then waits for the page
+        var out: [String: JSONValue] = [
             "message": .string("Opened URL \(url.scheme ?? "")://… . Give it a moment, then page_source/screenshot to see where it landed."),
-        ], nil)
+        ]
+        if let front = resolveForegroundBundleId() { out["foreground_app"] = .string(front) }
+        return (out, nil)
     }
 
     private func launchApp(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
@@ -2188,6 +2932,26 @@ class ActionHandler {
         // NON-BLOCKING and returns immediately — no quiescence wait, so a wrong
         // bundle_id or an ad/launch screen can't hang the whole server (which is
         // what XCUIApplication.launch()/activate() did).
+        // The whole call stays inside the 6s reply limit: on a busy phone
+        // (apps installing) a single frame can take a second, and an unbounded
+        // launch runs long enough to wedge the next call. Waits below get what
+        // is left of 4.5s.
+        let launchStart = nowMonotonic
+        let before = ForegroundApp.frontmostPID()
+        // Only "is it already in front?" — naming an unknown front pid asks
+        // every known app for its state, which right after a runner restart
+        // can take seconds and push the launch past 6s.
+        let wasFront: Bool = {
+            if springboardPID == 0 { springboardPID = ForegroundApp.processID(forBundleID: "com.apple.springboard") }
+            if before <= 0 || before == springboardPID { return false }
+            if let known = frontByPID[before] { return known == bundleId }
+            // Asking XCTest for the app's state can take over half a second and
+            // can name the wrong app in front. Unknown: treat as not in front.
+            return false
+        }()
+        let preAt = nowMonotonic
+        let startFrame = ScreenSettle.sample()
+        let captureCost = nowMonotonic - preAt
         let opened = ForegroundApp.openBundleID(bundleId)
         guard opened else {
             AppMemory.shared.recordNotInstalled(bundleId: bundleId)
@@ -2196,48 +2960,329 @@ class ActionHandler {
                 "Call resolve_app{text:\"<app name>\"} to look up the correct one."
             ))
         }
-        usleep(800_000)  // brief settle; app is coming to foreground async
-        lastForegroundBundleId = bundleId
-        boundBundleId = bundleId       // sticky target for subsequent actions
-        lastBoundActivateAt = nowMonotonic  // just brought forward — skip redundant re-activate
+        let openedAt = nowMonotonic
+        let preMs = (preAt - launchStart) * 1000
+        noteOpened(bundleId)
         rememberOpened(bundleId)
-        return ([
-            "message": .string("Opened \(bundleId). Actions now target this app until you open another."),
-            "bound_app": .string(bundleId),
-            // Advisory text goes in `hint`, like every other method — this used
-            // to be a separate "advice" key, so a caller reading hints uniformly
-            // silently missed it.
-            "hint": .string("The app is still launching/rendering — wait 2-3s (call wait), THEN page_source " +
-                            "to confirm the UI is stable before locating elements. Acting too early matches " +
-                            "placeholder/splash elements or is very slow (cold-start element queries can take 6s+)."),
-        ], nil)
+        // This call runs up to 4.5s; watch for late alerts past its end.
+        alertWatchUntil = launchStart + 4.5 + Self.alertWatchSeconds
+        launchedAt[bundleId] = launchStart
+        // The open is asynchronous. Returning after a fixed delay let the
+        // caller's first read land on the previous app (the App Store, the
+        // app switcher) as if it were this one. Wait for the front process
+        // to actually change instead, bounded.
+        // A system alert raised at launch (network, permission) keeps
+        // SpringBoard's pid in front, so the pid never changes: look for one
+        // every half second and stop waiting when it's there.
+        var alertSeen = false
+        if !wasFront {
+            let deadline = min(nowMonotonic + 2.5, launchStart + 2.6)
+            var polls = 0
+            while nowMonotonic < deadline {
+                usleep(100_000)
+                polls += 1
+                let pid = ForegroundApp.frontmostPID()
+                if pid > 0 && pid != before {
+                    // The process that just came up is the one launched: naming
+                    // it by asking XCTest for each app's state right after a
+                    // launch can block for seconds ("Unable to update application
+                    // state promptly") on the first read.
+                    // Mid-switch the front list can lead with the app going away,
+                    // which would pin the previous app's pid to the new app's name
+                    // for good. So only a pid that stays in front, and isn't
+                    // already known as another app. (Asking XCTest for this
+                    // app's pid instead can take seconds right after the launch.)
+                    usleep(150_000)
+                    if ForegroundApp.frontmostPID() == pid, frontByPID[pid] == nil || frontByPID[pid] == bundleId {
+                        frontByPID[pid] = bundleId
+                    }
+                    break
+                }
+                if polls % 5 == 0, systemAlertUp() { alertSeen = true; break }
+            }
+        }
+        let frontAt = nowMonotonic
+        // Then let the launch animation and first draw finish: a read right
+        // away caught splash screens, and the permission or network alert an
+        // app raises at start appears only after it is drawn — too late for
+        // the alert check below without this.
+        // Against one deadline for the whole call: on a hot phone each phase
+        // would overrun its own cap (frames at ~1s each) and launches hit 6s.
+        // Not when a capture is slow: then the screen itself is (a hot phone,
+        // a heavy app starting, where one capture can take seconds), and watching
+        // it only makes launch_app overrun. The caller reads next anyway.
+        let drawn: ScreenSettle.Outcome? = captureCost > 0.35 ? nil :
+            ScreenSettle.wait(baseline: startFrame, budget: max(0.3, min(1.5, launchStart + 3.8 - nowMonotonic)))
+        if let last = drawn?.last { noteSeen(last) }
+        let settledAt = nowMonotonic
+        // A new process in front once the launch has drawn is the app just
+        // opened (the mid-switch mix-up the loop above guards against is
+        // over by now). Naming it the general way asks every known app for
+        // its state, which after a runner restart can take many seconds.
+        let pidNow = ForegroundApp.frontmostPID()
+        var front: String?
+        if let known = frontByPID[pidNow] {
+            front = known
+        } else if pidNow > 0, pidNow != before, pidNow != springboardPID {
+            frontByPID[pidNow] = bundleId
+            front = bundleId
+        } else {
+            front = resolveForegroundBundleId()
+        }
+        if let f = front { Self.lastFront = (f, nowMonotonic) }
+        // Precise: a tracking alert left by ANOTHER app keeps its pid in front
+        // and covers whatever opens next, which would otherwise be reported
+        // as a plain "Opened".
+        let resolvedAt = nowMonotonic
+        // Only with time left: on a loaded phone the SpringBoard walk itself
+        // can take many seconds. The next read checks again anyway.
+        let alert = alertSeen || systemAlertUp(precise: nowMonotonic - launchStart < 3.5)
+        let alertMs = (nowMonotonic - resolvedAt) * 1000
+        // A system alert puts SpringBoard's pid in front even though the app
+        // is there underneath it; name the app, and flag the alert below.
+        // Not confirmed by asking XCTest for the app's state: under an alert
+        // that can block for seconds, pushing launch_app past its 6s limit
+        // and queueing the next read behind it.
+        if alert, front == "com.apple.springboard" {
+            front = bundleId
+        }
+        let total = nowMonotonic - launchStart
+        if wasFront || total > 3.5 {
+            iCTRLUITests.logBuffer.append("🔢 launch \(bundleId): before=\(before) wasFront=\(wasFront) now=\(pidNow) known=\(frontByPID[before] ?? "-")")
+        }
+        if total > 3.5 {
+            iCTRLUITests.logBuffer.append(String(format: "🐢 launch_app %.0fms: pre=%.0f capture=%.0f open=%.0f front=%.0f settle=%.0f name=%.0f alert=%.0f",
+                total * 1000, preMs, captureCost * 1000, (openedAt - preAt - captureCost) * 1000, (frontAt - openedAt) * 1000,
+                (settledAt - frontAt) * 1000, (resolvedAt - settledAt) * 1000, alertMs))
+        }
+        var data: [String: JSONValue] = ["message": .string("Opened \(bundleId)."), "settle": drawn?.json ??
+            .object(["skipped": .string("screen captures are slow right now (\(Int(captureCost * 1000))ms), so the launch wasn't watched")])]
+        if let front = front { data["foreground_app"] = .string(front) }
+        if front == bundleId {
+            // No fixed delay: on current devices apps are usually drawn almost
+            // immediately, and a suggested fixed wait tends to become a blind
+            // sleep in every session. Read, and read again only if needed.
+            data["hint"] = .string("Read the screen right away (page_source). If it still shows a splash or placeholder, " +
+                                   "read again every ~0.5s until it changes (cap ~10s) — don't sleep a fixed time.")
+        } else {
+            data["hint"] = .string("Opened, but \(front ?? "another app") is in front, not \(bundleId): it may still " +
+                                   "be launching, or a system alert (permission, network) covers it. Read with " +
+                                   "page_source{bundle_id:\"com.apple.springboard\"} to see an alert; otherwise read again.")
+        }
+        if alert { data["hint"] = nil; flagAlert(&data) }
+        return (data, nil)
     }
 
     private func activateApp(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         guard let bundleId = cmd.bundleId else {
             return (nil, JSONRPCError(code: -32602, message: "activate_app requires a 'bundle_id'", data: nil))
         }
-        // Safe activate (Obj-C @try/@catch) — a raw XCUIApplication.activate() can
-        // throw an NSException that Swift can't catch and that aborts the runner.
-        var activated = false
-        let ok = runWithTimeout(seconds: 5, label: "activate") {
-            activated = ForegroundApp.safeActivateBundleID(bundleId)
-        }
-        guard ok else {
-            return (nil, .serverError("activate_app timed out after 5s for '\(bundleId)'. Check the bundle_id."))
+        // Opening a running app through LSApplicationWorkspace brings it to the
+        // front, like tapping its icon, and returns at once. It is tried first:
+        // XCUIApplication.activate() throws immediately on iOS 27 and can
+        // block for seconds where it does work. The XCTest path stays as the
+        // fallback.
+        // Whether the app is still alive in the background: iOS ends idle ones,
+        // and then activating starts it fresh — its screen, scroll position
+        // and every ref are gone, which the caller must know.
+        var pidBefore: pid_t = -1
+        _ = runWithTimeout(seconds: 1.5, label: "activate-pid") { pidBefore = ForegroundApp.processID(forBundleID: bundleId) }
+        let activateStart = nowMonotonic
+        let startFrame = ScreenSettle.sample()
+        let captureCost = nowMonotonic - activateStart
+        var activated = ForegroundApp.openBundleID(bundleId)
+        if !activated {
+            let ok = runWithTimeout(seconds: 5, label: "activate") {
+                activated = ForegroundApp.safeActivateBundleID(bundleId)
+            }
+            guard ok else {
+                return (nil, .serverError("activate_app timed out after 5s for '\(bundleId)'. Check the bundle_id."))
+            }
         }
         guard activated else {
             return (nil, .serverError("Could not activate '\(bundleId)' (not installed, or activation failed). Use resolve_app/list_apps to verify the bundle_id."))
         }
-        lastForegroundBundleId = bundleId
-        boundBundleId = bundleId       // sticky target for subsequent actions
-        lastBoundActivateAt = nowMonotonic  // just brought forward — skip redundant re-activate
+        noteOpened(bundleId)
         rememberOpened(bundleId)
-        return (["message": .string("Activated \(bundleId). Actions now target this app.")], nil)
+        // An accepted request is not a switch: activate_app can report
+        // "Activated" while the current app (e.g. Settings opened from a
+        // banner) stays in front. Wait for the front to change, and say where it ended up.
+        let deadline = nowMonotonic + 2.0
+        var front = resolveForegroundBundleId()
+        while front != bundleId, nowMonotonic < deadline {
+            usleep(150_000)
+            front = resolveForegroundBundleId()
+        }
+        var out: [String: JSONValue] = ["message": .string("Activated \(bundleId).")]
+        if let front = front { out["foreground_app"] = .string(front) }
+        // In front is not yet resumed: the switch animation is still running
+        // and the app re-lays out — a tree read right away can show a stale
+        // screen (a feed instead of the page it was left on) for about a second.
+        if front == bundleId, captureCost <= 0.35 {
+            let drawn = ScreenSettle.wait(baseline: startFrame, budget: max(0.3, min(1.2, activateStart + 3.0 - nowMonotonic)))
+            if let last = drawn.last { noteSeen(last) }
+            out["settle"] = drawn.json
+        }
+        if pidBefore >= 0 {
+            out["was_running"] = .bool(pidBefore > 0)
+            if pidBefore == 0 {
+                forgetAppState(bundleId)
+                launchedAt[bundleId] = nowMonotonic
+                out["relaunched"] = .bool(true)
+                out["message"] = .string("\(bundleId) was no longer running (iOS ends apps left in the background), so " +
+                    "it started fresh: earlier screens, scroll position and refs are gone. Read the screen before acting.")
+            }
+        }
+        // An alert (often another app's) covers the screen: the switch may
+        // well have happened underneath it, and launch_app wouldn't help.
+        if systemAlertUp(precise: true) {
+            if front == "com.apple.springboard" { out["foreground_app"] = .string(bundleId) }
+            flagAlert(&out)
+            return (out, nil)
+        }
+        if front != bundleId {
+            out["message"] = .string("Asked to activate \(bundleId), but \(front ?? "another app") is still in front.")
+            out["hint"] = .string("The switch didn't happen. Try launch_app{bundle_id:\"\(bundleId)\"}, or home and then launch_app.")
+        }
+        return (out, nil)
+    }
+
+    /// A fresh process: whatever its tree had grown to, and what collect
+    /// learned about it, is gone.
+    private func forgetAppState(_ bundleId: String) {
+        grownTree[bundleId] = nil
+        heavyList[bundleId] = nil
+        slowCappedRead[bundleId] = nil
+        treeCost[bundleId] = nil
+        liveWalkSlow.remove(bundleId)
+        collectChildren[bundleId] = nil
+        collectHistory[bundleId] = nil
+        collectOCRMode[bundleId] = nil
+        lastVisibleCells[bundleId] = nil
     }
 
     /// An app opened by launch_app/activate_app, not yet confirmed running.
     private var pendingRemember: String?
+
+    /// Whether some node in a rendered (unclipped) tree has `cap` children —
+    /// all a capped fetch allowed it.
+    static func childCapHit(_ body: String, cap: Int) -> Bool {
+        var counts: [Int: Int] = [:]   // indent of parent → children seen so far
+        for line in body.split(separator: "\n") {
+            let ind = line.prefix { $0 == " " }.count
+            counts = counts.filter { $0.key < ind }
+            counts[ind - 2, default: 0] += 1
+            if counts[ind - 2]! >= cap { return true }
+        }
+        return false
+    }
+
+    /// Apps whose capped read was slow (a heavy list): page_source and page
+    /// prefer the visible-cells read and pixel movement there.
+    private var heavyList: [String: TimeInterval] = [:]
+    private var slowCappedRead: [String: TimeInterval] = [:]
+
+    /// A capped walk's cost toward calling the app's list heavy: one over 3s,
+    /// or two over 1.5s within two minutes. A single slow read can be a hot
+    /// phone rather than a heavy list; a heavy list keeps reading slowly.
+    private func noteCappedCost(_ bid: String, seconds: Double) {
+        if seconds > 3 {
+            heavyList[bid] = nowMonotonic
+        } else if seconds > 1.5 {
+            if let prev = slowCappedRead[bid], nowMonotonic - prev < 120 { heavyList[bid] = nowMonotonic }
+            slowCappedRead[bid] = nowMonotonic
+        }
+    }
+    /// Apps whose list tree grew too large to read quickly, and when.
+    private var grownTree: [String: TimeInterval] = [:]
+    /// When each app was last launched: its first read is slow anyway.
+    private var launchedAt: [String: TimeInterval] = [:]
+
+    /// The visible part of a long list in page_source's text form, without
+    /// walking the rows scrolled past: a shallow snapshot finds the list, the
+    /// list names its visible cells (XC_kAXXCAttributeVisibleCells), only
+    /// those are read, and they replace the list's subtree. Deep into a long
+    /// list this stays near a second where the capped read takes many seconds.
+    private func visibleListBody(_ bid: String, verifyFresh: Bool = true) -> (body: String, cells: Int, rows: Int, ms: Int)? {
+        let t = nowMonotonic
+        let screen = CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height)
+        var parts: [AnyHashable: Any]?
+        var cellKey = ""
+        // What the screen shows must be what this returns — more is fine,
+        // less is not. The list can lag a scroll (returning the previous
+        // screen's cells): the same cells as last time while the pixels
+        // moved means stale, so wait and ask again; give up after three tries.
+        let frameNow = ScreenSettle.sample()
+        let tries = verifyFresh ? 3 : 1
+        for attempt in 0..<tries {
+            guard let d = ForegroundApp.visibleListParts(bid, screen: screen, maxElements: 2000),
+                  let cells = d["cell_bodies"] as? [String], !cells.isEmpty else { return nil }
+            cellKey = cells.map { String($0.prefix(120)) }.joined(separator: "|")
+            if let last = lastVisibleCells[bid], last.key == cellKey, let a = last.frame, let b = frameNow,
+               ScreenSettle.contentDiff(a, b) >= ScreenSettle.scrolledShare {
+                if attempt == tries - 1 {
+                    iCTRLUITests.logBuffer.append("⚡️ visible cells \(bid): still the previous screen's — tree read instead")
+                    return nil
+                }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+                continue
+            }
+            parts = d
+            break
+        }
+        guard let d = parts, let root = d["root_body"] as? String, let type = d["container_type"] as? String,
+              let frameV = d["container_frame"] as? NSValue, let cells = d["cell_bodies"] as? [String] else { return nil }
+        // Cells only: a section header or "show more" row between them isn't
+        // one. A gap between consecutive on-screen cells means something
+        // there wasn't read — read the tree instead.
+        let tops = cells.compactMap { Self.frameOf(Substring($0.prefix { $0 != "\n" })) }
+            .filter { $0[1] + $0[3] > 0 && $0[1] < Double(screen.height) }.sorted { $0[1] < $1[1] }
+        for (a, b) in zip(tops, tops.dropFirst()) where b[1] - (a[1] + a[3]) > 80 {
+            iCTRLUITests.logBuffer.append("⚡️ visible cells \(bid): \(Int(b[1] - (a[1] + a[3])))pt gap between cells — tree read instead")
+            return nil
+        }
+        lastVisibleCells[bid] = (cellKey, frameNow, nowMonotonic)
+        let cf = frameV.cgRectValue
+        var lines = root.components(separatedBy: "\n")
+        let rows = (d["children_count"] as? NSNumber)?.intValue ?? -1
+        let cellLines: (Int) -> [String] = { indent in
+            let pad = String(repeating: " ", count: indent)
+            return cells.flatMap { $0.components(separatedBy: "\n").filter { !$0.isEmpty }.map { pad + $0 } }
+        }
+        if let i = lines.firstIndex(where: { l in
+            l.drop { $0 == " " }.hasPrefix(type + ",") && Self.frameOf(Substring(l)).map {
+                abs($0[0] - cf.minX) < 1 && abs($0[1] - cf.minY) < 1 && abs($0[2] - cf.width) < 1 } == true }) {
+            let indent = lines[i].prefix { $0 == " " }.count
+            var j = i + 1
+            while j < lines.count, lines[j].prefix(while: { $0 == " " }).count > indent { j += 1 }
+            lines.replaceSubrange((i + 1)..<j, with: cellLines(indent + 2))
+        } else {
+            lines += cellLines(2)
+        }
+        let ms = Int((nowMonotonic - t) * 1000)
+        iCTRLUITests.logBuffer.append("⚡️ visible cells \(bid): \(cells.count) of \(rows) rows, \(ms)ms " +
+            "(shallow \(Int((d["shallow_ms"] as? NSNumber)?.doubleValue ?? 0))ms)")
+        return (lines.joined(separator: "\n"), cells.count, rows, ms)
+    }
+
+    /// The visible cells last read per app and the screen they came with,
+    /// to tell a lagging list from a scrolled one.
+    private var lastVisibleCells: [String: (key: String, frame: ScreenSettle.Frame?, at: TimeInterval)] = [:]
+
+    /// What scroll_position's own walk (1000 children a node) last cost per
+    /// app: on a list that keeps its scrolled-past rows it can grow past a
+    /// second of every read, so it is skipped there for a while.
+    private var scrollPositionCost: [String: (s: Double, at: TimeInterval)] = [:]
+
+    /// Post-fetch costs of the current page_source, logged when slow.
+    private var readLaps: [String] = []
+    private func timedLap<T>(_ name: String, _ work: () -> T) -> T {
+        let t = nowMonotonic
+        let v = work()
+        let ms = Int((nowMonotonic - t) * 1000)
+        if ms >= 150 { readLaps.append("\(name)=\(ms)ms") }
+        return v
+    }
 
     /// Note that `bundleId` was just opened; it is recorded in AppMemory the
     /// first time a read of it succeeds (see confirmOpened).
@@ -2265,16 +3310,26 @@ class ActionHandler {
         guard let bundleId = cmd.bundleId else {
             return (nil, JSONRPCError(code: -32602, message: "terminate_app requires a 'bundle_id'", data: nil))
         }
-        let ok = runWithTimeout(seconds: 5, label: "terminate") {
-            _ = ForegroundApp.safeTerminateBundleID(bundleId)
+        let pidBefore = ForegroundApp.processID(forBundleID: bundleId)
+        // On this thread (the main one), not via runWithTimeout: XCTest
+        // asserts "-[XCUIApplication terminate] must be called on the main
+        // thread"; elsewhere the exception is swallowed and terminate_app
+        // would report "Terminated" while the app kept running with all its
+        // accumulated state.
+        _ = ForegroundApp.safeTerminateBundleID(bundleId)
+        var pidAfter = ForegroundApp.processID(forBundleID: bundleId)
+        for _ in 0..<10 where pidBefore > 0 && pidAfter == pidBefore {
+            usleep(150_000)
+            pidAfter = ForegroundApp.processID(forBundleID: bundleId)
         }
-        guard ok else {
-            return (nil, .serverError("terminate_app timed out after 5s for '\(bundleId)'."))
+        iCTRLUITests.logBuffer.append("🪓 terminate \(bundleId): pid \(pidBefore) → \(pidAfter)")
+        frontByPID[pidBefore] = nil
+        if pidAfter != pidBefore { forgetAppState(bundleId) }
+        if pidBefore > 0, pidAfter == pidBefore {
+            return (nil, .serverError("terminate_app couldn't end \(bundleId): it is still running (pid \(pidBefore)). " +
+                "A relaunch won't start it fresh; swipe it away in the app switcher if a clean start matters."))
         }
-        // If we just killed the sticky target, unbind so actions fall back to the
-        // live foreground app instead of a dead one.
-        if boundBundleId == bundleId { boundBundleId = nil }
-        return (["message": .string("Terminated \(bundleId)")], nil)
+        return (["message": .string(pidBefore > 0 ? "Terminated \(bundleId) (pid \(pidBefore))" : "\(bundleId) wasn't running")], nil)
     }
 
     // MARK: - View Hierarchy
@@ -2304,7 +3359,10 @@ class ActionHandler {
     struct LocateHit {
         let label: String
         let identifier: String
+        let value: String
+        let elementType: XCUIElement.ElementType
         let byLabel: Bool          // re-resolve by label (else by identifier)
+        let byValue: Bool          // only a value: no live re-resolve, act on the frame
         let ordinal: Int           // index among same-label (or same-id) live matches
         let how: String            // exact | id | contains
         let frame: CGRect
@@ -2318,13 +3376,17 @@ class ActionHandler {
             func num(_ k: String) -> Double { (d[k] as? NSNumber)?.doubleValue ?? 0 }
             label = d["label"] as? String ?? ""
             identifier = d["identifier"] as? String ?? ""
-            byLabel = (d["key"] as? String) != "identifier"
+            value = d["value"] as? String ?? ""
+            elementType = XCUIElement.ElementType(rawValue: (d["type"] as? NSNumber)?.uintValue ?? 0) ?? .any
+            let key = d["key"] as? String
+            byValue = key == "value"
+            byLabel = key == "label"
             ordinal = (d["ordinal"] as? NSNumber)?.intValue ?? 0
             how = d["how"] as? String ?? "exact"
             frame = CGRect(x: num("x"), y: num("y"), width: num("w"), height: num("h"))
             visibility = d["visibility"] as? String ?? "offscreen"
             container = (d["container"] as? [String: Any]).map(LocateScan.rect)
-            if byLabel ? label.isEmpty : identifier.isEmpty { return nil }
+            if byValue ? value.isEmpty : (byLabel ? label.isEmpty : identifier.isEmpty) { return nil }
         }
 
         var summary: JSONValue {
@@ -2356,30 +3418,46 @@ class ActionHandler {
     /// XCUIElementType raw values matching `elementQuery(in:type:)` exactly —
     /// the ordinal a candidate carries is only meaningful against a live query
     /// filtered the same way. nil = any type.
-    private static func typeFilterRaws(_ type: String?) -> [NSNumber]? {
-        let t: XCUIElement.ElementType
-        switch type?.lowercased() {
-        case "button":                  t = .button
-        case "textfield", "text_field": t = .textField
-        case "textview", "text_view":   t = .textView
-        case "label", "static_text":    t = .staticText
-        case "image":                   t = .image
-        case "cell":                    t = .cell
-        case "switch":                  t = .switch
-        case "icon":                    t = .icon
-        default:                        return nil
+    /// Element types by every name a caller might use: the renderer's own
+    /// names (what page_source prints: "SearchField", "StaticText"…), plus
+    /// a few aliases. Unknown names used to be silently ignored, so
+    /// element_type:"SearchField" filtered nothing and returned a StaticText.
+    private static let typeNames: [String: [XCUIElement.ElementType]] = {
+        var m: [String: [XCUIElement.ElementType]] = [:]
+        for raw in UInt(0)...UInt(90) {
+            guard let t = XCUIElement.ElementType(rawValue: raw) else { continue }
+            let name = elementTypeName(t).lowercased()
+            if !name.isEmpty, !name.hasPrefix("type"), m[name] == nil { m[name] = [t] }
         }
-        return [NSNumber(value: t.rawValue)]
+        // A search box or password box is a text field to whoever asks for one.
+        m["textfield"] = [.textField, .searchField, .secureTextField]
+        m["text_field"] = m["textfield"]
+        m["input"] = [.textField, .searchField, .secureTextField, .textView]
+        m["text_view"] = [.textView]
+        m["search_field"] = [.searchField]
+        m["label"] = [.staticText]
+        m["static_text"] = [.staticText]
+        m["text"] = [.staticText]
+        return m
+    }()
+
+    /// nil = no filter. Throws-by-result: `unknownType` is set for a name
+    /// nothing maps to, so the caller can say so instead of ignoring it.
+    private static func typeFilterRaws(_ type: String?) -> [NSNumber]? {
+        guard let key = type?.lowercased().replacingOccurrences(of: " ", with: ""), !key.isEmpty else { return nil }
+        guard let types = typeNames[key] else { return [] }   // matches nothing → "no element of type X"
+        return types.map { NSNumber(value: $0.rawValue) }
     }
 
     /// One bounded snapshot, every match ranked. nil when the bounded path is
     /// unavailable — callers fall back rather than treating that as "absent".
     private func scanCandidates(query: String, type: String?, matchMode: String,
-                                bundleId: String) -> LocateScan? {
+                                bundleId: String,
+                                maxChildren: Int = ActionHandler.maxChildrenPerNode) -> LocateScan? {
         guard let root = ForegroundApp.boundedSnapshot(
                 forBundleID: bundleId,
                 maxDepth: Self.defaultMaxDepth,
-                maxChildren: Self.maxChildrenPerNode),
+                maxChildren: maxChildren),
               let r = ForegroundApp.locate(
                 inBoundedSnapshot: root, query: query,
                 contains: matchMode == "contains",
@@ -2387,13 +3465,35 @@ class ActionHandler {
                 viewport: CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height),
                 maxDepth: Self.defaultMaxDepth) as? [String: Any] else { return nil }
         let raw = r["candidates"] as? [[String: Any]] ?? []
+        var hits = raw.compactMap(LocateHit.init)
+        if matchMode == "contains" { hits = Self.rankContains(hits, query: query) }
         return LocateScan(
-            candidates: raw.compactMap(LocateHit.init),
+            candidates: hits,
             contentTop: (r["content_top"] as? NSNumber)?.doubleValue ?? 0,
             contentBottom: (r["content_bottom"] as? NSNumber)?.doubleValue ?? pointSize.height,
             fingerprint: r["fingerprint"] as? String ?? "",
             scrollContainer: (r["scroll_container"] as? [String: Any]).map(LocateScan.rect),
             visited: (r["visited"] as? NSNumber)?.intValue ?? 0)
+    }
+
+    /// Contains-matching "Allow" also matches "Don't Allow" — the opposite
+    /// answer, which may come first. Negations of the query are dropped
+    /// (the not-found error still lists them among the on-screen labels),
+    /// the exact label goes first, and otherwise the locator's order stands.
+    static func rankContains(_ hits: [LocateHit], query: String) -> [LocateHit] {
+        let q = query.lowercased()
+        func rank(_ h: LocateHit) -> Int {
+            let l = h.label.lowercased()
+            let negated = ["不", "别", "拒绝", "don't ", "do not ", "not ", "never "].contains { neg in
+                l.contains(neg + q) || l.hasPrefix(neg) && !q.hasPrefix(neg) && l.contains(q)
+            }
+            if negated { return 2 }
+            return l == q || h.identifier.lowercased() == q ? 0 : 1
+        }
+        return hits.enumerated()
+            .filter { rank($0.element) < 2 }
+            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+            .map(\.element)
     }
 
     /// Re-resolve a snapshot hit to the LIVE element that IS that node.
@@ -2412,7 +3512,15 @@ class ActionHandler {
             return abs(f.midX - hit.frame.midX) <= 2 && abs(f.midY - hit.frame.midY) <= 2
         }
         let atOrdinal = sub.element(boundBy: hit.ordinal)
-        if atOrdinal.safeExists, sameSpot(atOrdinal) { return (atOrdinal, hit.ordinal) }
+        let probeStart = nowMonotonic
+        let exists = atOrdinal.safeExists
+        if exists, sameSpot(atOrdinal) { return (atOrdinal, hit.ordinal) }
+        // Each probe here is a whole-app walk. When the first pair was already
+        // slow, more of them only add walks (on an app busy starting up, one
+        // more can run past 6s): keep the snapshot's ordinal.
+        if nowMonotonic - probeStart > 0.8 {
+            return exists ? (atOrdinal, hit.ordinal) : nil
+        }
         for i in 0..<6 where i != hit.ordinal {
             let el = sub.element(boundBy: i)
             guard el.safeExists else { break }
@@ -2440,23 +3548,23 @@ class ActionHandler {
     static func snapshotPrecheck(bundleId: String?, action: String,
                                  retryWith method: String, strict: Bool = false) -> JSONRPCError? {
         guard let bid = bundleId, bid != "com.apple.springboard" else { return nil }
+        // Just named as the front app (by pid): no need to ask XCTest's
+        // state, which lags on iOS 27 and can report an app that is on screen
+        // as "in the background".
+        if let front = lastFront, front.bid == bid, ProcessInfo.processInfo.systemUptime - front.at < 2 { return nil }
         var state = AppState(rawValue: ForegroundApp.appState(forBundleID: bid)) ?? .unknown
 
-        // The id being checked is usually the STICKY binding from the last
-        // launch_app, not whatever is actually on screen. If that app has since
-        // been backgrounded but something else is frontmost, refusing the read
-        // is simply wrong — the screen is readable, just not the app we happened
-        // to remember. Seen with com.apple.store.Jolly: screenshot succeeded
-        // while page_source claimed there was no snapshottable window.
-        //
-        // So when the bound app looks unusable, ask what IS in front and, if it
-        // is something else that is running, let the call proceed against it.
+        // The id checked may be one the caller named, or one a ref was made in,
+        // rather than what is on screen now. If that app has gone to the
+        // background but something else is frontmost, the screen is still
+        // readable — refusing would be wrong for a plain read (a screenshot can
+        // succeed while the named app reports no snapshottable window).
         if !strict, state == .background || state == .backgroundSuspended || state == .notRunning,
            let live = ForegroundApp.currentBundleID(), !live.isEmpty, live != bid {
             let liveState = AppState(rawValue: ForegroundApp.appState(forBundleID: live)) ?? .unknown
             if liveState == .foreground || liveState == .unknown {
                 iCTRLUITests.logBuffer.append(
-                    "🔀 precheck: bound app \(bid) is \(state), but \(live) is frontmost — proceeding")
+                    "🔀 precheck: \(bid) is \(state), but \(live) is frontmost — proceeding")
                 state = .foreground
             }
         }
@@ -2469,8 +3577,8 @@ class ActionHandler {
         case .background, .backgroundSuspended:
             return JSONRPCError(code: -32004, message:
                 "Can't \(action): app '\(bid)' is in the background, so it has no snapshottable window. " +
-                "Bring it to the front first — run one interaction (tap/swipe re-focuses the bound app) or call " +
-                "launch_app/activate_app, then retry \(method).", data: nil)
+                "What is on screen is something else now — read it (page_source/screenshot) and decide; to go " +
+                "back to this app, call activate_app/launch_app, then retry \(method).", data: nil)
         default:
             return nil  // foreground or unknown → proceed (unknown may still work)
         }
@@ -2509,24 +3617,13 @@ class ActionHandler {
     }
 
     private func pageSource(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+        // enhanced: the whole tree, then OCR for what it lacks (see ocrOnly).
+        var cmd = cmd
+        if cmd.enhanced == true, cmd.maxChildren == nil { cmd.maxChildren = 5000 }
         // Resolve which app to inspect:
         //   explicit bundle_id → that app
-        //   otherwise → detected foreground app (private API, then last-launched)
-        // An explicit bundle_id is honoured as-is. Otherwise prefer whatever is
-        // ACTUALLY frontmost over the sticky binding: reading is a passive
-        // operation, and a caller asking "what is on screen" means the screen,
-        // not the app we last launched. Without this, switching apps by any
-        // means other than launch_app leaves every read pointed at the old one.
-        var inspectedBundleId = cmd.bundleId ?? resolveForegroundBundleId()
-        if cmd.bundleId == nil,
-           let bound = boundBundleId, !bound.isEmpty,
-           let live = ForegroundApp.currentBundleID(), !live.isEmpty, live != bound,
-           live != "com.apple.springboard" {
-            let boundState = AppState(rawValue: ForegroundApp.appState(forBundleID: bound)) ?? .unknown
-            if boundState != .foreground {
-                inspectedBundleId = live
-            }
-        }
+        //   otherwise → the app actually in front
+        let inspectedBundleId = cmd.bundleId ?? resolveForegroundBundleId()
 
         let target: XCUIApplication
         if let bundleId = inspectedBundleId {
@@ -2576,6 +3673,7 @@ class ActionHandler {
         // run through the protocol path, so fall back when one is active.
         var usedBoundedSnapshot = false
         var boundedBody: String?
+        var rawBoundedBody: String?
         var boundedCount = 0
         var boundedTruncated = false
         // Re-enabled after the empty-tree cause was found. It was never the
@@ -2593,6 +3691,7 @@ class ActionHandler {
         var renderMs = 0.0
         var childrenUsed = 0
         var ladderSteps: [String] = []
+        var capRaisedForGrowth = false
         var ocrFallback: (items: [JSONValue], shotMs: Double, ocrMs: Double)?
         let boundedEnabled = true
         let fetchStart = nowMonotonic
@@ -2608,7 +3707,7 @@ class ActionHandler {
         let pinnedChildren = cmd.maxChildren.map { max(1, min($0, 5000)) }
 
         /// One bounded fetch + render at a given child cap.
-        func attempt(_ children: Int) -> (body: String, nodes: Int, truncated: Bool)? {
+        func attempt(_ children: Int) -> (body: String, nodes: Int, truncated: Bool, capHit: () -> Bool)? {
             guard let bid = inspectedBundleId,
                   let bounded = ForegroundApp.boundedSnapshot(
                     forBundleID: bid,
@@ -2627,16 +3726,73 @@ class ActionHandler {
                     visibleRect: viewport,
                     nodesWritten: &n,
                     truncated: &t) else { return nil }
-            return (text, n, t.boolValue)
+            // Whether some node gave all `children` it was allowed: rows
+            // scrolled past pile up in a list's container, fill the cap, and
+            // push the on-screen rows out (after a long scroll, coverage can
+            // drop to a few percent at 50). Rendered again from the same fetch,
+            // unclipped. Asked only when a read comes back thin: on a large tree
+            // the extra render costs up to a second a read when run every time.
+            let depth = maxDepth == Int.max ? Self.defaultMaxDepth : maxDepth
+            let capHit = { () -> Bool in
+                var m = 0
+                var t2: ObjCBool = false
+                return ForegroundApp.renderBoundedSnapshot(bounded, maxDepth: depth, maxElements: 4000, visibleRect: .null,
+                                                           nodesWritten: &m, truncated: &t2).map { Self.childCapHit($0, cap: children) } ?? false
+            }
+            return (text, n, t.boolValue, capHit)
         }
 
-        if boundedEnabled, inspectedBundleId != nil {
-            var chosen: (body: String, nodes: Int, truncated: Bool)?
+        // Known not to answer (see below), recently: skip straight to OCR
+        // rather than waiting out another tree timeout first.
+        var grownSkip = false
+        var visibleCellsRead: (cells: Int, rows: Int)?
+        if let bid = inspectedBundleId, (treeCost[bid] ?? 0) >= 99, nowMonotonic - treeCostAt < 20 {
+            fetchMs = 99_000
+        } else if cmd.visibleOnly == true, !filter.active, cmd.maxChildren.map({ $0 <= 100 }) ?? true,
+                  let bid = inspectedBundleId, (grownTree[bid].map { nowMonotonic - $0 < 300 } ?? false) || (heavyList[bid].map { nowMonotonic - $0 < 300 } ?? false),
+                  collectNoCells[bid].map({ nowMonotonic - $0 > 300 }) ?? true, let fast = visibleListBody(bid) {
+            // A list known to have grown: its visible cells only, whatever its size.
+            rawBoundedBody = fast.body
+            boundedBody = fast.body
+            boundedCount = fast.body.components(separatedBy: "\n").count
+            usedBoundedSnapshot = true
+            childrenUsed = 0
+            fetchMs = Double(fast.ms)
+            visibleCellsRead = (fast.cells, fast.rows)
+        } else if let bid = inspectedBundleId, let at = grownTree[bid], nowMonotonic - at < 60, cmd.maxChildren.map({ $0 <= 200 }) ?? true {
+            // Grown too big to read quickly (see below): OCR for a while.
+            fetchMs = 99_000
+            grownSkip = true
+        } else if boundedEnabled, inspectedBundleId != nil {
+            var chosen: (body: String, nodes: Int, truncated: Bool, capHit: () -> Bool)?
             var usedChildren = 0
 
             if let pinned = pinnedChildren {
                 chosen = attempt(pinned)
                 usedChildren = pinned
+                // A caller pinning max_children:50 (as documented usage does) skips
+                // the climb below, and on a grown list got a few percent coverage
+                // and "ocr". Widen once there too.
+                if pinned <= 100, let c = chosen, cmd.visibleOnly == true,
+                   visibleLabelledCoverage(c.body) < Self.treeCoverageThreshold,
+                   Self.contentTextCount(c.body, height: pointSize.height) < Self.minTreeTextItems, c.capHit(),
+                   let bid = inspectedBundleId, let fast = visibleListBody(bid) {
+                    chosen = (fast.body, fast.body.components(separatedBy: "\n").count, false, { false })
+                    capRaisedForGrowth = true
+                    visibleCellsRead = (fast.cells, fast.rows)
+                    grownTree[bid] = nowMonotonic
+                    ladderSteps.append("pinned\(pinned)→visible-cells")
+                } else if pinned <= 100, let c = chosen,
+                   visibleLabelledCoverage(c.body) < Self.treeCoverageThreshold,
+                   Self.contentTextCount(c.body, height: pointSize.height) < Self.minTreeTextItems, c.capHit(),
+                   let wider = attempt(200),
+                   visibleLabelledCoverage(wider.body) >= Self.treeCoverageThreshold
+                    || Self.contentTextCount(wider.body, height: pointSize.height) >= Self.minTreeTextItems {
+                    chosen = wider
+                    usedChildren = 200
+                    capRaisedForGrowth = true
+                    ladderSteps.append("pinned\(pinned)→200")
+                }
             } else {
                 // Climb only while the probe says list content stops ABOVE the
                 // viewport AND the container still has more to give.
@@ -2649,6 +3805,10 @@ class ActionHandler {
                     usedChildren = Self.childrenLadder[0]
                     let coverage = visibleLabelledCoverage(first.body)
                     ladderSteps.append(String(format: "50:%.0f%%", coverage * 100))
+                    if let bid = inspectedBundleId, let frame = ScreenSettle.sample() {
+                        coverageCache = (bid, frame, coverage)
+                        readFrame = frame   // also serves page_check's "last seen"
+                    }
 
                     // Escalate when the tree barely describes the content area. A
                     // ratio rather than a node count: count thresholds encode
@@ -2668,7 +3828,36 @@ class ActionHandler {
                     // A 50% bar fired on RED and cost ~400ms of OCR for nothing.
                     // 15% separates the real failures (0-11%) from sparse-but-fine
                     // layouts (26%+) on everything measured.
-                    if coverage < Self.treeCoverageThreshold {
+                    // Text that covers little area is still text: a list of short
+                    // titles can sit under 10% coverage and need no OCR.
+                    // Low because the cap cut the visible rows off, not because
+                    // the app hides them: widen once before giving up on the tree.
+                    var widened = false
+                    if cmd.visibleOnly == true, coverage < Self.treeCoverageThreshold,
+                       Self.contentTextCount(first.body, height: pointSize.height) < Self.minTreeTextItems, first.capHit(),
+                       let bid = inspectedBundleId, let fast = visibleListBody(bid) {
+                        chosen = (fast.body, fast.body.components(separatedBy: "\n").count, false, { false })
+                        ladderSteps.append("visible-cells:\(fast.cells)/\(fast.rows)")
+                        widened = true
+                        capRaisedForGrowth = true
+                        visibleCellsRead = (fast.cells, fast.rows)
+                        grownTree[bid] = nowMonotonic
+                    }
+                    if !widened, coverage < Self.treeCoverageThreshold, nowMonotonic - fetchStart < 2.0,
+                       Self.contentTextCount(first.body, height: pointSize.height) < Self.minTreeTextItems, first.capHit(),
+                       let wider = attempt(200) {
+                        let c2 = visibleLabelledCoverage(wider.body)
+                        ladderSteps.append(String(format: "200:%.0f%%", c2 * 100))
+                        if c2 >= Self.treeCoverageThreshold
+                            || Self.contentTextCount(wider.body, height: pointSize.height) >= Self.minTreeTextItems {
+                            chosen = wider
+                            usedChildren = 200
+                            widened = true
+                            capRaisedForGrowth = true
+                        }
+                    }
+                    if !widened, coverage < Self.treeCoverageThreshold,
+                       Self.contentTextCount(first.body, height: pointSize.height) < Self.minTreeTextItems {
                         // Run the wider fetch and the OCR CONCURRENTLY: serially
                         // they are ~1.2s + ~0.7s, which blows the 1s budget on
                         // exactly the screens that need help most.
@@ -2705,6 +3894,22 @@ class ActionHandler {
 
             childrenUsed = usedChildren
             fetchMs = (nowMonotonic - fetchStart) * 1000
+            // A capped read this slow (seconds from the first screen at full
+            // coverage, timeouts after a long scroll) is a heavy list: read its
+            // visible cells from now on (falls back to this read if it has none).
+            // Two slow reads in a row: one alone may be a hot phone, which would
+            // flag a light app and cost its pages their movement check.
+            if cmd.visibleOnly == true, let bid = inspectedBundleId, !capRaisedForGrowth {
+                noteCappedCost(bid, seconds: fetchMs / 1000)
+            }
+            // Widening kept the visible rows but costs more every screen as
+            // the list grows (from about a second to many seconds over a few
+            // dozen screens). Past 3s, read this app by OCR for a minute.
+            if capRaisedForGrowth, fetchMs > 3000, let bid = inspectedBundleId {
+                grownTree[bid] = nowMonotonic
+                iCTRLUITests.logBuffer.append("🌳 \(bid) tree has grown too large (\(Int(fetchMs))ms) — OCR for the next reads")
+            }
+            if let bid = inspectedBundleId { treeCost[bid] = fetchMs / 1000 }
             if let got = chosen {
                 let renderStart = nowMonotonic
                 // Acceptance: a sizeable tree with NO labels at all is the known
@@ -2717,6 +3922,7 @@ class ActionHandler {
                 // to a handful of nodes, and judging the filtered text would read
                 // that as the bad-fetch signature and fall back for no reason.
                 if got.nodes > 1, got.nodes < 40 || got.body.contains("label:") {
+                    rawBoundedBody = got.body
                     if filter.active {
                         let (filtered, matches) = Self.filterRenderedTree(got.body, filter: filter)
                         boundedBody = filtered
@@ -2730,6 +3936,53 @@ class ActionHandler {
                 }
                 renderMs = (nowMonotonic - renderStart) * 1000
             }
+        }
+
+        // The capped fetch failed after a long wait: the app's accessibility
+        // isn't answering (kAXErrorIPCTimeout). The full-snapshot fallback
+        // below would make XCTest retry it ~9 times at the AX timeout each —
+        // well over a minute, wedging every call behind it. Read the screen
+        // by OCR instead, and mark the tree slow so other calls skip it too.
+        if !usedBoundedSnapshot, let bid = inspectedBundleId, fetchMs > 3000 {
+            if fetchMs < 99_000 { treeCost[bid] = 99 }
+            if !grownSkip {
+                iCTRLUITests.logBuffer.append("🧊 \(bid) accessibility not answering (\(Int(fetchMs))ms) — OCR instead of the full snapshot")
+            }
+            guard let ocr = runOCR(query: nil, fast: false, minConfidence: 0.3) else {
+                return (nil, .serverError("\(bid)'s accessibility isn't answering right now and the screen couldn't be " +
+                                          "captured either. Take a screenshot, wait a moment, and read again."))
+            }
+            var out: [String: JSONValue] = [
+                "source": .string(""),
+                "bundle_id": .string(bid),
+                "ax_unresponsive": .bool(true),
+                "ocr_items": .array(ocr.items),
+                "ocr_count": .int(ocr.items.count),
+                // 99_000 marks "skipped, known unresponsive" — not a time.
+                "timing": .object(["fetch_ms": .int(fetchMs >= 99_000 ? 0 : Int(fetchMs)), "ocr_ms": .int(Int(ocr.ocrMs)),
+                                   "tree_skipped": .bool(fetchMs >= 99_000)]),
+                "hint": .string("This app's accessibility isn't answering (" +
+                                (fetchMs >= 99_000 ? "it timed out moments ago" : "its tree request timed out after \(Int(fetchMs / 1000))s") +
+                                " — often a busy feed or playing video), so the screen was read " +
+                                "by OCR: use ocr_items and tap{x:center_x,y:center_y}. find_element and refs won't work " +
+                                "until it recovers; screenshots and coordinate actions do."),
+            ]
+            if grownSkip {
+                out["ax_unresponsive"] = nil
+                out["tree_growth"] = .bool(true)
+                out["hint"] = .string("This list keeps the rows already scrolled past, and its tree has grown too large " +
+                    "to read quickly, so the screen was read by OCR (~1s): use ocr_items and tap{x:center_x,y:center_y}. " +
+                    "Relaunching the app (terminate_app + launch_app; loses your position) makes the tree small again; " +
+                    "pass max_children explicitly to force a tree read.")
+            }
+            flagBlockers(ocr.items.compactMap(Self.ocrScreenText), bid: bid, overlayShown: false, into: &out)
+            // An app busy drawing its first page is often the one not answering.
+            if ocr.items.count <= 2, let frame = readFrame, ScreenSettle.blankShare(frame) >= 0.85 {
+                out["loading"] = .bool(true)
+                out["loading_reason"] = .string("blank")
+                if case .string(let h)? = out["hint"] { out["hint"] = .string(Self.blankLoadingHint + " " + h) }
+            }
+            return (out, nil)
         }
 
         let appSnap = usedBoundedSnapshot
@@ -2856,15 +4109,37 @@ class ActionHandler {
             // is no way to tell "the trigger decided the tree was fine" from "the
             // trigger never ran", which is exactly the ambiguity that hid a bug here.
             "ax_coverage": .double((visibleLabelledCoverage(body) * 100).rounded() / 100),
-            "channel": Self.screenChannel(visibleLabelledCoverage(body)),
+            // A well-covered screen is readable whatever else it holds (a
+            // hidden tab's long list may have no visible children).
+            "channel": visibleLabelledCoverage(body) < 0.5 && Self.hasOpaqueContent(body, screen: pointSize.size)
+                ? .object([
+                    "ax_coverage": .double((visibleLabelledCoverage(body) * 100).rounded() / 100),
+                    "recommended": .string("ocr"),
+                    "why": .string("A page-sized content area here (a web view or custom-drawn document) exposes no " +
+                                   "text to the accessibility tree; only the controls around it are listed. Read it " +
+                                   "with screen_text and tap by coordinate. Check again on the next screen."),
+                ])
+                : Self.screenChannel(visibleLabelledCoverage(body),
+                                     textItems: Self.contentTextCount(body, height: pointSize.height)),
             // Where this read sits in the list, so a caller can tell "more below"
             // from "already at the bottom" without scrolling to find out.
-            "scroll_position": scrollPosition().map { JSONValue.object($0) } ?? .null,
+            // Another walk of the app; skipped while its tree is slow.
+            // And within 10s of a launch: the app is still starting, and each
+            // extra walk can cost several times the read itself.
+            "scroll_position": (inspectedBundleId.map { isSlowTree($0) || justLaunched($0)
+                || (scrollPositionCost[$0].map { nowMonotonic - $0.at < 120 && $0.s > 0.8 } ?? false) } == true
+                ? nil : timedLap("scroll_position") { () -> [String: JSONValue]? in
+                    let t = nowMonotonic
+                    let v = scrollPosition()
+                    if let bid = inspectedBundleId { scrollPositionCost[bid] = (nowMonotonic - t, nowMonotonic) }
+                    return v
+                })
+                .map { JSONValue.object($0) } ?? .null,
             // A keyboard appearing shifts the whole layout up, which silently
             // invalidates any coordinate read before it — the reported failure
             // was a send button that moved ~50pt between the read and the tap.
             // Reporting the occluded band lets a caller notice that itself.
-            "keyboard": keyboardState(),
+            "keyboard": timedLap("keyboard") { keyboardState(body: rawBoundedBody) },
             // Which channel produced the tree. NOT named "source": that key is
             // already the tree TEXT in this same dictionary, and a duplicate key
             // in a Swift dictionary literal is a runtime trap — it crashed the
@@ -2952,6 +4227,92 @@ class ActionHandler {
                   + "cross-check — prefer the tree items, they have real types and support refs.")
         }
         if filter.active { result["filtered"] = .bool(true) }
+        // An in-app overlay drawn outside accessibility (privacy dialogs,
+        // coach marks, login sheets) leaves the tree as it was while the
+        // screen changes under the caller's eyes, and taps land beneath it.
+        // Same labels as the last read, but a clearly different screen, is
+        // that signature.
+        let screenFrame = inspectedBundleId != "com.apple.springboard" && !filter.active
+            ? readFrame ?? ScreenSettle.sample() : nil
+        if readFrame == nil { readFrame = screenFrame }
+        if let bid = inspectedBundleId, bid != "com.apple.springboard", let frame = screenFrame {
+            let labels = Self.labelFingerprint(body)
+            if let prev = lastTreeRead, prev.bid == bid, prev.labels == labels, body.contains(", label: '"),
+               ScreenSettle.diff(prev.frame, frame) >= 0.35 {
+                result["overlay_suspected"] = .bool(true)
+                let old: String
+                if case .string(let h)? = result["hint"] { old = " " + h } else { old = "" }
+                result["hint"] = .string("Heads-up: the screen changed since your last read but this tree didn't — " +
+                    "something not in the accessibility tree (a dialog, coach mark or login sheet) is probably drawn " +
+                    "on top, and taps from this tree would land under it. Take a screenshot and deal with it first." + old)
+            }
+            lastTreeRead = (bid, labels, frame)
+        }
+        // Share of the screen in one colour, when nothing on it is labelled.
+        let blankShare: Double? = {
+            guard let frame = screenFrame, inspectedBundleId != "com.apple.springboard",
+                  visibleLabelledCoverage(body) < 0.05, (ocrFallback?.items.count ?? 0) <= 2 else { return nil }
+            let share = ScreenSettle.blankShare(frame)
+            iCTRLUITests.logBuffer.append(String(format: "⬜️ blank share %.2f", share))
+            return share
+        }()
+        if Self.looksLikeLoading(body) {
+            result["loading"] = .bool(true)
+            let old: String
+            if case .string(let h)? = result["hint"] { old = " " + h } else { old = "" }
+            result["hint"] = .string("The page shows a loading indicator: prices, lists and counts may still be " +
+                "provisional. Read again before relying on them." + old)
+        } else if let share = blankShare, share >= 0.85 {
+            // A skeleton or a page not drawn yet has no spinner and no wording
+            // ("settled" pages can still be grey boxes). Nearly one
+            // colour and nothing labelled is that — or a page that is really
+            // empty, which the second read tells apart.
+            result["loading"] = .bool(true)
+            result["loading_reason"] = .string("blank")
+            let old: String
+            if case .string(let h)? = result["hint"] { old = " " + h } else { old = "" }
+            result["hint"] = .string(Self.blankLoadingHint + old)
+        }
+        if Self.looksLikeLoginWall(body) {
+            result["login_wall"] = .bool(true)
+            let old: String
+            if case .string(let h)? = result["hint"] { old = " " + h } else { old = "" }
+            result["hint"] = .string("This screen asks you to log in (one-tap / phone / code sign-in). If the task " +
+                "doesn't allow logging in, close it (关闭 / × / 跳过 / 返回 / 暂不登录) and continue as a guest, or report " +
+                "the step as blocked by login. Never tap one-tap / \"继续\" / \"Continue as …\" buttons here: they sign in." + old)
+        }
+        if let v = visibleCellsRead {
+            result["visible_cells"] = .object(["cells": .int(v.cells), "list_rows": .int(v.rows)])
+        }
+        if capRaisedForGrowth || visibleCellsRead != nil {
+            result["tree_growth"] = .bool(true)
+            let old: String
+            if case .string(let h)? = result["hint"] { old = " " + h } else { old = "" }
+            result["hint"] = .string((visibleCellsRead != nil
+                ? "This list keeps the rows already scrolled past (\(visibleCellsRead!.rows) rows in it), so only its " +
+                  "\(visibleCellsRead!.cells) visible cells were read — fast at any depth. "
+                : "This list keeps the rows already scrolled past (its container filled the 50-child cap and pushed the " +
+                  "visible rows out), so this read widened to 200 children; reads slow down as you scroll. ") +
+                "For long reading use collect; relaunching the app (losing the position) resets the list." + old)
+        }
+        if cmd.enhanced == true, ocrFallback == nil, let extra = timedLap("ocr_only", { ocrOnly(body) }), !extra.isEmpty {
+            result["ocr_only"] = .array(extra)
+            result["ocr_only_note"] = .string("\(extra.count) pieces of on-screen text are not in the tree (drawn into " +
+                "images or custom views), read from the screenshot: points, tap{x:center_x,y:center_y}, no ref; " +
+                "they go stale on scroll.")
+        }
+        let layered = Self.stackedLayers(body, screen: pointSize.size)
+        flagBlockers(Self.screenTexts(body) + (ocrFallback?.items ?? []).compactMap(Self.ocrScreenText),
+                     bid: inspectedBundleId, overlayShown: layered != nil || result["overlay_suspected"] != nil
+                        || result["login_wall"] != nil, into: &result)
+        if let top = layered {
+            result["stacked_layers"] = .int(top.count)
+            let old: String
+            if case .string(let h)? = result["hint"] { old = " " + h } else { old = "" }
+            result["hint"] = .string("This tree holds \(top.count) full-screen layers; the last is drawn on top — likely a " +
+                "dialog, login wall or sheet over the page (its text: \(top.labels.map { "'\($0)'" }.joined(separator: ", "))). " +
+                "Deal with it first; controls of the layers under it can't be tapped." + old)
+        }
         if let bid = inspectedBundleId {
             result["bundle_id"] = .string(bid)
             // Say it up front, while the caller is still deciding how to locate
@@ -3127,12 +4488,84 @@ class ActionHandler {
     /// runs before AND after every page/swipe, and a live query costs a full
     /// hierarchy walk per call. Labels plus their y positions, because a feed
     /// can repeat the same strings at different offsets.
+    /// The last time a keyboard was seen up, and in which app.
+    private var lastKeyboardSeen: (bid: String, at: TimeInterval)?
+    /// Where the keyboard started on the last scroll fingerprint (points),
+    /// nil when none was up.
+    private var pageKeyboardTop: Double?
+
+    /// Whether a node sits in the middle 70% of the screen: what scrolls.
+    /// The first labels in tree order are often tabs and a search bar,
+    /// which never move, so a scrolled feed would read as unmoved.
+    static func inContentBand(_ f: [Double], height: Double) -> Bool {
+        let mid = f[1] + f[3] / 2
+        return mid > height * 0.15 && mid < height * 0.85
+    }
+
+    /// A scroll fingerprint from a rendered body: content-band labels and
+    /// where they are (see scrollFingerprint).
+    static func fingerprint(ofBody body: String, height: Double) -> String? {
+        var parts: [String] = []
+        for line in body.split(separator: "\n") {
+            guard let r = line.range(of: ", label: '") else { continue }
+            let rest = line[r.upperBound...]
+            guard let e = rest.range(of: "'") else { continue }
+            let label = rest[..<e.lowerBound]
+            if label.contains("滚动条") || label.lowercased().contains("scroll bar") { continue }
+            guard let f = frameOf(line), inContentBand(f, height: height) else { continue }
+            parts.append("\(label)@\(Int(f[0])),\(Int(f[1]))")
+            if parts.count >= 40 { break }
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "|")
+    }
+
+    static func frameOf(_ line: Substring) -> [Double]? {
+        guard let r = line.range(of: "{{"), let e = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { return nil }
+        let v = line[r.lowerBound..<e.upperBound].split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
+        return v.count >= 4 ? v : nil
+    }
+
+    /// Whether the content moved between two fingerprints: most labels seen
+    /// in both shifted. One control changing place (a search field following
+    /// the keyboard down) is not a scroll; a whole new set of labels is.
+    static func contentShifted(_ before: String, _ after: String) -> Bool {
+        func parse(_ s: String) -> [String: (Double, Double)] {
+            var out: [String: (Double, Double)] = [:]
+            for p in s.split(separator: "|") {
+                guard let at = p.lastIndex(of: "@") else { continue }
+                let xy = p[p.index(after: at)...].split(separator: ",").compactMap { Double($0) }
+                let key = String(p[..<at])
+                if xy.count == 2, out[key] == nil { out[key] = (xy[0], xy[1]) }
+            }
+            return out
+        }
+        let b = parse(before), a = parse(after)
+        let shared = b.keys.filter { a[$0] != nil }
+        // Mostly different labels: the content was replaced by a scroll.
+        if shared.count < 2 || Double(shared.count) < Double(min(a.count, b.count)) * 0.3 {
+            iCTRLUITests.logBuffer.append("🧭 content shift: \(shared.count) of \(min(a.count, b.count)) labels shared → \(before != after ? "replaced" : "same")")
+            return before != after
+        }
+        let moving = shared.filter {
+            abs(a[$0]!.0 - b[$0]!.0) > 4 || abs(a[$0]!.1 - b[$0]!.1) > 4
+        }
+        let verdict = Double(moving.count) >= max(1, Double(shared.count) / 3)
+        iCTRLUITests.logBuffer.append("🧭 content shift: \(moving.count)/\(shared.count) shared labels moved " +
+            "(\(moving.prefix(3).map { "\($0.prefix(12))" }.joined(separator: ", "))) → \(verdict ? "moved" : "still")")
+        return verdict
+    }
+
     private func scrollFingerprint() -> String? {
-        guard let bid = resolveForegroundBundleId(),
-              let root = ForegroundApp.boundedSnapshot(
+        guard let bid = resolveForegroundBundleId() else { return nil }
+        // Two walks per page; on a tree that isn't answering they can take
+        // the whole page call. Without them `moved` is just unknown.
+        if isSlowTree(bid) { return nil }
+        let walkStart = nowMonotonic
+        defer { if nowMonotonic - walkStart > Self.slowTreeSeconds { treeCost[bid] = nowMonotonic - walkStart } }
+        guard let root = ForegroundApp.boundedSnapshot(
                 forBundleID: bid,
                 maxDepth: Self.defaultMaxDepth,
-                maxChildren: Self.maxChildrenPerNode) else { return nil }
+                maxChildren: Self.childrenLadder[0]) else { return nil }
         var n = 0
         var t: ObjCBool = false
         guard let body = ForegroundApp.renderBoundedSnapshot(
@@ -3140,33 +4573,86 @@ class ActionHandler {
                 visibleRect: CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height),
                 nodesWritten: &n, truncated: &t) else { return nil }
         var parts: [String] = []
+        var kbIndent: Int?
         for line in body.split(separator: "\n") {
-            guard line.contains(", label: '") else { continue }
+            // The keyboard is no content: its keys filled the cap, and closing
+            // it read as a scroll (a page on a search screen). Note where it
+            // starts, for telling a closing keyboard from a scroll.
+            let indent = line.prefix { $0 == " " }.count
+            if let k = kbIndent, indent > k { continue }
+            kbIndent = nil
+            if line.dropFirst(indent).hasPrefix("Keyboard,") {
+                kbIndent = indent
+                if let f = Self.frameOf(line) { pageKeyboardTop = min(pageKeyboardTop ?? f[1], f[1]) }
+                continue
+            }
+            // Past the cap, only looking for the keyboard (late in the tree).
+            if parts.count >= 40 { continue }
             guard let r = line.range(of: ", label: '") else { continue }
             let rest = line[r.upperBound...]
             guard let end = rest.range(of: "'") else { continue }
-            guard let fr = line.range(of: "{{") else { continue }
-            let y = line[fr.lowerBound...].split(separator: ",").dropFirst().first ?? ""
-            parts.append("\(rest[..<end.lowerBound])@\(y.trimmingCharacters(in: .whitespaces))")
-            if parts.count >= 25 { break }
+            let label = rest[..<end.lowerBound]
+            // Scroll bars show up while a finger drags, even on a page that
+            // can't scroll: they made every page there "moved".
+            if label.contains("滚动条") || label.lowercased().contains("scroll bar") { continue }
+            guard let f = Self.frameOf(line), Self.inContentBand(f, height: pointSize.height) else { continue }
+            parts.append("\(label)@\(Int(f[0])),\(Int(f[1]))")
         }
         return parts.isEmpty ? nil : parts.joined(separator: "|")
     }
 
     /// Whether a keyboard is up and which part of the screen it covers.
-    private func keyboardState() -> JSONValue {
+    ///
+    /// Read from the tree page_source already fetched when there is one. The
+    /// live `keyboards.firstMatch.exists` probe walks the whole app again —
+    /// on a large results list that alone can be most of a page_source.
+    private func keyboardState(body: String? = nil) -> JSONValue {
         guard let bid = resolveForegroundBundleId() else { return .object(["visible": .bool(false)]) }
-        let target = XCUIApplication(bundleIdentifier: bid)
         var visible = false
         var top: Double = 0
-        _ = ObjCException.catching {
-            let kb = target.keyboards.firstMatch
-            if kb.safeExists {
-                visible = true
-                top = kb.frame.minY
+        if let body = body {
+            for line in body.split(separator: "\n") where line.drop(while: { $0 == " " }).hasPrefix("Keyboard,") {
+                guard let r = line.range(of: "{{") else { continue }
+                let v = line[r.lowerBound...].split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
+                if v.count >= 4, v[3] > 0 { visible = true; top = v[1]; break }
+            }
+        }
+        // Not in a capped tree is not proof: the 50-children cap can cut the
+        // Keyboard node off, and some apps' keyboards aren't in their tree
+        // (reported visible:false with the keyboard up). Ask live then,
+        // unless this app's tree is too slow for it.
+        // Asked as one capped, shallow request rather than a live query: the
+        // live `keyboards.firstMatch.exists` is retried by XCTest on an AX
+        // timeout (several AX timeouts in a row on a busy feed), while this is
+        // a single request bounded by the AX timeout. The keyboard sits near
+        // the top of the tree, so a few levels and a wide child cap find it.
+        if !visible, !isSlowTree(bid), !justLaunched(bid),
+           let root = ForegroundApp.boundedSnapshot(forBundleID: bid, maxDepth: 4, maxChildren: 200) {
+            var n = 0
+            var t: ObjCBool = false
+            if let shallow = ForegroundApp.renderBoundedSnapshot(root, maxDepth: 4, maxElements: 800,
+                                                                 nodesWritten: &n, truncated: &t) {
+                for line in shallow.split(separator: "\n") where line.drop(while: { $0 == " " }).hasPrefix("Keyboard,") {
+                    guard let r = line.range(of: "{{") else { continue }
+                    let v = line[r.lowerBound...].split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
+                    if v.count >= 4, v[3] > 0 { visible = true; top = v[1]; break }
+                }
             }
         }
         guard visible else { return .object(["visible": .bool(false)]) }
+        lastKeyboardSeen = (bid, nowMonotonic)
+        // A Chinese keyboard's candidate bar sits above the Keyboard node, in
+        // the full-width host that runs to the bottom of the screen: keys can
+        // start some 45pt above the Keyboard node's reported top, so taps
+        // "above the keyboard" in that gap land on the candidate bar.
+        if let body = body {
+            let w = pointSize.width, h = pointSize.height
+            for line in body.split(separator: "\n") {
+                guard let f = Self.frameOf(line), f[0] <= 1, f[2] >= w * 0.95, f[1] + f[3] >= h - 2,
+                      f[1] < top, f[1] >= top - 80 else { continue }
+                top = f[1]
+            }
+        }
         return .object([
             "visible": .bool(true),
             "covers_from_y": .double(top.rounded()),
@@ -3207,19 +4693,38 @@ class ActionHandler {
     /// Smallest-containing, because frames nest: the window, a container and a
     /// button can all contain the point, and only the innermost is informative.
     private func elementUnder(x: Double, y: Double) -> [String: JSONValue]? {
-        guard let bid = resolveForegroundBundleId(),
-              let root = ForegroundApp.boundedSnapshot(
+        hitSkipped = false
+        guard let bid = resolveForegroundBundleId() else { return nil }
+        // A tap is ~0.1s; this probe is a whole-tree walk. On a slow tree it
+        // can turn every tap into many seconds, so skip it there and say so.
+        if isSlowTree(bid) { hitSkipped = true; return nil }
+        let probeStart = nowMonotonic
+        defer { treeCost[bid] = nowMonotonic - probeStart }
+        guard let root = ForegroundApp.boundedSnapshot(
                 forBundleID: bid,
                 maxDepth: Self.defaultMaxDepth,
-                maxChildren: Self.maxChildrenPerNode) else { return nil }
+                maxChildren: Self.childrenLadder[0]) else { return nil }
         var n = 0
         var t: ObjCBool = false
         guard let body = ForegroundApp.renderBoundedSnapshot(
                 root, maxDepth: Self.defaultMaxDepth, maxElements: 2000,
                 nodesWritten: &n, truncated: &t) else { return nil }
 
+        return Self.hit(in: body, x: x, y: y, screen: pointSize.size)
+    }
+
+    /// What a tap at (x, y) lands on, from a rendered tree: the smallest
+    /// labelled node containing the point — on the top layer when full-screen
+    /// layers are stacked.
+    static func hit(in body: String, x: Double, y: Double, screen: CGSize) -> [String: JSONValue]? {
+        let lines = body.split(separator: "\n")
+        // A dialog or login wall drawn as a later full-screen layer covers
+        // the page under it, yet the page's controls are still in the tree
+        // and "contain" the point: hit would name a control under a captcha.
+        let stack = layerStack(lines, screen: screen)
+        func smallest(in range: Range<Int>) -> (area: Double, type: String, label: String, f: [Double])? {
         var best: (area: Double, type: String, label: String, f: [Double])?
-        for line in body.split(separator: "\n") {
+        for line in lines[range] {
             guard line.contains(", label: '") || line.contains(", value: '") else { continue }
             guard let r = line.range(of: "{{"),
                   let end = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { continue }
@@ -3231,7 +4736,7 @@ class ActionHandler {
             // A node covering (nearly) the whole screen is the app or a page
             // container, not what was tapped — reporting it as the hit says
             // nothing while looking like an answer.
-            if area >= Double(pointSize.width * pointSize.height) * 0.9 { continue }
+            if area >= Double(screen.width * screen.height) * 0.9 { continue }
             if best == nil || area < best!.area {
                 let t = String(line.drop { $0 == " " }.prefix { $0 != "," })
                 var label = ""
@@ -3242,13 +4747,60 @@ class ActionHandler {
                 best = (area, t, label, f)
             }
         }
-        guard let b = best else { return nil }
-        return [
-            "element_type": .string(b.type),
-            "label": .string(b.label),
-            "x": .double(b.f[0]), "y": .double(b.f[1]),
-            "width": .double(b.f[2]), "height": .double(b.f[3]),
-        ]
+        return best
+        }
+        func json(_ b: (area: Double, type: String, label: String, f: [Double])) -> [String: JSONValue] {
+            [
+                "element_type": .string(b.type),
+                "label": .string(b.label),
+                "x": .double(b.f[0]), "y": .double(b.f[1]),
+                "width": .double(b.f[2]), "height": .double(b.f[3]),
+            ]
+        }
+        let under = smallest(in: lines.indices)
+        // An anti-bot box drawn over part of a page (a slider over a list):
+        // the page's rows under it still "contain" the point.
+        let check = blockers(screenTexts(body))
+        if check.kind == "captcha", let area = check.area, area.contains(CGPoint(x: x, y: y)), let u = under,
+           !check.close.contains(where: { $0.text == u.label }),
+           !captchaPhrases.contains(where: { u.label.lowercased().contains($0) }), u.label != "滑块" {
+            return [
+                "element_type": .string("captcha"), "label": .string("anti-bot check"),
+                "x": .double(area.minX), "y": .double(area.minY), "width": .double(area.width), "height": .double(area.height),
+                "covering_layer": .bool(true), "covered": .object(json(u)),
+                "note": .string("An anti-bot check covers this point, so the tap landed on it, not on '\(u.label)'. " +
+                                "iCTRL doesn't solve verification: close it or back out."),
+            ]
+        }
+        guard let top = stack?.top else { return under.map(json) }
+        // The innermost node on the top layer, else the layer itself.
+        let onTop = smallest(in: top)
+        if let u = under, let t = onTop, u.f == t.f, u.label == t.label { return json(u) }
+        var out: [String: JSONValue]
+        if let t = onTop {
+            out = json(t)
+        } else {
+            let layer = lines[top.lowerBound]
+            let f = layer.range(of: "{{").map {
+                layer[$0.lowerBound...].split(whereSeparator: { !"-0123456789".contains($0) }).compactMap { Double($0) }
+            } ?? []
+            out = [
+                "element_type": .string(String(layer.drop { $0 == " " }.prefix { $0 != "," })),
+                "label": .string(stack!.labels.joined(separator: " / ")),
+            ]
+            if f.count >= 4 {
+                out["x"] = .double(f[0]); out["y"] = .double(f[1])
+                out["width"] = .double(f[2]); out["height"] = .double(f[3])
+            }
+        }
+        out["covering_layer"] = .bool(true)
+        if let u = under {
+            out["covered"] = .object(json(u))
+            out["note"] = .string("A full-screen layer (a dialog, login wall or sheet; its text: " +
+                "\(stack!.labels.map { "'\($0)'" }.joined(separator: ", "))) is drawn over '\(u.label)', so the tap " +
+                "landed on the layer, not on it. Deal with the layer first.")
+        }
+        return out
     }
 
     // MARK: - Which channel can read this screen
@@ -3264,8 +4816,21 @@ class ActionHandler {
     /// app routinely mixes native screens (tree readable) with web or
     /// custom-drawn ones (tree empty), and a lesson carried from one to the
     /// other turns into OCR everywhere — refs lost, misreads, coordinate taps.
-    static func screenChannel(_ coverage: Double) -> JSONValue {
+    static func screenChannel(_ coverage: Double, textItems: Int = 0) -> JSONValue {
         let c = (coverage * 100).rounded() / 100
+        // Small text nodes cover little area: a list of short titles can be
+        // fully in the tree at under 10% coverage, and "ocr" would send callers
+        // to OCR and coordinate taps for a list the tree can read (episode
+        // lists, flight dates and reviews behave the same).
+        if coverage < treeCoverageThreshold, textItems >= minTreeTextItems {
+            return .object([
+                "ax_coverage": .double(c),
+                "text_items": .int(textItems),
+                "recommended": .string("tree"),
+                "why": .string("The tree holds \(textItems) pieces of text on this screen, though they cover only " +
+                               "\(Int(c * 100))% of it: use page_source / find_element → tap{ref}."),
+            ])
+        }
         let tree = coverage >= treeCoverageThreshold
         return .object([
             "ax_coverage": .double(c),
@@ -3277,12 +4842,352 @@ class ActionHandler {
         ])
     }
 
+    static let minTreeTextItems = 6
+
+    /// OCR items whose text the tree doesn't hold where OCR saw it — for
+    /// page_source enhanced. Matched by place (a short tab label isn't "found"
+    /// in a longer row label further down) and loosely — OCR splits and joins
+    /// lines and misreads a glyph, the tree joins fields with "。" — so a line
+    /// counts as present when most of its 3-character pieces are in the text
+    /// of tree nodes over the same spot.
+    private func ocrOnly(_ body: String) -> [JSONValue]? {
+        // screen_text's bar: mixed small text over a picture (a channel row
+        // of short tab names) reads at 0.3 and is still right.
+        guard let o = runOCR(query: nil, fast: false, minConfidence: 0.3) else { return nil }
+        let norm = { (t: String) -> [Character] in Array(t.lowercased().filter { $0.isLetter || $0.isNumber }) }
+        let nodes = Self.screenTexts(body).map { ($0.frame, String(norm($0.text))) }.filter { !$0.1.isEmpty }
+        func present(_ n: [Character], in tree: String) -> Bool {
+            if n.count <= 3 { return tree.contains(String(n)) }
+            var hit = 0
+            for i in 0...(n.count - 3) where tree.contains(String(n[i..<i + 3])) { hit += 1 }
+            return Double(hit) >= 0.6 * Double(n.count - 2)
+        }
+        var out: [JSONValue] = []
+        for v in o.items {
+            guard case .object(let d) = v, case .string(let label)? = d["label"], let e = Self.ocrScreenText(v) else { continue }
+            let n = norm(label)
+            guard n.count >= 2 else { continue }
+            let spot = e.frame.insetBy(dx: -12, dy: -12)
+            if present(n, in: nodes.filter { $0.0.intersects(spot) }.map { $0.1 }.joined(separator: "|")) { continue }
+            out.append(.object(d.filter { ["label", "x", "y", "width", "height", "center_x", "center_y"].contains($0.key) }))
+        }
+        return out
+    }
+
+    /// Distinct text labels (8+ characters) in the content band — sentences,
+    /// titles, prices with words. Icon names ("ic rate small",
+    /// "float_widget_activity_") don't count.
+    static func contentTextCount(_ body: String, height: Double) -> Int {
+        var seen = Set<String>()
+        for e in screenTexts(body) where e.text.count >= 8 && !e.text.contains("滚动条") {
+            let mid = e.frame.midY
+            guard mid > height * 0.15, mid < height * 0.85, e.frame.width > 0 else { continue }
+            let ascii = e.text.allSatisfy { $0.isASCII }
+            if ascii, e.text.contains("_") || e.text == e.text.lowercased() { continue }
+            seen.insert(e.text)
+        }
+        return seen.count
+    }
+
     /// Labelled-node coverage of the foreground app's visible screen — one
     /// bounded read, for responses that don't otherwise walk the tree.
+    /// The last coverage measured, with the screen it was measured on. A
+    /// walk can cost seconds on a busy page, more than the OCR it rides
+    /// along with, and an unchanged screen has an unchanged tree.
+    private var coverageCache: (bid: String, frame: ScreenSettle.Frame, value: Double)?
+    /// A visible loading indicator: a spinner element or standard wording.
+    /// Pixel settle can't tell a stable "Loading…" page from a loaded one,
+    /// and values such as prices can change across consecutive reads.
+    // MARK: - Anti-bot checks, rate limits, popups
+
+    struct ScreenText { let text: String; let type: String; let frame: CGRect }
+
+    /// An OCR item (screen_text / page_source's OCR fallback) as an entry.
+    static func ocrScreenText(_ v: JSONValue) -> ScreenText? {
+        guard case .object(let o) = v, case .string(let t)? = o["label"] else { return nil }
+        func num(_ k: String) -> Double { if case .double(let d)? = o[k] { return d }; if case .int(let i)? = o[k] { return Double(i) }; return 0 }
+        return ScreenText(text: t, type: "ocr", frame: CGRect(x: num("x"), y: num("y"), width: num("width"), height: num("height")))
+    }
+
+    /// A slider / puzzle / "are you a robot" check. Specific phrases only:
+    /// broader words also match an SMS-code login or a puzzle toy on a shopping feed.
+    private static let captchaPhrases = [
+        "滑块验证", "向右滑动", "拖动滑块", "滑动解锁", "拖动下方滑块", "完成拼图", "依次点击", "身份核实", "安全验证",
+        "人机验证", "验证码拦截", "是不是机器人", "不是机器人", "drag the slider", "slide to verify", "verify you are human",
+        "not a robot", "complete the puzzle",
+    ]
+    /// The app throttling or refusing automation: wait, don't push.
+    private static let rateLimitPhrases = [
+        "休息一会", "活动太火爆", "太火爆了", "访问过于频繁", "操作过于频繁", "操作太频繁", "请求过于频繁", "访问受限",
+        "系统繁忙", "稍后再试", "稍后重试", "几分钟后", "出了点问题", "too many requests", "try again later",
+        "unusual traffic",
+    ]
+    private static let promoPhrases = ["消费券", "立即领", "领取", "红包", "优惠券", "抢券"]
+    private static let closeLabels = ["关闭", "close", "×", "✕", "取消", "跳过", "暂不", "以后再说", "不感兴趣", "我知道了", "知道了"]
+
+    /// What blocks the screen, if anything, and the ways out it labels.
+    static func blockers(_ entries: [ScreenText]) -> (kind: String?, area: CGRect?, close: [ScreenText], promo: Bool) {
+        var kind: String?
+        var area: CGRect?
+        func hit(_ e: ScreenText, _ phrases: [String]) -> Bool {
+            let t = e.text.lowercased()
+            return phrases.contains { t.contains($0) }
+        }
+        // A blocking page is sparse and says it in a short line; a feed can
+        // carry the same words in a title (a story quoting "try again later"
+        // must not stop collect as "rate_limit").
+        let longTexts = Set(entries.filter { $0.text.count >= 8 }.map { $0.text }).count
+        let sparse = longTexts <= 12
+        for e in entries {
+            if (sparse && e.text.count <= 40 && hit(e, captchaPhrases)) || (e.text == "滑块" && e.type == "Button") {
+                kind = "captcha"
+                area = area.map { $0.union(e.frame) } ?? e.frame
+            }
+        }
+        if kind == nil, sparse, entries.contains(where: { $0.text.count <= 40 && hit($0, rateLimitPhrases) }) {
+            kind = "rate_limit"
+        }
+        let promo = entries.contains { e in promoPhrases.contains { e.text.contains($0) } && e.text.count <= 30 }
+        let close = entries.filter { e in
+            let t = e.text.lowercased()
+            // Icons are named in English ("ic close s", "login close normal");
+            // a longer Chinese label containing "close" is text (an ad's "VIP can turn this off").
+            return closeLabels.contains(t) || t.contains("close") && e.text.count <= 30
+                || t.contains("关闭") && e.text.count <= 6
+        }
+        // A button and its own text both carry the label: one each.
+        var names = Set<String>()
+        let ways = close.filter { names.insert($0.text).inserted }
+        return (kind, area, Array(ways.prefix(3)), promo)
+    }
+
+    /// The last anti-bot check seen, per app — to refuse drags on it and to
+    /// count how often this app is pushing back.
+    private var lastChallenge: (bid: String, area: CGRect, at: TimeInterval)?
+    private var blockedSeen: [String: [TimeInterval]] = [:]
+
+    /// Adds blocked_by / close_candidates / promo_popup and their advice to
+    /// a read. `overlayShown`: the read already flagged a layer over the page.
+    private func flagBlockers(_ entries: [ScreenText], bid: String?, overlayShown: Bool, into result: inout [String: JSONValue]) {
+        let b = Self.blockers(entries)
+        var advice: [String] = []
+        if let kind = b.kind, let bid = bid {
+            result["blocked_by"] = .string(kind)
+            let recent = (blockedSeen[bid] ?? []).filter { nowMonotonic - $0 < 600 } + [nowMonotonic]
+            blockedSeen[bid] = recent
+            if kind == "captcha" {
+                if let a = b.area { lastChallenge = (bid, a.insetBy(dx: -60, dy: -120), nowMonotonic) }
+                advice.append("An anti-bot check (slider / puzzle / \"are you a robot\") is on screen. iCTRL will not " +
+                    "solve it and refuses drags on it: don't try. Close it if it offers a way out (below), otherwise back " +
+                    "out (返回, or relaunch the app), then slow down — or stop and report the step as blocked by verification.")
+            } else {
+                advice.append("This app is throttling: a \"too busy / rest a while / too many requests\" page. Don't retry " +
+                    "or tap around — wait at least a minute, then try once (刷新 / 重试 / back). If it comes back, stop using " +
+                    "this app for now and report it.")
+            }
+            if recent.count >= 3 {
+                advice.append("This app has pushed back \(recent.count) times in 10 minutes: stop using it for now — more " +
+                    "attempts only escalate its checks.")
+            }
+        } else if b.promo, overlayShown {
+            result["promo_popup"] = .bool(true)
+            advice.append("A promotional popup (coupons / red packets) is over the page. Close it; never tap its 领取 / " +
+                "立即领 / claim buttons — they open activity pages that may dead-end.")
+        }
+        if !b.close.isEmpty, b.kind != nil || overlayShown {
+            result["close_candidates"] = .array(b.close.map {
+                .object(["label": .string($0.text), "x": .double($0.frame.midX.rounded()), "y": .double($0.frame.midY.rounded())])
+            })
+            advice.append("Ways out on screen: " + b.close.map { "'\($0.text)' at (\(Int($0.frame.midX)),\(Int($0.frame.midY)))" }
+                .joined(separator: ", ") + ".")
+        }
+        guard !advice.isEmpty else { return }
+        let old: String
+        if case .string(let h)? = result["hint"] { old = " " + h } else { old = "" }
+        result["hint"] = .string(advice.joined(separator: " ") + old)
+    }
+
+    /// Entries for the detector from a rendered tree.
+    static func screenTexts(_ body: String) -> [ScreenText] {
+        var out: [ScreenText] = []
+        for line in body.split(separator: "\n") {
+            guard let r = line.range(of: ", label: '") else { continue }
+            let rest = line[r.upperBound...]
+            guard let e = rest.range(of: "'"), let f = frameOf(line) else { continue }
+            let t = line.drop { $0 == " " }
+            out.append(ScreenText(text: String(rest[..<e.lowerBound]), type: String(t.prefix { $0 != "," }),
+                                  frame: CGRect(x: f[0], y: f[1], width: f[2], height: f[3])))
+        }
+        return out
+    }
+
+    static let blankLoadingHint = "The screen is nearly one colour with nothing labelled: probably a page still " +
+        "loading (a blank or skeleton screen). Read once more; if it looks the same, the page is really empty and " +
+        "this loading flag was wrong."
+    private static func looksLikeLoading(_ body: String) -> Bool {
+        for line in body.split(separator: "\n") {
+            let t = line.drop(while: { $0 == " " })
+            if t.hasPrefix("ActivityIndicator,") { return true }
+            let l = t.lowercased()
+            if l.contains("正在加载") || l.contains("加载中") || l.contains("正在搜索") || l.contains("搜索中")
+                || l.contains("生成中") || l.contains("处理中") || l.contains("请稍候") || l.contains("请稍等")
+                || l.contains("loading…") || l.contains("loading...")
+                || l.contains("please wait") { return true }
+        }
+        return false
+    }
+
+    /// A sign-in screen or sheet, by its standard wording: common app
+    /// vocabulary, not one app's layout, so callers don't spend calls
+    /// discovering one from the raw tree.
+    private static func looksLikeLoginWall(_ body: String) -> Bool {
+        let text = body.lowercased()
+        if text.contains("一键登录") || text.contains("本机号码登录") { return true }
+        // Sign-up / social sign-in screens ("sign up or log in", "continue with
+        // Google", a saved account plus "create new account").
+        if ["注册或登录", "登录或注册", "帐号登录", "账号登录", "创建新账户", "创建账户", "创建新帐户",
+            "continue with google", "continue with apple", "sign in with apple", "create new account",
+            "create account", "sign up or log in", "log in or sign up"].contains(where: text.contains) { return true }
+        let zhLogin = text.contains("登录") && (text.contains("手机号") || text.contains("验证码") || text.contains("其他方式登录")
+            || text.contains("其他登录方式"))
+        // Some apps write it as one word: "Continue with Phone", "Login with username".
+        let enLogin = (text.contains("sign in") || text.contains("log in") || text.contains("login with")) &&
+            (text.contains("continue with") || text.contains("phone number") || text.contains("password"))
+        return zhLogin || enLogin
+    }
+
+    /// A content node much taller than the screen (a scrolled document) with
+    /// at most one labelled node under it: the document's text isn't exposed
+    /// (a web article: a node many screens tall, no text, chrome around it at
+    /// 20% coverage, so the tree would be recommended and nothing read).
+    static func hasOpaqueContent(_ body: String, screen: CGSize) -> Bool {
+        let lines = body.split(separator: "\n")
+        for (i, l) in lines.enumerated() {
+            guard let r = l.range(of: "{{") else { continue }
+            let v = l[r.lowerBound...].split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
+            guard v.count >= 4, v[3] > screen.height * 3, v[2] >= screen.width * 0.8,
+                  v[1] < screen.height, v[1] + v[3] > 0 else { continue }
+            let indent = l.prefix { $0 == " " }.count
+            var labelled = 0
+            var j = i + 1
+            while j < lines.count, lines[j].prefix(while: { $0 == " " }).count > indent {
+                if lines[j].contains(", label: '"), !lines[j].contains("滚动条"), !lines[j].contains("scroll bar") { labelled += 1 }
+                j += 1
+            }
+            if labelled <= 1 { return true }
+        }
+        return false
+    }
+
+    /// Sibling full-screen subtrees that each carry labelled content: pages
+    /// stacked in one tree (a search page plus a login sheet, a home feed plus a
+    /// login wall). In document order the last sibling is drawn on top. Returns
+    /// the count and the top layer's first labels, or nil when there is one layer.
+    private static func stackedLayers(_ body: String, screen: CGSize) -> (count: Int, labels: [String])? {
+        layerStack(body.split(separator: "\n"), screen: screen).map { ($0.count, $0.labels) }
+    }
+
+    /// The same, with the top layer's lines (indices into `lines`).
+    private static func layerStack(_ lines: [Substring], screen: CGSize)
+        -> (count: Int, labels: [String], top: Range<Int>)? {
+        func frame(_ l: Substring) -> [Double]? {
+            guard let r = l.range(of: "{{") else { return nil }
+            let v = l[r.lowerBound...].split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
+            return v.count >= 4 ? v : nil
+        }
+        func label(_ l: Substring) -> String? {
+            guard let r = l.range(of: ", label: '") else { return nil }
+            let rest = l[r.upperBound...]
+            guard let e = rest.range(of: "'") else { return nil }
+            let s = String(rest[..<e.lowerBound])
+            return s.isEmpty || s.contains("滚动条") ? nil : s
+        }
+        // The keyboard's subtrees: its candidate bar (，。？！) sits in the
+        // middle band, and it holds full-screen containers of its own, so it
+        // would read as a dialog layer.
+        var inKeyboard = [Bool](repeating: false, count: lines.count)
+        var kbIndent: Int? = nil
+        for (i, l) in lines.enumerated() {
+            let ind = l.prefix { $0 == " " }.count
+            if let k = kbIndent, ind > k { inKeyboard[i] = true; continue }
+            kbIndent = nil
+            let t = l.dropFirst(ind)
+            if t.hasPrefix("Keyboard,") || t.contains("nputAssistantView'") || t.contains("id: 'inputView'") {
+                inKeyboard[i] = true; kbIndent = ind
+            }
+        }
+        // Full-screen nodes, grouped by indent: (index, indent).
+        var byIndent: [Int: [Int]] = [:]
+        for (i, l) in lines.enumerated() {
+            guard let f = frame(l), f[0] <= 1, f[1] <= 1, f[2] >= screen.width - 1, f[3] >= screen.height - 1 else { continue }
+            byIndent[l.prefix { $0 == " " }.count, default: []].append(i)
+        }
+        for indent in byIndent.keys.sorted() {
+            // Siblings: same indent and no shallower line between them.
+            var layers: [(labels: [String], lines: Range<Int>)] = []
+            for i in byIndent[indent]! {
+                if inKeyboard[i] { continue }
+                var labels: [String] = []
+                var j = i + 1
+                while j < lines.count, lines[j].prefix(while: { $0 == " " }).count > indent {
+                    if inKeyboard[j] { j += 1; continue }
+                    // Content only: chrome containers are full-screen too (iOS
+                    // 27's glass toolbar, table header/footer holders) but
+                    // keep their text at the edges.
+                    if let s = label(lines[j]), let f = frame(lines[j]),
+                       f[1] + f[3] / 2 > screen.height * 0.25, f[1] + f[3] / 2 < screen.height * 0.75 {
+                        labels.append(s)
+                    }
+                    j += 1
+                }
+                if labels.count >= 2 { layers.append((labels, i..<j)) }
+            }
+            if let top = layers.last, layers.count >= 2 {
+                // A button and its text carry the same label: say it once.
+                let names = top.labels.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+                return (layers.count, Array(names.prefix(3)), top.lines)
+            }
+        }
+        return nil
+    }
+
+    /// The last page_source of an app: its labels and the screen they came with.
+    private var lastTreeRead: (bid: String, labels: Int, frame: ScreenSettle.Frame)?
+    private static func labelFingerprint(_ body: String) -> Int {
+        var h = Hasher()
+        for line in body.split(separator: "\n") where line.contains(", label: '") {
+            if let r = line.range(of: ", label: '") { h.combine(line[r.upperBound...].prefix(60)) }
+        }
+        return h.finalize()
+    }
+
+    /// What covers the front app's content, if anything: a login wall or a
+    /// full-screen layer over the page. One capped read; skipped on a slow tree.
+    private func coveringLayer() -> String? {
+        guard let bid = resolveForegroundBundleId(), bid != "com.apple.springboard", !isSlowTree(bid),
+              heavyList[bid].map({ nowMonotonic - $0 < 300 }) != true,
+              let root = ForegroundApp.boundedSnapshot(forBundleID: bid, maxDepth: Self.defaultMaxDepth, maxChildren: 50)
+        else { return nil }
+        var n = 0
+        var t: ObjCBool = false
+        guard let body = ForegroundApp.renderBoundedSnapshot(
+                root, maxDepth: Self.defaultMaxDepth, maxElements: 600,
+                visibleRect: CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height),
+                nodesWritten: &n, truncated: &t) else { return nil }
+        if Self.looksLikeLoginWall(body) { return "a login screen" }
+        if let top = Self.stackedLayers(body, screen: pointSize.size) {
+            return "a layer on top (" + top.labels.prefix(3).map { "'\($0)'" }.joined(separator: ", ") + ")"
+        }
+        return nil
+    }
+
     private func currentTreeCoverage() -> Double? {
-        guard let bid = resolveForegroundBundleId(),
-              bid != "com.apple.springboard",
-              let root = ForegroundApp.boundedSnapshot(forBundleID: bid, maxDepth: Self.defaultMaxDepth,
+        guard let bid = resolveForegroundBundleId(), bid != "com.apple.springboard" else { return nil }
+        if let c = coverageCache, c.bid == bid, let now = readFrame, ScreenSettle.diff(c.frame, now) < 0.02 {
+            return c.value
+        }
+        if isSlowTree(bid) { return nil }
+        guard let root = ForegroundApp.boundedSnapshot(forBundleID: bid, maxDepth: Self.defaultMaxDepth,
                                                        maxChildren: 50) else { return nil }
         var n = 0
         var t: ObjCBool = false
@@ -3290,7 +5195,25 @@ class ActionHandler {
                 root, maxDepth: Self.defaultMaxDepth, maxElements: 600,
                 visibleRect: CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height),
                 nodesWritten: &n, truncated: &t) else { return nil }
-        return visibleLabelledCoverage(body)
+        let value = visibleLabelledCoverage(body)
+        if let frame = readFrame { coverageCache = (bid, frame, value) }
+        coverageBody = body
+        return value
+    }
+    /// The tree text behind the last coverage measured: lets screen_text check
+    /// whether the words OCR sees are in the tree at all.
+    private var coverageBody: String?
+
+    /// Share of OCR'd text lines (4+ characters) that also appear in the tree.
+    /// Labelled chrome can cover the screen while a web article's text isn't
+    /// in the tree at all (high coverage, no article text).
+    static func treeTextShare(_ ocr: [String], body: String) -> Double? {
+        func norm(_ s: String) -> String { s.lowercased().filter { !$0.isWhitespace } }
+        let tree = norm(body)
+        let lines = ocr.map(norm).filter { $0.count >= 4 }
+        guard lines.count >= 5 else { return nil }
+        let found = lines.filter { tree.contains($0.prefix(12)) }.count
+        return Double(found) / Double(lines.count)
     }
 
     /// Screen regions drawn OVER the foreground app by the system: the status
@@ -3301,9 +5224,21 @@ class ActionHandler {
     ///
     /// Generic on purpose: no knowledge of which app or activity drew what,
     /// just "inside the app's card" versus "on top of it".
+    /// SpringBoard's overlay regions barely change between reads (status bar,
+    /// a rare banner) but cost a walk of SpringBoard each screen_text — a
+    /// large share of the call. Reuse them briefly.
+    private var overlayCache: (bid: String, rects: [CGRect], at: TimeInterval)?
+
     private func overlayRects() -> [CGRect] {
-        guard let fg = resolveForegroundBundleId(), fg != "com.apple.springboard",
-              let root = ForegroundApp.boundedSnapshot(forBundleID: "com.apple.springboard",
+        guard let fg = resolveForegroundBundleId(), fg != "com.apple.springboard" else { return [] }
+        if let c = overlayCache, c.bid == fg, nowMonotonic - c.at < 5 { return c.rects }
+        let rects = computeOverlayRects()
+        overlayCache = (fg, rects, nowMonotonic)
+        return rects
+    }
+
+    private func computeOverlayRects() -> [CGRect] {
+        guard let root = ForegroundApp.boundedSnapshot(forBundleID: "com.apple.springboard",
                                                        maxDepth: Self.defaultMaxDepth, maxChildren: 50) else { return [] }
         let screen = CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height)
         var n = 0
@@ -3383,13 +5318,22 @@ class ActionHandler {
         let viewportH = pointSize.height
         let contentH = bottom - top
         let scrollable = contentH - viewportH
-        // Everything fits on screen: nothing to scroll, so a percentage would be
-        // a fiction. Say so instead of reporting 0%.
+        // The rows in the tree fit on screen. That proves "nothing to scroll"
+        // only if they also end well short of the bottom edge: a lazily built
+        // list exposes just its on-screen rows, which always "fit" — an endless
+        // feed would be reported as having nothing to scroll.
         guard scrollable > 1 else {
+            if bottom < viewportH * 0.85 {
+                return [
+                    "fits_on_screen": .bool(true),
+                    "confidence": .string("exact"),
+                    "note": .string("All \(tops.count) rows fit in the viewport and end above its bottom — there is nothing to scroll."),
+                ]
+            }
             return [
-                "fits_on_screen": .bool(true),
-                "confidence": .string("exact"),
-                "note": .string("All \(tops.count) rows fit in the viewport — there is nothing to scroll."),
+                "confidence": .string("unknown"),
+                "note": .string("Only on-screen rows are in the tree (a lazily built list), so how much more there " +
+                                "is can't be told. page{direction:\"down\"} and check `moved` to find out."),
             ]
         }
 
@@ -3429,19 +5373,488 @@ class ActionHandler {
     ///
     /// One caveat worth passing on: a page still LOADING also looks unchanged,
     /// so `at_end` is reported as a likelihood, not a fact.
+    /// Where a page drag starts and how far it goes. With a keyboard up the
+    /// drag must stay above it: one starting low (78% of the height) lands on
+    /// the keys, scrolls nothing and could type. The search field iOS 27 floats
+    /// on top of the keyboard, and a band above it, take the touch too: from
+    /// 120pt above the keyboard nothing moves, from 165pt it scrolls.
+    private func pageBand(pages: Double) -> (bottom: Double, travel: Double) {
+        let h = pointSize.height
+        let bottom = pageKeyboardTop.map { max(h * 0.3, min($0 - 120, $0 * 0.72)) } ?? h * 0.78
+        return (bottom, (pageKeyboardTop == nil ? h * 0.66 : bottom - h * 0.12) * pages)
+    }
+
+    // MARK: - collect: page + read, several screens per call
+
+    /// What earlier collect calls returned, per app — so the next call
+    /// continues the list instead of repeating it.
+    private var collectSeen: (bid: String, texts: Set<String>, at: TimeInterval)?
+    /// Apps where collect found no table / collection view list to read by
+    /// visible cells, and when.
+    private var collectNoCells: [String: TimeInterval] = [:]
+    /// The mode collect left an app's list in for cost, so the next call
+    /// starts there.
+    private var collectOCRMode: [String: (reason: String, at: TimeInterval)] = [:]
+    /// The child cap collect reads an app's list with, once widened.
+    private var collectChildren: [String: (n: Int, at: TimeInterval)] = [:]
+    /// Recent tree reads (seconds, nodes) per app, for collect's mode choice.
+    private var collectHistory: [String: (samples: [(ms: Double, nodes: Int)], at: TimeInterval)] = [:]
+
+    /// Whether the tree has become too costly to keep reading screen by
+    /// screen, and why. One read over 4s; the median of the last three over
+    /// 2s; or a rising trend (≥150ms a screen over 4+ reads) about to cross
+    /// 2s on the next — left before it times out, not after.
+    static func treeTooCostly(_ h: [(ms: Double, nodes: Int)]) -> String? {
+        guard let last = h.last else { return nil }
+        if last.ms > 4 { return "slow" }
+        if h.count >= 3 {
+            let m = h.suffix(3).map { $0.ms }.sorted()[1]
+            if m > 2 { return "slow" }
+        }
+        if h.count >= 4 {
+            let ys: [Double] = h.suffix(6).map { $0.ms }
+            let n = Double(ys.count)
+            let mx: Double = (n - 1) / 2
+            var my: Double = 0
+            for y in ys { my += y }
+            my /= n
+            var num: Double = 0, den: Double = 0
+            for (i, y) in ys.enumerated() {
+                let dx = Double(i) - mx
+                num += dx * (y - my)
+                den += dx * dx
+            }
+            let slope = den > 0 ? num / den : 0
+            if slope > 0.15, last.ms + slope > 2 {
+                let grew = h.first.map { last.nodes - $0.nodes } ?? 0
+                return "growing (+\(Int(slope * 1000))ms/screen, nodes \(grew >= 0 ? "+" : "")\(grew))"
+            }
+        }
+        return nil
+    }
+
+    /// Apps whose list text was found to be mostly outside the tree.
+    private var collectPrefersOCR: [String: TimeInterval] = [:]
+
+    /// Paging a feed meant two calls a screen (page, then page_source) and
+    /// several seconds each. One call reads, pages, reads… and hands back only
+    /// text not seen before.
+    private func collect(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
+        guard let bid = resolveForegroundBundleId() else {
+            return (nil, .serverError("Can't tell which app is in front, so there is no tree to collect from. Read it with page_source first."))
+        }
+        // OCR when asked, or when the app's accessibility has stopped
+        // answering — a long feed can stop after a few screens; tree reads
+        // then fail and collect would return nothing.
+        let source = cmd.source?.lowercased() ?? "auto"
+        // fresh: a new list — judge the tree again rather than keep an old
+        // "thin" verdict.
+        if cmd.fresh == true { collectPrefersOCR[bid] = nil }
+        // A tree read just measured at 3s+ can't fit several screens in the
+        // budget: collect would wait out a failing read before going to OCR,
+        // past its call limit.
+        var useOCR = source == "ocr" || (source == "auto" && (treeCost[bid] ?? 0) >= 3 && nowMonotonic - treeCostAt < 20)
+            || (source == "auto" && collectPrefersOCR[bid].map { nowMonotonic - $0 < 300 } == true)
+        var switchedToOCR = false
+        let start = nowMonotonic
+        let budget = 11.0
+        let pages = max(0, min(cmd.pages ?? 3, 8))
+        let minLen = max(1, cmd.minLength ?? 2)
+        let goingDown = cmd.direction?.lowercased() != "up"
+        var seen: Set<String> = []
+        if cmd.fresh != true, let c = collectSeen, c.bid == bid, nowMonotonic - c.at < 600 { seen = c.texts }
+        let screen = CGRect(x: 0, y: 0, width: pointSize.width, height: pointSize.height)
+
+        // A list found to keep its scrolled-past rows stays widened for the
+        // rest of the session: reset to 50 on the next call, it hit the cap
+        // again and the thin read sent the app to OCR for good.
+        var cellsReads = 0
+        var children = (cmd.fresh != true ? collectChildren[bid] : nil).flatMap { nowMonotonic - $0.at < 600 ? $0.n : nil }
+            ?? Self.childrenLadder[0]
+        var capHit: () -> Bool = { false }
+        // Visible cells first: their cost doesn't grow with the list. Apps
+        // without a table / collection view list fall back, and aren't asked
+        // again for a while.
+        var tryCells = collectNoCells[bid].map { nowMonotonic - $0 > 300 } ?? true
+        func read() -> (items: [(String, String, [Double])], fingerprint: String)? {
+            var n = 0
+            let body: String
+            if tryCells, let fast = visibleListBody(bid) {
+                body = fast.body
+                n = fast.cells
+                capHit = { false }
+                cellsReads += 1
+            } else {
+                let triedCells = tryCells
+                tryCells = false
+                guard let root = ForegroundApp.boundedSnapshot(forBundleID: bid, maxDepth: Self.defaultMaxDepth,
+                                                               maxChildren: children) else { return nil }
+                var t: ObjCBool = false
+                let cap = children
+                capHit = {
+                    var m = 0
+                    var t2: ObjCBool = false
+                    return ForegroundApp.renderBoundedSnapshot(root, maxDepth: Self.defaultMaxDepth, maxElements: 4000, visibleRect: .null,
+                                                               nodesWritten: &m, truncated: &t2).map { Self.childCapHit($0, cap: cap) } ?? false
+                }
+                guard let b = ForegroundApp.renderBoundedSnapshot(root, maxDepth: Self.defaultMaxDepth, maxElements: 1200,
+                                                                  visibleRect: screen, nodesWritten: &n, truncated: &t) else { return nil }
+                body = b
+                // Only a loaded screen says "no cell list here" (a cold start
+                // may not have drawn its list yet).
+                if triedCells, Self.contentTextCount(b, height: pointSize.height) >= Self.minTreeTextItems {
+                    collectNoCells[bid] = nowMonotonic
+                }
+            }
+            var items: [(String, String, [Double])] = []
+            var parts: [String] = []
+            var kbIndent: Int?
+            lastBody = body
+            lastNodes = n
+            for line in body.split(separator: "\n") {
+                let indent = line.prefix { $0 == " " }.count
+                if let k = kbIndent, indent > k { continue }
+                kbIndent = nil
+                let text = line.dropFirst(indent)
+                if text.hasPrefix("Keyboard,") {
+                    kbIndent = indent
+                    if let f = Self.frameOf(line), pageKeyboardTop == nil { pageKeyboardTop = f[1] }
+                    continue
+                }
+                if text.hasPrefix("Application,") || text.hasPrefix("Window,") { continue }
+                guard let r = line.range(of: ", label: '") else { continue }
+                let rest = line[r.upperBound...]
+                guard let e = rest.range(of: "'") else { continue }
+                let label = String(rest[..<e.lowerBound]).trimmingCharacters(in: .whitespaces)
+                if label.contains("滚动条") || label.lowercased().contains("scroll bar") { continue }
+                guard let f = Self.frameOf(line), f[2] > 0, f[3] > 0,
+                      CGRect(x: f[0], y: f[1], width: f[2], height: f[3]).intersects(screen) else { continue }
+                if parts.count < 40, Self.inContentBand(f, height: pointSize.height) {
+                    parts.append("\(label)@\(Int(f[0])),\(Int(f[1]))")
+                }
+                guard label.count >= minLen else { continue }
+                items.append((label, String(text.prefix { $0 != "," }), f))
+            }
+            return (items, parts.joined(separator: "|"))
+        }
+
+        @discardableResult
+        func dragPage() -> JSONRPCError? {
+            let band = pageBand(pages: 1)
+            let fromY = goingDown ? band.bottom : pointSize.height * 0.22
+            let toY = goingDown ? max(pointSize.height * 0.12, fromY - band.travel)
+                                : min(pageKeyboardTop == nil ? pointSize.height * 0.88 : band.bottom, fromY + band.travel)
+            if let err = fastHandler.fastSwipe(fromX: pointSize.width / 2, fromY: fromY, toX: pointSize.width / 2, toY: toY,
+                                               duration: 0.35, hold: 0.25).1 { return err }
+            // Rows fill in right after the drag stops (lazy cells, prices).
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+            return nil
+        }
+        var retriedFirst = false
+        var lastBody: String?
+        var lastNodes = 0
+        // Tree read costs over this app's recent screens — across calls, so a
+        // list read in several collect calls is judged as one session.
+        var history = (cmd.fresh != true ? collectHistory[bid] : nil).flatMap { nowMonotonic - $0.at < 600 ? $0.samples : nil } ?? []
+        var ocrReason: String? = useOCR ? (source == "ocr" ? "asked" : (treeCost[bid] ?? 0) >= 99 ? "unresponsive" : (treeCost[bid] ?? 0) >= 3 ? "slow" : "thin") : nil
+        var ocrScreens = 0
+        // Left on OCR for cost last time: start there (re-checked below every
+        // 4 screens) instead of paying one more slow tree read to find out.
+        if !useOCR, source == "auto", cmd.fresh != true, let m = collectOCRMode[bid], nowMonotonic - m.at < 300 {
+            useOCR = true
+            ocrReason = m.reason
+            ocrScreens = 1
+        }
+        var modeChanges: [JSONValue] = []
+        func switchMode(toOCR: Bool, screen: Int, reason: String) {
+            useOCR = toOCR
+            ocrReason = toOCR ? reason : nil
+            if toOCR, reason == "slow" || reason.hasPrefix("growing") { collectOCRMode[bid] = (reason, nowMonotonic) }
+            if !toOCR { collectOCRMode[bid] = nil }
+            if toOCR { switchedToOCR = true }
+            ocrScreens = 0
+            modeChanges.append(.object(["screen": .int(screen), "to": .string(toOCR ? "ocr" : "tree"), "reason": .string(reason)]))
+            iCTRLUITests.logBuffer.append("🧺 collect: screen \(screen) → \(toOCR ? "OCR" : "tree") (\(reason))")
+        }
+        var lastEntries: [ScreenText] = []
+        func readOCR() -> (items: [(String, String, [Double])], fingerprint: String)? {
+            guard let o = runOCR(query: nil, fast: false, minConfidence: 0.4) else { return nil }
+            var items: [(String, String, [Double])] = []
+            var parts: [String] = []
+            for v in o.items {
+                guard let e = Self.ocrScreenText(v) else { continue }
+                let f = [Double(e.frame.minX), Double(e.frame.minY), Double(e.frame.width), Double(e.frame.height)]
+                if parts.count < 40, Self.inContentBand(f, height: pointSize.height) {
+                    parts.append("\(e.text)@\(Int(f[0])),\(Int(f[1]))")
+                }
+                if e.text.count >= minLen { items.append((e.text, "ocr", f)) }
+            }
+            return (items, parts.joined(separator: "|"))
+        }
+        var out: [JSONValue] = []
+        var screensRead = 0
+        var atEnd = false
+        var stoppedForTime = false
+        var staleRereads = 0
+        var lastFingerprint: String?
+        var lastFrame = ScreenSettle.sample()
+        var perScreen = 1.0
+        for i in 0...pages {
+            let t0 = nowMonotonic
+            // A screen costs a read plus a drag; don't start one that can't finish.
+            if i > 0, nowMonotonic - start + perScreen * 1.2 > budget { stoppedForTime = true; break }
+            let readStart = nowMonotonic
+            var maybe = useOCR ? readOCR() : read()
+            // A read that came back empty quickly is a hiccup (a screen still
+            // changing), not an app that stopped answering: try once more.
+            if maybe == nil, !useOCR, nowMonotonic - readStart < 2 {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+                maybe = read()
+            }
+            if maybe == nil, !useOCR, source == "auto" {
+                // The tree read failed: the app stopped answering. Mark it, and
+                // read this screen and the rest by OCR.
+                if nowMonotonic - readStart > 2 { treeCost[bid] = 99 }
+                switchMode(toOCR: true, screen: i, reason: "unresponsive")
+                maybe = readOCR()
+            }
+            guard var got = maybe else { break }
+            // Thin because the list kept its scrolled-past rows and they filled
+            // the child cap — not because the text isn't in the tree: widen.
+            // Only when the capped read was cheap and the call has room: on a
+            // cold, already-large tree the extra render plus a 200-child
+            // fetch can push one screen past the call limit.
+            if !useOCR, children < 200, nowMonotonic - readStart < 1.5, budget - (nowMonotonic - start) > 4,
+               Set(got.items.filter { $0.0.count >= 8 && Self.inContentBand($0.2, height: pointSize.height) }.map { $0.0 }).count
+                < Self.minTreeTextItems, capHit() {
+                children = 200
+                collectChildren[bid] = (200, nowMonotonic)
+                if let wider = read() {
+                    got = wider
+                    modeChanges.append(.object(["screen": .int(i), "to": .string("tree, 200 children"),
+                                                "reason": .string("tree growth: scrolled-past rows filled the 50-child cap")]))
+                    iCTRLUITests.logBuffer.append("🧺 collect: screen \(i) child cap hit — widened to 200")
+                }
+            }
+            // A thin tree: the screen's content isn't in it (e.g. section
+            // headers only, where OCR reads several times more). Check the
+            // first screen against OCR once and keep whichever reads more.
+            if i == 0, !useOCR, source == "auto" {
+                // Right after a launch the feed is still filling in (the first tree
+                // can hold almost no text) — give it a second first, or the whole
+                // session would go to OCR and lose the tree's texts.
+                if launchedAt[bid].map({ readStart - $0 < 10 }) == true,
+                   got.items.filter({ $0.0.count >= 8 && Self.inContentBand($0.2, height: pointSize.height) }).count < Self.minTreeTextItems {
+                    RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+                    if let again = read() { got = again }
+                }
+                // Few texts from the visible cells may be the wrong list (a banner
+                // strip on the first screen while the tree holds the feed):
+                // the plain tree decides before OCR does.
+                let thinNow = { (g: (items: [(String, String, [Double])], fingerprint: String)) in
+                    g.items.filter { $0.0.count >= 8 && Self.inContentBand($0.2, height: self.pointSize.height) }.count
+                }
+                if tryCells, cellsReads > 0, thinNow(got) < Self.minTreeTextItems {
+                    tryCells = false
+                    if let plain = read(), thinNow(plain) > thinNow(got) { got = plain } else { tryCells = true }
+                }
+                // Still thin from a capped tree (after a long scroll the cap can
+                // hide most of what the screen shows): one wider read before OCR,
+                // which drops the tree's types and refs.
+                if !tryCells, children < 200, thinNow(got) < Self.minTreeTextItems, budget - (nowMonotonic - start) > 4 {
+                    let saved = children
+                    children = 200
+                    if let wider = read(), thinNow(wider) > thinNow(got) {
+                        got = wider
+                        collectChildren[bid] = (200, nowMonotonic)
+                        iCTRLUITests.logBuffer.append("🧺 collect: screen \(i) thin at \(saved) children — widened to 200")
+                    } else { children = saved }
+                }
+                // Compared by the amount of text, not the number of pieces: some
+                // apps put a whole post (author, text, counts) in one label, a few
+                // a screen, while OCR splits the same text into many lines — by
+                // count a complete tree would read as "thin".
+                let treeSet = Set(got.items.filter { $0.0.count >= 8 && Self.inContentBand($0.2, height: pointSize.height) }.map { $0.0 })
+                let treeTexts = treeSet.count
+                let treeChars = treeSet.reduce(0) { $0 + $1.count }
+                if treeTexts < Self.minTreeTextItems, let o = readOCR() {
+                    let ocrSet = Set(o.items.filter { $0.0.count >= 8 }.map { $0.0 })
+                    let ocrTexts = ocrSet.count
+                    let ocrChars = ocrSet.reduce(0) { $0 + $1.count }
+                    if ocrTexts >= Self.minTreeTextItems, ocrChars >= treeChars * 2 {
+                        collectPrefersOCR[bid] = nowMonotonic
+                        switchMode(toOCR: true, screen: i, reason: "thin (tree \(treeTexts) texts, OCR \(ocrTexts))")
+                        got = o
+                    }
+                }
+            }
+            // Whether to leave the tree is judged on its recent cost, not one
+            // read: a single slow read on a hot phone would send an app to OCR
+            // for good, while a tree that grows as rows pile up gets slower screen
+            // by screen and should be left before it costs a timeout.
+            // The first read after a launch pays the app's start-up: not a
+            // measure of its tree.
+            let coldRead = launchedAt[bid].map { readStart - $0 < 10 } == true && i == 0
+            if !useOCR, !coldRead {
+                history.append((nowMonotonic - readStart, lastNodes))
+                if history.count > 12 { history.removeFirst(history.count - 12) }
+                if source == "auto", let why = Self.treeTooCostly(history) { switchMode(toOCR: true, screen: i, reason: why) }
+            } else if useOCR {
+                ocrScreens += 1
+                // Not for good: look at the tree again now and then, and go back
+                // when it is quick (slow / growing) or carries the text (thin).
+                // A thin verdict is rechecked on each call's first screen as
+                // well: the tree may have filled in since (an app still starting).
+                if source == "auto", let reason = ocrReason, ocrScreens % 4 == 0 || (ocrScreens == 1 && reason.hasPrefix("thin")),
+                   reason == "slow" || reason.hasPrefix("growing") || reason.hasPrefix("thin") {
+                    let t = nowMonotonic
+                    if let tree = read() {
+                        let ms = nowMonotonic - t
+                        let textSet = Set(tree.items.filter { $0.0.count >= 8 && Self.inContentBand($0.2, height: pointSize.height) }.map { $0.0 })
+                        let texts = textSet.count
+                        let chars = textSet.reduce(0) { $0 + $1.count }
+                        let back = reason.hasPrefix("thin") ? texts >= Self.minTreeTextItems || chars >= 300 : ms < 1.2
+                        if back {
+                            history = [(ms, lastNodes)]
+                            if reason.hasPrefix("thin") { collectPrefersOCR[bid] = nil }
+                            switchMode(toOCR: false, screen: i, reason: reason.hasPrefix("thin")
+                                       ? "tree carries the text again (\(texts))" : "tree quick again (\(Int(ms * 1000))ms)")
+                        }
+                    }
+                }
+            }
+            if i > 0 {
+                // Whether the drag scrolled is the pixels' call: this tree
+                // lags them (the read right after a drag can return the
+                // previous screen's tree, every frame unchanged).
+                let frame = ScreenSettle.sample()
+                let scrolled = lastFrame.flatMap { a in frame.map { ScreenSettle.contentDiff(a, $0) } }
+                if let d = scrolled, d < ScreenSettle.scrolledShare, let prev = lastFingerprint,
+                   !Self.contentShifted(prev, got.fingerprint) {
+                    // An app can ignore the first drag after a relaunch and take the
+                    // second: one unmoved first page is not the end yet.
+                    if i == 1, !retriedFirst {
+                        retriedFirst = true
+                        dragPage()
+                        if let again = useOCR ? readOCR() : read() { got = again }
+                        let f2 = ScreenSettle.sample()
+                        let d2 = lastFrame.flatMap { a in f2.map { ScreenSettle.contentDiff(a, $0) } } ?? 0
+                        if d2 < ScreenSettle.scrolledShare, !Self.contentShifted(prev, got.fingerprint) { atEnd = true; break }
+                        lastFrame = f2
+                    } else { atEnd = true; break }
+                }
+                lastFrame = frame
+                var tries = 0
+                while (scrolled ?? 0) >= ScreenSettle.scrolledShare,
+                      let prev = lastFingerprint, !Self.contentShifted(prev, got.fingerprint), tries < 4,
+                      nowMonotonic - start < budget - 1 {
+                    // Let the run loop turn: XCTest refreshes what it knows of
+                    // the app's tree on this thread, and a blocked thread kept
+                    // handing back the old screen.
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+                    tries += 1
+                    staleRereads += 1
+                    guard let again = useOCR ? readOCR() : read() else { break }
+                    got = again
+                }
+            }
+            screensRead += 1
+            lastFingerprint = got.fingerprint
+            lastEntries = got.items.map { ScreenText(text: $0.0, type: $0.1, frame: CGRect(x: $0.2[0], y: $0.2[1], width: $0.2[2], height: $0.2[3])) }
+            for (label, type, f) in got.items where !seen.contains(label) {
+                seen.insert(label)
+                out.append(.object([
+                    "text": .string(label), "type": .string(type),
+                    "x": .double(f[0]), "y": .double(f[1]), "width": .double(f[2]), "height": .double(f[3]),
+                    "screen": .int(i),
+                ]))
+            }
+            if i == pages { break }
+            if nowMonotonic - start + perScreen > budget { stoppedForTime = true; break }
+            if let err = dragPage() { return (nil, err) }
+            perScreen = nowMonotonic - t0
+        }
+        // A login sheet over the list stops it as surely as its end (a guest
+        // feed that shows one screen, then a "log in to see more" prompt).
+        let loginWall = lastBody.map(Self.looksLikeLoginWall) == true
+        if loginWall { atEnd = false }
+        // An app that isn't answering accessibility is often busy enough to
+        // ignore a drag too (collect would call the end on screen one while
+        // the next page scrolls). That early, it's "didn't move", not "end".
+        var busy = false
+        if atEnd, useOCR, source == "auto", screensRead <= 2 { atEnd = false; busy = true }
+        collectSeen = (bid, seen, nowMonotonic)
+        collectHistory[bid] = (history, nowMonotonic)
+        let ms = Int((nowMonotonic - start) * 1000)
+        iCTRLUITests.logBuffer.append("🧺 collect \(bid): \(screensRead) screens, \(out.count) new items, \(ms)ms, " +
+                                      "\(staleRereads) stale-tree rereads\(atEnd ? ", end" : "")")
+        var result: [String: JSONValue] = [
+            "items": .array(out), "new_count": .int(out.count), "screens_read": .int(screensRead),
+            "at_end": .bool(atEnd), "elapsed_ms": .int(ms), "bundle_id": .string(bid),
+            "source": .string(useOCR ? "ocr" : cellsReads > 0 ? "visible_cells" : "tree"),
+        ]
+        if !modeChanges.isEmpty { result["mode_changes"] = .array(modeChanges) }
+        if let h = history.last {
+            result["tree_read"] = .object([
+                "last_ms": .int(Int(h.ms * 1000)), "last_nodes": .int(h.nodes),
+                "first_nodes": .int(history.first?.nodes ?? h.nodes), "samples": .int(history.count),
+            ])
+        }
+        var hint: String
+        if atEnd {
+            hint = "Reached the end of the list in this direction — nothing more to collect that way."
+        } else if stoppedForTime {
+            hint = "Stopped after \(screensRead) screens to stay inside the call time; call collect again to continue."
+        } else {
+            hint = "Call collect again to continue the list; items already returned won't repeat (fresh:true starts over)."
+        }
+        if loginWall {
+            result["login_wall"] = .bool(true)
+            hint = "A login wall is over the list — that, not the end, stopped it. If logging in isn't allowed, close " +
+                "it (×, 暂不登录, 返回) and call collect again, or report the rest as needing login."
+        }
+        if busy {
+            hint = "The list didn't move under the drag — this app is busy (it isn't answering accessibility either). " +
+                "Call collect again in a few seconds; only at_end:true means the end."
+        }
+        if switchedToOCR {
+            hint = "Read by OCR: this app's list text is mostly outside the accessibility tree, or the tree was too " +
+                "slow / stopped answering (items have no refs; tap by their x/y). " + hint
+        }
+        if out.isEmpty, !atEnd, screensRead == 0 {
+            hint = "Couldn't read the screen (neither the tree nor OCR answered). Wait a few seconds and call again. " + hint
+        } else if out.isEmpty, !atEnd {
+            hint = "No new text on these screens — the list may be drawn outside the accessibility tree (check " +
+                "channel.recommended with page_source; on ocr use page + screen_text). " + hint
+        }
+        result["hint"] = .string(hint)
+        flagBlockers(lastEntries, bid: bid, overlayShown: false, into: &result)
+        readFrame = lastFrame
+        return (result, nil)
+    }
+
     private func scrollOutcome(before: String?, after: String?) -> [String: JSONValue] {
         guard let b = before, let a = after else {
             return ["moved": .bool(true), "motion_check": .string("unavailable")]
         }
-        let moved = (b != a)
+        let moved = Self.contentShifted(b, a)
         var out: [String: JSONValue] = ["moved": .bool(moved)]
-        if let pos = scrollPosition() { out["position"] = .object(pos) }
+        // Another walk of the app, gated as page_source gates it: ungated here
+        // it can take most of a page call, leaving the settle a negative budget.
+        let bid = resolveForegroundBundleId()
+        let skip = bid.map { isSlowTree($0) || justLaunched($0)
+            || (scrollPositionCost[$0].map { nowMonotonic - $0.at < 120 && $0.s > 0.8 } ?? false) } ?? false
+        if !skip {
+            let t = nowMonotonic
+            if let pos = scrollPosition() { out["position"] = .object(pos) }
+            if let bid = bid { scrollPositionCost[bid] = (nowMonotonic - t, nowMonotonic) }
+        }
         if !moved {
             out["at_end"] = .bool(true)
             out["hint"] = .string(
                 "The screen did not change — you are most likely at the end of the scrollable "
                 + "content in this direction, so scrolling further will do nothing. "
-                + "If the page was still loading when this ran, wait ~1s and re-read before concluding that.")
+                + "If the page was still loading when this ran, read again before concluding that.")
         }
         return out
     }
@@ -3507,7 +5920,54 @@ class ActionHandler {
                 for cc in max(c0, 0)..<min(max(c1, c0 + 1), cols) { grid[rr * cols + cc] = true }
             }
         }
-        return Double(grid.filter { $0 }.count) / Double(cols * rows)
+        var coverage = Double(grid.filter { $0 }.count) / Double(cols * rows)
+        // Area undercounts image-led layouts: a screen can sit under 10%
+        // coverage with hundreds of usable labelled nodes. Many distinct
+        // labelled nodes on screen is a readable tree, whatever area.
+        let labelledOnScreen = body.split(separator: "\n").filter { line in
+            guard line.contains(", label: '"), !line.contains("滚动条"),
+                  let r = line.range(of: "{{") else { return false }
+            let v = line[r.lowerBound...].split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
+            return v.count >= 4 && v[2] > 0 && v[3] > 0 && v[1] + v[3] > contentTop && v[1] < contentBottom
+                && v[0] + v[2] > 0 && v[0] < w
+        }.count
+        if labelledOnScreen >= 30 { coverage = max(coverage, Self.treeCoverageThreshold) }
+        // Search bars, tabs and filter chips alone can reach 18–27% — over
+        // the bar — while the list that IS the content is an empty container
+        // (answers, search results, map POIs: rows drawn but not exposed).
+        // A big list with no labelled row inside means the tree is
+        // missing the content whatever the furniture adds up to.
+        if coverage >= Self.treeCoverageThreshold, hasEmptyListArea(body, contentHeight: contentH) {
+            return min(coverage, Self.treeCoverageThreshold / 2)
+        }
+        return coverage
+    }
+
+    /// A CollectionView/Table/ScrollView covering over a third of the content
+    /// band with no labelled node inside it.
+    private func hasEmptyListArea(_ body: String, contentHeight: Double) -> Bool {
+        let lines = body.split(separator: "\n")
+        let w = pointSize.width
+        for (i, line) in lines.enumerated() {
+            let indent = line.prefix { $0 == " " }.count
+            let t = line.dropFirst(indent)
+            guard t.hasPrefix("CollectionView,") || t.hasPrefix("Table,") || t.hasPrefix("ScrollView,"),
+                  let r = line.range(of: "{{"),
+                  let end = line.range(of: "}}", range: r.lowerBound..<line.endIndex) else { continue }
+            let f = line[r.lowerBound..<end.upperBound]
+                .split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
+            guard f.count >= 4, f[2] >= w * 0.6, f[3] >= contentHeight / 3 else { continue }
+            var labelled = 0
+            for inner in lines[(i + 1)...] {
+                if inner.prefix(while: { $0 == " " }).count <= indent { break }
+                // Scroll indicators are labelled ("Vertical scroll bar, 1 page") but are not content.
+                if inner.contains("滚动条") || inner.lowercased().contains("scroll bar") { continue }
+                if inner.contains(", label: '") || inner.contains(", value: '") { labelled += 1 }
+                if labelled > 0 { break }
+            }
+            if labelled == 0 { return true }
+        }
+        return false
     }
 
     /// Worst (smallest) bottom edge among the direct children of any scrollable
@@ -3766,14 +6226,27 @@ class ActionHandler {
         var aimedStalls = 0
         var lastHit: LocateHit?
         var trace: [String] = []
+        // The reply is due at 6s whether or not the search is done, and a
+        // call still running then wedges the UI queue for every call behind it.
+        // Each scan+drag costs ~0.7–1.5s (more on a hot phone), so stop when
+        // the next one would not fit, and say how to continue.
+        let started = nowMonotonic
+        let timeBudget = 4.5
+        var stepCost = 0.8
+        var outOfTime = false
+        func fitsAnotherStep() -> Bool {
+            if nowMonotonic - started + stepCost <= timeBudget { return true }
+            outOfTime = true
+            return false
+        }
 
         func opposite(_ d: String) -> String {
             switch d { case "up": return "down"; case "down": return "up"
                        case "left": return "right"; default: return "left" }
         }
 
-        // A synthesized drag held at 300pt/s — below the ~350pt/s where iOS adds
-        // momentum — so the content moves by the finger travel, not 1.6x it.
+        // A synthesized drag that rests on its end point before lifting, so
+        // the content moves by the finger travel with no momentum.
         func drag(in area: CGRect, finger: String, travel: Double) {
             let horizontal = (finger == "left" || finger == "right")
             let span = horizontal ? area.width : area.height
@@ -3786,9 +6259,9 @@ class ActionHandler {
             case "right": (fx, fy, tx, ty) = (area.minX + margin, area.midY, area.minX + margin + t, area.midY)
             default:      (fx, fy, tx, ty) = (area.midX, area.maxY - margin, area.midX, area.maxY - margin - t)
             }
-            _ = fastHandler.fastSwipe(fromX: fx, fromY: fy, toX: tx, toY: ty,
-                                      duration: min(max(t / 300.0, 0.30), 2.5))
-            usleep(350_000)   // let the content settle before the next read
+            // Fast drag + resting end point: no momentum (see pageScroll).
+            _ = fastHandler.fastSwipe(fromX: fx, fromY: fy, toX: tx, toY: ty, duration: 0.3, hold: 0.25)
+            usleep(100_000)
         }
 
         func dragArea(_ scan: LocateScan, _ hit: LocateHit?) -> CGRect {
@@ -3798,9 +6271,22 @@ class ActionHandler {
             return area.isNull || area.height < 80 ? band : area
         }
 
+        // The fingerprint is capped (50 children a node): a calendar's 60+ day
+        // cells look the same after a drag that visibly moved them, which would
+        // read as "the end" and reverse the search. A drag that changed the
+        // screen moved, whatever the fingerprint says.
+        var lastFrame: ScreenSettle.Frame?
         while true {
-            guard let scan = scanCandidates(query: query, type: typeFilter, matchMode: matchMode,
-                                            bundleId: bundleId) else {
+            let scanStart = nowMonotonic
+            let frameNow = ScreenSettle.sample()
+            let screenMoved: Bool = {
+                guard let a = lastFrame, let b = frameNow else { return false }
+                return ScreenSettle.diff(a, b) >= 0.02
+            }()
+            lastFrame = frameNow
+            let scanned = scanCandidates(query: query, type: typeFilter, matchMode: matchMode, bundleId: bundleId)
+            let scanCost = nowMonotonic - scanStart
+            guard let scan = scanned else {
                 // No bounded snapshot on this build/app — the old search still works.
                 return steps == 0 ? legacyScrollToElement(cmd) : (nil, .serverError(
                     "scroll_to_element lost the accessibility snapshot after \(steps) scrolls. Call page_source to see where it stopped."))
@@ -3859,7 +6345,7 @@ class ActionHandler {
                     // Under ~20pt a drag reads as a tap to the scroll view.
                     travel = max(abs(dy), 40)
                 }
-                if let last = lastFingerprint, last == scan.fingerprint {
+                if let last = lastFingerprint, last == scan.fingerprint, !screenMoved {
                     aimedStalls += 1
                 } else {
                     aimedStalls = 0
@@ -3874,14 +6360,17 @@ class ActionHandler {
                         data: ["x": .double(hit.frame.midX), "y": .double(hit.frame.midY)]))
                 }
                 lastFingerprint = scan.fingerprint
+                guard fitsAnotherStep() else { break }
                 trace.append("aim:\(finger)\(Int(travel))")
+                let t0 = nowMonotonic
                 drag(in: area, finger: finger, travel: travel)
+                stepCost = (nowMonotonic - t0) + scanCost
                 steps += 1
                 continue
             }
 
             // Not in the tree at all — scroll blind and watch for the end.
-            if let last = lastFingerprint, last == scan.fingerprint {
+            if let last = lastFingerprint, last == scan.fingerprint, !screenMoved {
                 endedDirections.append(direction)
                 if explicitDirection == nil, !reversed {
                     reversed = true
@@ -3892,17 +6381,26 @@ class ActionHandler {
                 }
             }
             lastFingerprint = scan.fingerprint
+            guard fitsAnotherStep() else { break }
             let area = dragArea(scan, nil)
             let horizontal = (direction == "left" || direction == "right")
             trace.append("blind:\(direction)")
+            let t0 = nowMonotonic
             drag(in: area, finger: direction, travel: (horizontal ? area.width : area.height) * 0.6)
+            stepCost = (nowMonotonic - t0) + scanCost
             steps += 1
         }
 
         iCTRLUITests.logBuffer.append("🧭 scroll_to '\(query)' not found after \(steps) [\(trace.joined(separator: " "))]")
         let what = "'\(query)'" + (typeFilter.map { " of type '\($0)'" } ?? "")
         let message: String
-        if let hit = lastHit {
+        if outOfTime {
+            let seenEnd = endedDirections.first.map { " (reached the end scrolling \($0) and turned back)" } ?? ""
+            message = "Stopped after \(steps) scrolls (\(String(format: "%.1f", nowMonotonic - started))s) to stay inside " +
+                "the call time limit; \(what) not seen yet\(seenEnd). Call scroll_to_element again — it continues " +
+                "from where the view is now" +
+                (lastHit.map { ". It is in the tree at (\(Int($0.frame.midX)),\(Int($0.frame.midY))), so it is reachable" } ?? "") + "."
+        } else if let hit = lastHit {
             message = "'\(hit.label)' is in the view but still \(hit.visibility) at " +
                 "(\(Int(hit.frame.midX)),\(Int(hit.frame.midY))) after \(steps) scrolls toward it. " +
                 "Raise distance, or call page_source to see what is in the way."
@@ -4041,6 +6539,68 @@ class ActionHandler {
     /// Locate an element (without scrolling) in the foreground app by exact label,
     /// then accessibility id, then (if match=contains) substring. Returns the first
     /// hittable match + its index, so both find_element and tap-by-ref agree.
+
+    /// Seconds the last bounded walk of each app took — how slow its
+    /// accessibility server is answering right now.
+    private var treeCost: [String: Double] = [:] { didSet { treeCostAt = nowMonotonic } }
+    private var treeCostAt: TimeInterval = 0
+    /// Apps where a whole-app walk (each live exists/frame probe) was seen to
+    /// be slow. treeCost is the last bounded read and can't tell: a bounded
+    /// read can be fast while each live probe walks for seconds, so a lookup
+    /// that trusted treeCost would confirm its hit with several slow walks.
+    private var liveWalkSlow: Set<String> = []
+    /// The Picture-in-Picture window's frame, if one is on screen. Read from a
+    /// two-level SpringBoard snapshot (the PiP window hangs off its
+    /// Application node), cached briefly: actions come in bursts.
+    private var pipCache: (frame: CGRect?, at: TimeInterval)?
+    private func pipWindowFrame() -> CGRect? {
+        if let c = pipCache, nowMonotonic - c.at < 2 { return c.frame }
+        var found: CGRect?
+        let t = nowMonotonic
+        if let root = ForegroundApp.boundedSnapshot(forBundleID: "com.apple.springboard", maxDepth: 2, maxChildren: 50) {
+            var n = 0
+            var tr: ObjCBool = false
+            let body = ForegroundApp.renderBoundedSnapshot(root, maxDepth: 2, maxElements: 200,
+                                                           nodesWritten: &n, truncated: &tr) ?? ""
+            for line in body.split(separator: "\n") where line.contains("id: 'PIP-") {
+                if let f = Self.frameOf(line), f[2] > 0, f[3] > 0 {
+                    found = CGRect(x: f[0], y: f[1], width: f[2], height: f[3])
+                    break
+                }
+            }
+        }
+        if found != nil || nowMonotonic - t > 0.3 {
+            iCTRLUITests.logBuffer.append(String(format: "🖼 PiP %@ (%.0fms)", found.map { "\($0)" } ?? "none", (nowMonotonic - t) * 1000))
+        }
+        pipCache = (found, nowMonotonic)
+        return found
+    }
+
+    /// Launched in the last 10s: the app is still starting, and every extra
+    /// walk of it competes with that.
+    private func justLaunched(_ bid: String) -> Bool {
+        launchedAt[bid].map { nowMonotonic - $0 < 10 } == true
+    }
+    /// Above this, follow-up walks (live re-resolve, hit probes) cost more
+    /// than they are worth; callers get coordinates instead of refs.
+    private static let slowTreeSeconds = 1.5
+    /// Only a recent measurement counts: a tree is slow while a heavy page
+    /// is up, and taps should probe again once the app has moved on.
+    private func isSlowTree(_ bid: String) -> Bool {
+        (treeCost[bid] ?? 0) > Self.slowTreeSeconds && nowMonotonic - treeCostAt < 20
+    }
+    /// Set when locateElement found a match on a slow tree but skipped
+    /// making it live: callers act on its frame.
+    private var slowTreeHit: LocateHit?
+    /// Why the last locate returned coordinates only, when not a slow tree.
+    private var coordsOnlyNote: String?
+    private var hitSkipped = false
+    private func slowTreeNote(_ bid: String?) -> String {
+        let ms = bid.flatMap { treeCost[$0] }.map { Int($0 * 1000) } ?? 0
+        return "This app's accessibility tree is very slow right now (\(ms)ms per read), so no ref was made — " +
+            "re-resolving it would take as long again. Tap the center by coordinate."
+    }
+
     private func locateElement(query: String, type: String?, bundleId: String?, matchMode: String)
         -> (XCUIElement, ElementRef.Match, Int)? {
         // Cleared per call: a stale error from an earlier lookup must never be
@@ -4063,6 +6623,9 @@ class ActionHandler {
         }
         func done(_ hit: String) {
             iCTRLUITests.logBuffer.append("🔎 locate '\(query)' \(hit) [\(phases.joined(separator: " "))] total=\(Int((nowMonotonic - t0) * 1000))ms")
+            // Past the bounded walks, a slow lookup is whole-app walks: remember
+            // it, so the next lookup here stays bounded.
+            if let bid = bid, nowMonotonic - t0 > 2.0 { liveWalkSlow.insert(bid) }
         }
 
         // Before ANY tree query: a few-ms state check. Every query below is
@@ -4070,6 +6633,15 @@ class ActionHandler {
         // fast — the live query timed out, was abandoned still running, and
         // spun XCTest at 100% CPU for 48s until iOS killed the runner
         // (cpu_resource_fatal, iOS 16). This check used to run only at the end.
+        // Known not to answer moments ago: every route below waits out the
+        // AX timeout again (10s+, past the call limit).
+        if let bid = bid, (treeCost[bid] ?? 0) >= 99, nowMonotonic - treeCostAt < 20 {
+            lastLocateError = JSONRPCError(code: -32000, message:
+                "\(bid)'s accessibility isn't answering right now, so '\(query)' can't be looked up. Read the screen " +
+                "with screen_text and tap by coordinate; try find_element again in ~20s.", data: nil)
+            done("✗ax-unresponsive(known)")
+            return nil
+        }
         if let err = Self.snapshotPrecheck(bundleId: bid, action: "find '\(query)'",
                                            retryWith: "find_element", strict: true) {
             phases.append("precheck=refused")
@@ -4119,12 +6691,70 @@ class ActionHandler {
         // XCUIElementSnapshot protocol reads every frame as {{0,0},{0,0}} and
         // stops after one level of children, so a Swift walk would silently
         // search a tree of 16 empty nodes and report "not found".
+        //
+        // Two passes, like page_source: first with the small child cap that
+        // keeps page_source under a second, then the full one. A wide list
+        // makes the full walk slow (a long timeline: about a thousand nodes,
+        // seconds against under a second capped), and what a caller looks for
+        // is almost always on screen, which the capped walk already covers. Only
+        // an in-view hit from the capped pass is trusted: anything else may be
+        // one of the children it cut off, so the full walk decides.
         var s = nowMonotonic
-        if let bid = bid,
-           let scan = scanCandidates(query: query, type: type, matchMode: matchMode, bundleId: bid) {
-            phases.append("bounded=\(Int((nowMonotonic - s) * 1000))ms/\(scan.visited)nodes/\(scan.candidates.count)hits")
+        let boundedStart = s
+        slowTreeHit = nil
+        coordsOnlyNote = nil
+        var fullScan: LocateScan?
+        if let bid = bid {
+            if let quick = scanCandidates(query: query, type: type, matchMode: matchMode, bundleId: bid,
+                                          maxChildren: Self.childrenLadder[0]) {
+                phases.append("bounded50=\(Int((nowMonotonic - s) * 1000))ms/\(quick.visited)nodes/\(quick.candidates.count)hits")
+                if quick.candidates.first?.inView == true { fullScan = quick }
+            }
+            if fullScan == nil {
+                s = nowMonotonic
+                fullScan = scanCandidates(query: query, type: type, matchMode: matchMode, bundleId: bid)
+                if let scan = fullScan {
+                    phases.append("bounded=\(Int((nowMonotonic - s) * 1000))ms/\(scan.visited)nodes/\(scan.candidates.count)hits")
+                }
+            }
+        }
+        if let bid = bid {
+            treeCost[bid] = nowMonotonic - boundedStart
+        }
+        if let bid = bid, let scan = fullScan {
             if let best = scan.candidates.first {
-                if let (live, idx) = liveElement(for: best, in: q) {
+                // On a tree this slow, re-resolving the hit as a live element
+                // is several more full walks (XCTest snapshots the whole app
+                // for each exists/hittable probe): on a large results list each
+                // walk can take many seconds and one find_element could run for
+                // minutes, wedging every call behind it. Hand back the snapshot's frame instead.
+                if isSlowTree(bid) || best.byValue {
+                    lastLocateScan = scan
+                    lastLocateSnapFrame = best.frame
+                    lastLocateSnapLabel = best.label.isEmpty ? best.value : best.label
+                    slowTreeHit = best
+                    coordsOnlyNote = best.byValue && !isSlowTree(bid)
+                        ? "Matched by its value ('\(best.value)'): it has no label or identifier, so no ref can be made. Tap the center by coordinate."
+                        : nil
+                    done("→slow-tree-coords/\(Int((treeCost[bid] ?? 0) * 1000))ms")
+                    return nil
+                }
+                // On a costly tree, don't confirm the hit with live probes
+                // (each a whole-app walk, together most of the lookup). The
+                // walk's ordinal mirrors the live query; tap re-finds it the
+                // same capped way.
+                if (treeCost[bid] ?? 0) >= 0.5 { liveWalkSlow.insert(bid) }
+                // Nor on an app that is still starting: there a single walk
+                // can hang well past the call limit — before any check
+                // between probes could stop it.
+                let costly = liveWalkSlow.contains(bid) || nowMonotonic - (launchedAt[bid] ?? -100) < 15
+                let probeAt = nowMonotonic
+                let resolved = costly ? (q.matching(best.byLabel
+                        ? NSPredicate(format: "label == %@", best.label)
+                        : NSPredicate(format: "identifier == %@", best.identifier)).element(boundBy: best.ordinal), best.ordinal)
+                    : liveElement(for: best, in: q)
+                if !costly, nowMonotonic - probeAt > 1.0 { liveWalkSlow.insert(bid) }
+                if let (live, idx) = resolved {
                     lastLocateScan = scan
                     lastLocateSnapFrame = best.frame
                     lastLocateSnapLabel = best.label
@@ -4136,6 +6766,34 @@ class ActionHandler {
             }
         }
 
+        // The bounded fetch itself failed after a long wait: the app's
+        // accessibility isn't answering. The unbounded snapshot and the live
+        // query below would each wait out long timeouts (a long-scrolled feed
+        // can take tens of seconds), wedging every call behind it.
+        if let bid = bid, fullScan == nil, nowMonotonic - boundedStart > 2.0 {
+            treeCost[bid] = 99
+            lastLocateError = JSONRPCError(code: -32000, message:
+                "\(bid)'s accessibility isn't answering right now (the tree read failed after " +
+                "\(Int(nowMonotonic - boundedStart))s), so '\(query)' couldn't be looked up. Read the screen with " +
+                "screen_text and tap by coordinate; find_element works again once the app answers.", data: nil)
+            done("✗ax-unresponsive")
+            return nil
+        }
+        // Nothing found by the bounded walks on a slow tree: the unbounded
+        // walk and the live query below would cost far more and, on a tree
+        // the bounded walk already covered, find nothing new.
+        // Nor where whole-app walks were slow before: a fast bounded miss
+        // there would fall through to a very long snapshot and live query.
+        // Nor when the bounded walk saw the whole tree: with fewer nodes than
+        // one child cap, nothing was cut. An app still starting has few
+        // nodes; the unbounded snapshot then hangs on an app too busy to
+        // answer, and could find nothing new.
+        if let bid = bid, let scan = fullScan,
+           isSlowTree(bid) || liveWalkSlow.contains(bid) || nowMonotonic - boundedStart > 1.0
+            || scan.visited < Self.childrenLadder[0] {
+            done("✗no-match/slow-tree")
+            return nil
+        }
         s = nowMonotonic
         var snapshotAlreadyTried = false
         if !Self.preferLiveQueryFirst,
@@ -4516,6 +7174,7 @@ class ActionHandler {
         let shotStart = nowMonotonic
         _ = ObjCException.catching { image = XCUIScreen.main.screenshot().image }
         let shotMs = (nowMonotonic - shotStart) * 1000
+        readFrame = image.flatMap(ScreenSettle.frame(from:))
         guard let cg = image?.cgImage else { return nil }
 
         let ocrStart = nowMonotonic
@@ -4573,6 +7232,7 @@ class ActionHandler {
         // the whole reason this method can succeed when page_source cannot.
         _ = ObjCException.catching { image = XCUIScreen.main.screenshot().image }
         let shotMs = (nowMonotonic - shotStart) * 1000
+        readFrame = image.flatMap(ScreenSettle.frame(from:))
         guard let cg = image?.cgImage else {
             return (nil, .serverError("Could not capture the screen for OCR."))
         }
@@ -4595,7 +7255,9 @@ class ActionHandler {
         let ocrMs = (nowMonotonic - ocrStart) * 1000
 
         let minConf = Float(cmd.scale ?? 0.3)
+        let tOverlay = nowMonotonic
         let overlays = overlayRects()
+        let overlayMs = (nowMonotonic - tOverlay) * 1000
         var items: [JSONValue] = []
         var overlayText: [JSONValue] = []
         for obs in (request.results ?? []) {
@@ -4635,11 +7297,24 @@ class ActionHandler {
         // screen is measurable, so measure it and say so — an agent that
         // learned "this app needs OCR" on one web page otherwise keeps using it
         // on native screens where the tree gives refs and exact labels.
+        let tCov = nowMonotonic
         let coverage = currentTreeCoverage()
+        let covMs = (nowMonotonic - tCov) * 1000
+        let tConf = nowMonotonic
         confirmOpened(resolveForegroundBundleId(), name: nil)
+        iCTRLUITests.logBuffer.append(String(format: "📝 screen_text shot=%.0fms ocr=%.0fms overlays=%.0fms coverage=%.0fms confirm=%.0fms",
+                                             shotMs, ocrMs, overlayMs, covMs, (nowMonotonic - tConf) * 1000))
         var hint = "OCR of what is rendered on screen. Tap a result with tap{x:center_x, y:center_y} (points); "
             + "coordinates go stale on scroll, there are no refs, and icons/images are invisible here."
-        if let c = coverage, c >= Self.treeCoverageThreshold {
+        let ocrLines = items.compactMap { item -> String? in
+            if case .object(let o) = item, case .string(let l)? = o["label"] { return l }
+            return nil
+        }
+        let textShare = coverage == nil ? nil : coverageBody.flatMap { Self.treeTextShare(ocrLines, body: $0) }
+        if let share = textShare, share < 0.4 {
+            hint = "Only \(Int((share * 100).rounded()))% of the text on screen is in the accessibility tree (web or " +
+                "custom-drawn content), so OCR is the right tool here: read with screen_text and tap by coordinate. " + hint
+        } else if let c = coverage, c >= Self.treeCoverageThreshold {
             hint = "This screen's accessibility tree is readable (\(Int((c * 100).rounded()))% coverage) — "
                 + "prefer page_source / find_element → tap{ref} here: refs survive scrolling and labels are exact. "
                 + "OCR is for screens the tree can't read. " + hint
@@ -4661,12 +7336,39 @@ class ActionHandler {
             "hint": .string(hint),
         ]
         if !overlayText.isEmpty { result["overlay_text"] = .array(overlayText) }
-        if let c = coverage { result["channel"] = Self.screenChannel(c) }
+        // A captcha drawn outside the tree is only in the pixels (its coverage can be near zero).
+        let tBlock = nowMonotonic
+        flagBlockers(items.compactMap(Self.ocrScreenText), bid: resolveForegroundBundleId(), overlayShown: false, into: &result)
+        let blockMs = (nowMonotonic - tBlock) * 1000
+        if blockMs > 300 { iCTRLUITests.logBuffer.append(String(format: "🐢 screen_text blockers=%.0fms", blockMs)) }
+        if let c = coverage {
+            // Text missing from the tree overrides labelled-area coverage.
+            if let share = textShare, share < 0.4 {
+                result["channel"] = .object([
+                    "ax_coverage": .double((c * 100).rounded() / 100),
+                    "tree_text_share": .double((share * 100).rounded() / 100),
+                    "recommended": .string("ocr"),
+                    "why": .string("Most text on this screen is not in the accessibility tree: read it with " +
+                                   "screen_text and tap by coordinate. Check again on the next screen."),
+                ])
+            } else if let share = textShare, share >= 0.6, c < Self.treeCoverageThreshold {
+                result["channel"] = .object([
+                    "ax_coverage": .double((c * 100).rounded() / 100),
+                    "tree_text_share": .double((share * 100).rounded() / 100),
+                    "recommended": .string("tree"),
+                    "why": .string("\(Int(share * 100))% of the text read here is in the accessibility tree: use " +
+                                   "page_source / find_element → tap{ref}, which need no OCR and give refs."),
+                ])
+            } else {
+                result["channel"] = Self.screenChannel(c, textItems: coverageBody.map {
+                    Self.contentTextCount($0, height: pointSize.height) } ?? 0)
+            }
+        }
         return (result, nil)
     }
 
     private func findElementInfo(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
-        guard let elementId = cmd.elementId else {
+        guard let elementId = cmd.elementId, !elementId.trimmingCharacters(in: .whitespaces).isEmpty else {
             return (nil, JSONRPCError(
                 code: -32602,
                 message: "find_element requires 'element_id' (the accessibility label or identifier to search for). " +
@@ -4681,10 +7383,36 @@ class ActionHandler {
         guard let (element, match, index) = locateElement(query: elementId, type: cmd.elementType,
                                                           bundleId: cmd.bundleId, matchMode: matchMode) else {
             if let err = lastLocateError { return (nil, err) }
+            if let hit = slowTreeHit {
+                let f = hit.frame
+                return ([
+                    "exists": .bool(true),
+                    "label": .string(hit.label),
+                    "value": .string(hit.value),
+                    "element_type": .string(Self.elementTypeName(hit.elementType)),
+                    "x": .double(f.minX), "y": .double(f.minY), "width": .double(f.width), "height": .double(f.height),
+                    "center_x": .double(f.midX), "center_y": .double(f.midY),
+                    "visibility": .string(hit.visibility),
+                    "hint": .string(coordsOnlyNote ?? slowTreeNote(cmd.bundleId ?? resolveForegroundBundleId())),
+                ], nil)
+            }
             let base = "No element matching label/id '\(elementId)'" +
                 (cmd.elementType.map { " of type '\($0)'" } ?? "")
             if foregroundIsWebViewHost() {
                 return (nil, JSONRPCError(code: -32602, message: base + "." + Self.webViewAdvice, data: nil))
+            }
+            // A system alert over the app is why nothing matched (an alert left
+            // by a fresh install can make every lookup fail until it is answered).
+            // Say so before anything else.
+            if cmd.bundleId != "com.apple.springboard", resolveForegroundBundleId() == "com.apple.springboard" {
+                let buttons = alertButtons().map { $0.label }.filter { !$0.isEmpty }
+                if !buttons.isEmpty {
+                    let title = alertTitle().map { "\"\($0)\" " } ?? ""
+                    return (nil, JSONRPCError(code: -32602, message: base + ": a system alert \(title)covers the screen " +
+                        "(buttons: \(buttons.map { "'\($0)'" }.joined(separator: ", "))). Answer it first — " +
+                        "find_element{element_id:\"<button>\", bundle_id:\"com.apple.springboard\"} → tap{ref} — then look again.",
+                        data: nil))
+                }
             }
             // Say what IS there. "Not found" alone sends a caller round the same
             // loop — try contains, try a shorter substring, try page_source —
@@ -4700,13 +7428,21 @@ class ActionHandler {
             return (nil, JSONRPCError(
                 code: -32602,
                 message: base +
-                    ". It may be off-screen (use scroll_to_element), or the label differs from on-screen text — check page_source. Try match:'contains'."
+                    ". It may be off-screen (page{direction}, then find_element again), or the label differs from on-screen text — check page_source. Try match:'contains'."
                     + diag,
                 data: nil
             ))
         }
 
-        let frame = element.frame
+        // Answer from the snapshot the lookup already walked. Every property
+        // read on the live element re-resolves it across the whole tree: on a
+        // long timeline the ~8 reads below cost several times the lookup itself,
+        // ran find_element past its 6s limit and stalled the queue behind it.
+        // Live reads are left for the fallback paths, which have no snapshot hit.
+        let t0 = nowMonotonic
+        let snap = lastLocateScan?.candidates.first
+        let frame = snap?.frame ?? element.frame
+        let elementType = snap?.elementType ?? element.elementType
         let ref = makeRef(ElementRef(bundleId: cmd.bundleId ?? resolveForegroundBundleId(),
                                      match: match, elementType: cmd.elementType, index: index,
                                      createdAt: nowMonotonic))
@@ -4714,13 +7450,15 @@ class ActionHandler {
         // from a button that merely looks like a search bar. Many app home screens
         // show a search "bar" that is actually a Button/StaticText — tapping it
         // navigates to a search page where the REAL TextField lives.
-        let typeName = Self.elementTypeName(element.elementType)
-        let isTextInput = element.elementType == .textField
-            || element.elementType == .searchField
-            || element.elementType == .secureTextField
+        let typeName = Self.elementTypeName(elementType)
+        let isTextInput = elementType == .textField
+            || elementType == .searchField
+            || elementType == .secureTextField
         var result: [String: JSONValue] = [
             "exists": .bool(true),
-            "hittable": .bool(element.safeIsHittable),
+            // From the snapshot, "hittable" is "its centre is in the content
+            // area" — the same test the ranking uses; it can't see an overlay.
+            "hittable": .bool(snap.map { $0.inView } ?? element.safeIsHittable),
             "ref": .string(ref),
             "element_type": .string(typeName),
             "is_text_input": .bool(isTextInput),
@@ -4730,8 +7468,8 @@ class ActionHandler {
             "height": .double(frame.height),
             "center_x": .double(frame.midX),
             "center_y": .double(frame.midY),
-            "label": .string(element.label),
-            "value": .string(element.value as? String ?? ""),
+            "label": .string(snap?.label ?? element.label),
+            "value": .string(snap?.value ?? (element.value as? String ?? "")),
         ]
         // Say which of several look-alikes this is, and whether it can be acted
         // on. `hittable` alone was there before and still got ignored — the
@@ -4739,10 +7477,18 @@ class ActionHandler {
         // "9月25日" had matched too.
         if let scan = lastLocateScan, let best = scan.candidates.first {
             result["visibility"] = .string(best.visibility)
-            let others = scan.candidates.dropFirst().prefix(4)
+            // A labelled button and its own label text match the same query at
+            // the same place; listing that twin as an "alternative" (match_count
+            // 2 on every such find) is pure noise.
+            func same(_ a: LocateHit, _ b: LocateHit) -> Bool {
+                abs(a.frame.midX - b.frame.midX) < 4 && abs(a.frame.midY - b.frame.midY) < 4
+            }
+            var distinct: [LocateHit] = [best]
+            for c in scan.candidates.dropFirst() where !distinct.contains(where: { same($0, c) }) { distinct.append(c) }
+            let others = distinct.dropFirst().prefix(4)
             if !others.isEmpty {
                 result["alternatives"] = .array(others.map { $0.summary })
-                result["match_count"] = .int(scan.candidates.count)
+                result["match_count"] = .int(distinct.count)
             }
             if !best.inView {
                 result["hint"] = .string(
@@ -4758,11 +7504,18 @@ class ActionHandler {
         }
         // Nudge the caller when they were probably looking for an input field but
         // matched a button (the classic "fake search bar" trap).
-        if !isTextInput, (element.elementType == .button || element.elementType == .staticText || element.elementType == .other) {
+        // Only when it looks like a search or input box: on every other button
+        // (a tab, a list row) the note was noise in each reply.
+        let label = (snap?.label ?? element.label).lowercased()
+        let looksLikeInput = ["search", "搜索", "查找", "输入", "find", "type", "enter", "请输入"].contains { label.contains($0) }
+        if !isTextInput, looksLikeInput,
+           (elementType == .button || elementType == .staticText || elementType == .other) {
             result["note"] = .string(
-                "This is a \(typeName), NOT a text field. If you're trying to type/search: tap it to open the search page, wait ~1s for it to load and the keyboard to appear, then locate the REAL input field with find_element{element_id:\"<its placeholder text>\", element_type:\"textfield\", match:\"contains\"} before typing. (element_id is required — element_type alone only filters.)"
+                "This is a \(typeName), NOT a text field. If you're trying to type/search: tap it to open the search page, read again until the search page and keyboard are up, then locate the REAL input field with find_element{element_id:\"<its placeholder text>\", element_type:\"textfield\", match:\"contains\"} before typing. (element_id is required — element_type alone only filters.)"
             )
         }
+        iCTRLUITests.logBuffer.append("🔎 find_element result \(snap == nil ? "live" : "snapshot") " +
+                                      "build=\(Int((nowMonotonic - t0) * 1000))ms")
         return (result, nil)
     }
 
@@ -4773,13 +7526,21 @@ class ActionHandler {
     /// semantics as tap_element (element_id may be a label OR identifier,
     /// optional match:'contains' for partial substring).
     private func findAndTap(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
-        guard let elementId = cmd.elementId else {
+        guard let elementId = cmd.elementId, !elementId.trimmingCharacters(in: .whitespaces).isEmpty else {
             return (nil, JSONRPCError(code: -32602, message: "find_and_tap requires an 'element_id' (accessibility label or identifier); pair with match:'contains' for partial text.", data: nil))
         }
         let matchMode = (cmd.matchMode ?? "exact").lowercased()
         guard let (element, match, _) = locateElement(query: elementId, type: cmd.elementType,
                                                      bundleId: cmd.bundleId, matchMode: matchMode) else {
             if let err = lastLocateError { return (nil, err) }
+            if let hit = slowTreeHit, hit.inView {
+                let f = hit.frame
+                tapTargetFrame = f
+                let r = fastHandler.fastTap(x: f.midX, y: f.midY)
+                if r.1 != nil { return r }
+                return (["message": .string("Tapped '\(hit.label.isEmpty ? hit.value : hit.label)' at (\(Int(f.midX)),\(Int(f.midY))) from the tree snapshot"),
+                         "hint": .string(coordsOnlyNote ?? slowTreeNote(cmd.bundleId ?? resolveForegroundBundleId()))], nil)
+            }
             return (nil, JSONRPCError(
                 code: -32602,
                 message: "find_and_tap: no element matching '\(elementId)'\(cmd.elementType.map { " of type '\($0)'" } ?? ""). Try match:'contains', or a different label from page_source.",
@@ -4795,10 +7556,10 @@ class ActionHandler {
         if cmd.fast == false {
             let f = element.frame
             let label = element.label
-            guard element.safeIsHittable else {
+            if !element.safeIsHittable, let why = notHittableAdvice(label: label, frame: f) {
                 return (nil, JSONRPCError(
                     code: -32602,
-                    message: "find_and_tap: element '\(elementId)' exists but is not hittable (off-screen, covered, or zero-size). Scroll it into view (scroll_to_element).",
+                    message: "find_and_tap: element '\(elementId)' can't be tapped: " + why,
                     data: ["x": .double(f.midX), "y": .double(f.midY)]
                 ))
             }
@@ -4840,11 +7601,11 @@ class ActionHandler {
         let hittable = element.safeIsHittable
         tail.append("hittable=\(Int((nowMonotonic - ts) * 1000))ms")
 
-        guard hittable else {
+        if !hittable, let why = notHittableAdvice(label: label, frame: f) {
             iCTRLUITests.logBuffer.append("🎯 find_and_tap tail [\(tail.joined(separator: " "))] ✗not-hittable")
             return (nil, JSONRPCError(
                 code: -32602,
-                message: "find_and_tap: element '\(elementId)' exists but is not hittable (off-screen, covered, or zero-size). Scroll it into view (scroll_to_element).",
+                message: "find_and_tap: element '\(elementId)' can't be tapped: " + why,
                 data: ["x": .double(f.midX), "y": .double(f.midY)]
             ))
         }
@@ -4857,6 +7618,8 @@ class ActionHandler {
         // where synthesized events don't land.
         let (cx, cy) = humanizedPoint(in: f)
         ts = nowMonotonic
+        if cmd.bundleId != "com.apple.springboard", let err = alertRaisedBeforeTouch() { return (nil, err) }
+        tapTargetFrame = f
         let synth = fastHandler.fastTap(x: cx, y: cy)
         let usedNative = synth.1 != nil
         if usedNative { element.tap() }
@@ -4874,7 +7637,7 @@ class ActionHandler {
     }
 
     private func tapElement(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
-        guard let elementId = cmd.elementId else {
+        guard let elementId = cmd.elementId, !elementId.trimmingCharacters(in: .whitespaces).isEmpty else {
             return (nil, JSONRPCError(code: -32602, message: "tap_element requires an 'element_id' (accessibility label or identifier)", data: nil))
         }
 
@@ -4882,19 +7645,26 @@ class ActionHandler {
         guard let (element, _, _) = locateElement(query: elementId, type: cmd.elementType,
                                                   bundleId: cmd.bundleId, matchMode: matchMode) else {
             if let err = lastLocateError { return (nil, err) }
+            if let hit = slowTreeHit, hit.inView {
+                let f = hit.frame
+                tapTargetFrame = f
+                let r = fastHandler.fastTap(x: f.midX, y: f.midY)
+                if r.1 != nil { return r }
+                return (["message": .string("Tapped '\(hit.label.isEmpty ? hit.value : hit.label)' at (\(Int(f.midX)),\(Int(f.midY))) from the tree snapshot"),
+                         "hint": .string(coordsOnlyNote ?? slowTreeNote(cmd.bundleId ?? resolveForegroundBundleId()))], nil)
+            }
             return (nil, JSONRPCError(
                 code: -32602,
                 message: "No element matching '\(elementId)'\(cmd.elementType.map { " of type '\($0)'" } ?? ""). " +
-                    "The label may differ from on-screen text (check page_source), or the element needs scrolling into view (use scroll_to_element). Try match:'contains', or fall back to screenshot + coordinate tap.",
+                    "The label may differ from on-screen text (check page_source), or the element needs scrolling into view (page{direction}, then find again). Try match:'contains', or fall back to screenshot + coordinate tap.",
                 data: nil
             ))
         }
-        guard element.safeIsHittable else {
+        if !element.safeIsHittable, let why = notHittableAdvice(label: element.label, frame: element.frame) {
             let f = element.frame
             return (nil, JSONRPCError(
                 code: -32602,
-                message: "Element '\(elementId)' exists but is not hittable (off-screen, covered, or zero-size). " +
-                    "Scroll it into view (scroll_to_element) or tap its center by coordinate: (\(Int(f.midX)), \(Int(f.midY))).",
+                message: "Element '\(elementId)' can't be tapped: " + why,
                 data: ["x": .double(f.midX), "y": .double(f.midY)]
             ))
         }
@@ -4905,6 +7675,8 @@ class ActionHandler {
         let f = element.frame
         let label = element.label
         let (tx, ty) = humanizedPoint(in: f)
+        if cmd.bundleId != "com.apple.springboard", let err = alertRaisedBeforeTouch() { return (nil, err) }
+        tapTargetFrame = f
         let r = fastHandler.fastTap(x: tx, y: ty)
         if r.1 != nil { element.tap() }   // fallback only if synthesized tap failed
         return (["message": .string("Tapped element '\(label.isEmpty ? elementId : label)' at (\(Int(tx)),\(Int(ty)))")], nil)

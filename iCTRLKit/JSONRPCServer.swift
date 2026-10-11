@@ -811,7 +811,7 @@ class JSONRPCServer {
     /// with sub-500 ms delay instead of waiting for the next capture tick.
     private static let uiMutatingMethods: Set<String> = [
         "tap", "double_tap", "long_press", "swipe", "drag_up", "drag_down",
-        "drag_move", "scroll", "scroll_to_element", "tap_element", "find_and_tap", "page",
+        "drag_move", "scroll", "scroll_to_element", "tap_element", "find_and_tap", "page", "collect",
         "type", "clear_text", "home", "lock", "unlock",
         "launch_app", "activate_app", "terminate_app", "open_url",
     ]

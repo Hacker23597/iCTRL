@@ -538,7 +538,8 @@ iCTRLUITests/    The automation engine: test entry + run loop, ActionHandler,
 iCTRLCompat/     Back-compat shim for older iOS XCTest
 Config/          Signing.xcconfig (committed defaults) + Local.xcconfig (yours, gitignored)
 Scripts/         sign-ipa.sh (re-sign with your own identity), ictrl_rpc.py
-                 (reference client), build helpers
+                 (reference client), clean-xctest-attachments.sh (free test
+                 videos left on a phone), build helpers
 SKILL.md         The operating manual served at GET /skill
 project.yml      xcodegen spec
 Makefile         build + sign + package
@@ -558,6 +559,14 @@ Makefile         build + sign + package
 - Synthesized input is indistinguishable from real touches at the system level,
   but that is no guarantee against app-side anti-automation heuristics — apps
   with bot detection may still challenge you.
+- **Huge "System Data" on a phone that ran an older runner.** Since Xcode 15 a UI
+  test screen-records itself by default, and the video is kept on the phone
+  (testmanagerd's `tmp/Attachments`) unless the test passes. A server test that
+  runs for hours and ends killed left one video per run — tens of GB, untouched
+  by a reboot. Current runners turn this off
+  (`iCTRLUITests/ScreenRecordingDisabler.m`). To see and clear what an older
+  runner (or WebDriverAgent) left, connect the phone over USB and run
+  `Scripts/clean-xctest-attachments.sh` (lists only), then add `--delete`.
 
 ## Credits & licensing
 

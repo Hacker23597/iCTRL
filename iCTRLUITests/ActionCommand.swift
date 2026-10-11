@@ -38,6 +38,14 @@ struct ActionCommand {
     // screenshot encoding
     var format: String?
     var quality: Double?
+    // post-action settle check
+    var settle: Bool?
+    var pages: Int?
+    var minLength: Int?
+    var fresh: Bool?
+    var enhanced: Bool?
+    var source: String?
+    var settleTimeout: Double?
 
     init(method: String, params: [String: JSONValue]?) {
         self.name = method
@@ -67,6 +75,13 @@ struct ActionCommand {
         self.quality = params?["quality"]?.doubleValue
         self.country = params?["country"]?.stringValue
         self.url = params?["url"]?.stringValue
+        self.settle = params?["settle"]?.boolValue
+        self.pages = params?["pages"]?.intValue
+        self.minLength = params?["min_length"]?.intValue
+        self.fresh = params?["fresh"]?.boolValue
+        self.enhanced = params?["enhanced"]?.boolValue
+        self.source = params?["source"]?.stringValue
+        self.settleTimeout = params?["settle_timeout"]?.doubleValue
 
         self.maxDepth = params?["max_depth"]?.intValue
         self.maxElements = params?["max_elements"]?.intValue

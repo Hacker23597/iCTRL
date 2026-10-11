@@ -1,6 +1,9 @@
 import XCTest
 
 class FastActionHandler {
+    /// Where the last tap/press landed, for the settle check to watch that
+    /// spot as well as the whole screen. Cleared per call by the dispatcher.
+    var lastTouchPoint: CGPoint?
     private let app: XCUIApplication
 
     init(app: XCUIApplication) {
@@ -8,6 +11,7 @@ class FastActionHandler {
     }
 
     func fastTap(x: Double, y: Double) -> ([String: JSONValue]?, JSONRPCError?) {
+        lastTouchPoint = CGPoint(x: x, y: y)
         let eventRecord = XCSynthesizedEventRecord(name: "Fast Tap")
         let point = CGPoint(x: x, y: y)
         let eventPath = XCPointerEventPath(forTouchAt: point, offset: 0.0)
@@ -42,6 +46,7 @@ class FastActionHandler {
     /// sleep plus two IPC hops — past the ~250ms system window, and TikTok read
     /// it as a single tap (the video paused instead of liking).
     func fastDoubleTap(x: Double, y: Double) -> ([String: JSONValue]?, JSONRPCError?) {
+        lastTouchPoint = CGPoint(x: x, y: y)
         let eventRecord = XCSynthesizedEventRecord(name: "Fast Double Tap")
         let point = CGPoint(x: x, y: y)
         let eventPath = XCPointerEventPath(forTouchAt: point, offset: 0.0)
@@ -63,6 +68,7 @@ class FastActionHandler {
     /// the touch down for `duration` before lifting, so it never pays the
     /// quiescence wait that XCUICoordinate.press(forDuration:) does.
     func fastLongPress(x: Double, y: Double, duration: Double) -> ([String: JSONValue]?, JSONRPCError?) {
+        lastTouchPoint = CGPoint(x: x, y: y)
         let eventRecord = XCSynthesizedEventRecord(name: "Fast Long Press")
         let point = CGPoint(x: x, y: y)
         let eventPath = XCPointerEventPath(forTouchAt: point, offset: 0.0)
@@ -88,19 +94,36 @@ class FastActionHandler {
         }
     }
 
-    func fastSwipe(fromX: Double, fromY: Double, toX: Double, toY: Double, duration: Double = 0.3) -> ([String: JSONValue]?, JSONRPCError?) {
+    /// `hold`: how long the finger rests at the end before lifting. A finger
+    /// that stops before it lifts leaves with no velocity, so the content
+    /// stops where the drag ended — no momentum, whatever the drag speed.
+    func fastSwipe(fromX: Double, fromY: Double, toX: Double, toY: Double, duration: Double = 0.3,
+                   hold: Double = 0.05) -> ([String: JSONValue]?, JSONRPCError?) {
         let eventRecord = XCSynthesizedEventRecord(name: "Fast Swipe")
         let startPoint = CGPoint(x: fromX, y: fromY)
         let endPoint = CGPoint(x: toX, y: toY)
         let eventPath = XCPointerEventPath(forTouchAt: startPoint, offset: 0.0)
         eventPath.pressDown(atOffset: 0.0)
         eventPath.move(to: endPoint, atOffset: duration)
-        eventPath.liftUp(atOffset: duration + 0.05)
+        // A long hold gets stationary samples at the end point. Without them,
+        // iOS estimates lift-off velocity from the last moving segment and adds
+        // momentum however long the finger rested. With them, a fast drag
+        // stops where it was aimed.
+        if hold >= 0.1 {
+            var t = duration + 0.04
+            var jitter = 0.3   // identical points may be coalesced away
+            while t < duration + hold - 0.01 {
+                eventPath.move(to: CGPoint(x: endPoint.x, y: endPoint.y + jitter), atOffset: t)
+                jitter = -jitter
+                t += 0.04
+            }
+        }
+        eventPath.liftUp(atOffset: duration + hold)
         eventRecord.add(eventPath)
 
         do {
             try eventRecord.synthesize()
-            return (["message": .string("Fast swiped from (\(fromX),\(fromY)) to (\(toX),\(toY))")], nil)
+            return (["message": .string("Swiped from (\(Int(fromX)),\(Int(fromY))) to (\(Int(toX)),\(Int(toY))) over \(String(format: "%.2g", duration))s")], nil)
         } catch {
             return (nil, .serverError("Fast swipe failed: \(error.localizedDescription)"))
         }

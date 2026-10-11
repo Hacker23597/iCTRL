@@ -1,3 +1,5 @@
+#include <signal.h>
+#include <errno.h>
 #import "ForegroundApp.h"
 #import <XCTest/XCTest.h>
 #import <objc/message.h>
@@ -46,6 +48,106 @@
 @end
 
 @implementation ForegroundApp
+
++ (double)setAXTimeout:(double)seconds {
+    @try {
+        Class deviceClass = NSClassFromString(@"XCUIDevice");
+        id device = [deviceClass performSelector:NSSelectorFromString(@"sharedDevice")];
+        SEL ifaceSel = NSSelectorFromString(@"accessibilityInterface");
+        if (![device respondsToSelector:ifaceSel]) { return -1; }
+        id client = [device performSelector:ifaceSel];
+        double previous = -1;
+        SEL getSel = NSSelectorFromString(@"AXTimeout");
+        if ([client respondsToSelector:getSel]) {
+            double (*getFn)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+            previous = getFn(client, getSel);
+        }
+        SEL setSel = NSSelectorFromString(@"_setAXTimeout:error:");
+        if ([client respondsToSelector:setSel]) {
+            NSError *err = nil;
+            BOOL (*setFn)(id, SEL, double, NSError **) = (BOOL (*)(id, SEL, double, NSError **))objc_msgSend;
+            if (!setFn(client, setSel, seconds, &err)) { return -2; }
+            return previous;
+        }
+        SEL plainSel = NSSelectorFromString(@"setAXTimeout:");
+        if ([client respondsToSelector:plainSel]) {
+            void (*fn)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
+            fn(client, plainSel, seconds);
+            return previous;
+        }
+        return -1;
+    } @catch (__unused NSException *e) {
+        return -3;
+    }
+}
+
++ (pid_t)frontmostPID {
+    @try {
+        Class deviceClass = NSClassFromString(@"XCUIDevice");
+        SEL sharedSel = NSSelectorFromString(@"sharedDevice");
+        SEL ifaceSel = NSSelectorFromString(@"accessibilityInterface");
+        if (![deviceClass respondsToSelector:sharedSel]) { return 0; }
+        id device = [deviceClass performSelector:sharedSel];
+        if (![device respondsToSelector:ifaceSel]) { return 0; }
+        id client = [device performSelector:ifaceSel];
+        SEL sel = NSSelectorFromString(@"activeApplications");
+        if (![client respondsToSelector:sel]) { return 0; }
+        NSArray *apps = [client performSelector:sel];
+        if (![apps isKindOfClass:[NSArray class]] || apps.count == 0) { return 0; }
+        // iOS 27 lists exactly one element, the app in front (SpringBoard at
+        // the home screen). Its pid is readable even where its bundle id isn't.
+        id element = apps.firstObject;
+        SEL pidSel = NSSelectorFromString(@"processIdentifier");
+        // A crashed app can stay first in the list, sending every later read
+        // to its dead pid. Skip pids that no longer exist
+        // (kill(pid, 0) only checks; ESRCH = no such process).
+        for (id a in apps) {
+            if (![a respondsToSelector:pidSel]) { continue; }
+            pid_t p = [[a valueForKey:@"processIdentifier"] intValue];
+            if (p > 0 && (kill(p, 0) == 0 || errno != ESRCH)) { element = a; break; }
+        }
+        if (apps.count > 1) {
+            // Diagnostic: which order does a multi-app list come in? Reads
+            // landing on a stale app suggest firstObject is not always front.
+            NSMutableArray *pids = [NSMutableArray array];
+            for (id a in apps) {
+                if ([a respondsToSelector:pidSel]) { [pids addObject:[a valueForKey:@"processIdentifier"] ?: @0]; }
+            }
+            static NSString *lastLogged;
+            NSString *line = [pids componentsJoinedByString:@","];
+            if (![line isEqualToString:lastLogged]) {
+                lastLogged = line;
+                NSLog(@"🔎 activeApplications count=%lu pids=[%@]", (unsigned long)apps.count, line);
+            }
+        }
+        if (![element respondsToSelector:pidSel]) { return 0; }
+        NSMethodSignature *sig = [element methodSignatureForSelector:pidSel];
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        inv.selector = pidSel;
+        [inv invokeWithTarget:element];
+        pid_t pid = 0;
+        [inv getReturnValue:&pid];
+        return pid;
+    } @catch (__unused NSException *e) {
+        return 0;
+    }
+}
+
++ (pid_t)processIDForBundleID:(NSString *)bundleId {
+    if (bundleId.length == 0) { return 0; }
+    @try {
+        Class appClass = NSClassFromString(@"XCUIApplication");
+        if (!appClass) { return 0; }
+        id (*initFn)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+        id app = initFn([appClass alloc], @selector(initWithBundleIdentifier:), bundleId);
+        SEL pidSel = NSSelectorFromString(@"processID");
+        if (!app || ![app respondsToSelector:pidSel]) { return 0; }
+        pid_t (*pidFn)(id, SEL) = (pid_t (*)(id, SEL))objc_msgSend;
+        return pidFn(app, pidSel);
+    } @catch (__unused NSException *e) {
+        return 0;
+    }
+}
 
 + (nullable NSString *)currentBundleID {
     @try {
@@ -257,6 +359,94 @@
     } @catch (NSException *e) {
         NSLog(@"iCTRL: safeActivate caught exception for %@: %@", bundleId, e.reason);
         return NO;
+    }
+}
+
++ (id)axInterface {
+    id device = [NSClassFromString(@"XCUIDevice") performSelector:NSSelectorFromString(@"sharedDevice")];
+    return [device performSelector:NSSelectorFromString(@"accessibilityInterface")];
+}
+
++ (nullable NSDictionary *)visibleListParts:(NSString *)bundleId screen:(CGRect)screen maxElements:(NSInteger)maxElements {
+    // The visible part of a list without walking the rows scrolled past: a
+    // shallow snapshot (few children a node) finds the list, the list names
+    // its visible cells, and only those are snapshotted. Its cost stays flat
+    // however far the list has scrolled, while a full read keeps growing.
+    @try {
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        id root = [self boundedSnapshotForBundleID:bundleId maxDepth:30 maxChildren:12];
+        double shallowMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000;
+        if (!root) { return nil; }
+        id iface = [self axInterface];
+        SEL attrSel = NSSelectorFromString(@"attributesForElement:attributes:error:");
+        SEL reqSel = NSSelectorFromString(@"requestSnapshotForElement:attributes:parameters:error:");
+        if (![iface respondsToSelector:attrSel] || ![iface respondsToSelector:reqSel]) { return nil; }
+        id (*attrFn)(id, SEL, id, id, NSError **) = (id (*)(id, SEL, id, id, NSError **))objc_msgSend;
+        id (*reqFn)(id, SEL, id, id, id, NSError **) = (id (*)(id, SEL, id, id, id, NSError **))objc_msgSend;
+        // The innermost tall table / collection view with visible cells:
+        // deepest first, then smallest. A feed's table can sit in a cell of a
+        // full-screen pager the same size; reading the pager's one page cell
+        // instead would lose the inner table's lower rows.
+        NSArray *bestCells = nil; id bestNode = nil; double bestArea = 0; id bestCount = nil; NSInteger bestDepth = -1;
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:@[root, @0]];
+        while (stack.count) {
+            NSArray *top = stack.lastObject; [stack removeLastObject];
+            id n = top[0]; NSInteger depth = [top[1] integerValue];
+            for (id c in [n valueForKey:@"children"] ?: @[]) [stack addObject:@[c, @(depth + 1)]];
+            NSUInteger type = [[n valueForKey:@"elementType"] unsignedIntegerValue];
+            if (type != 26 && type != 32) continue;
+            CGRect f = [[n valueForKey:@"frame"] CGRectValue];
+            if (f.size.height < screen.size.height * 0.4 || !CGRectIntersectsRect(f, screen)) continue;
+            NSError *err = nil;
+            NSDictionary *vals = attrFn(iface, attrSel, [n valueForKey:@"accessibilityElement"],
+                                        @[@"XC_kAXXCAttributeVisibleCells", @"XC_kAXXCAttributeChildrenCount"], &err);
+            id cells = nil, count = nil;
+            for (id k in vals) {
+                if ([[k description] containsString:@"VisibleCells"]) cells = vals[k];
+                if ([[k description] containsString:@"ChildrenCount"]) count = vals[k];
+            }
+            double area = f.size.width * f.size.height;
+            if ([cells isKindOfClass:[NSArray class]] && [cells count] > 0
+                && (bestNode == nil || depth > bestDepth || (depth == bestDepth && area < bestArea))) {
+                bestCells = cells; bestNode = n; bestArea = area; bestCount = count; bestDepth = depth;
+            }
+        }
+        if (!bestNode) { return nil; }
+        NSInteger n = 0; BOOL trunc = NO;
+        NSString *rootBody = [self renderBoundedSnapshot:root maxDepth:30 maxElements:maxElements visibleRect:screen
+                                            nodesWritten:&n truncated:&trunc] ?: @"";
+        NSArray *attrs = @[@"XC_kAXXCAttributeLabel", @"XC_kAXXCAttributeValue", @"XC_kAXXCAttributeFrame",
+                           @"XC_kAXXCAttributeElementType", @"XC_kAXXCAttributeIdentifier",
+                           @"XC_kAXXCAttributePlaceholderValue"];
+        NSMutableArray *bodies = [NSMutableArray array];
+        t0 = CFAbsoluteTimeGetCurrent();
+        for (id cell in bestCells) {
+            NSError *e2 = nil;
+            // 24 levels: a feed cell can hold a list nested more than a dozen
+            // levels deep, whose labels a shallower snapshot cuts off.
+            id res = reqFn(iface, reqSel, cell, attrs, @{@"maxDepth": @24, @"maxChildren": @50, @"maxArrayCount": @50}, &e2);
+            id snap = nil;
+            @try { snap = [res valueForKey:@"rootElementSnapshot"]; } @catch (__unused NSException *x) { snap = res; }
+            if (!snap) continue;
+            NSInteger m = 0; BOOL t2 = NO;
+            NSString *body = [self renderBoundedSnapshot:snap maxDepth:24 maxElements:400 visibleRect:screen
+                                            nodesWritten:&m truncated:&t2];
+            if (body.length) [bodies addObject:body];
+        }
+        double cellsMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000;
+        NSUInteger type = [[bestNode valueForKey:@"elementType"] unsignedIntegerValue];
+        return @{
+            @"root_body": rootBody,
+            @"container_type": type == 26 ? @"Table" : @"CollectionView",
+            @"container_frame": [bestNode valueForKey:@"frame"],
+            @"cell_bodies": bodies,
+            @"children_count": bestCount ?: @(-1),
+            @"shallow_ms": @(shallowMs),
+            @"cells_ms": @(cellsMs),
+        };
+    } @catch (NSException *e) {
+        NSLog(@"iCTRL: visibleListParts exception: %@", e.reason);
+        return nil;
     }
 }
 
@@ -733,6 +923,15 @@ static BOOL ICTRLRenderNode(id node, NSInteger depth, NSInteger maxDepth,
         }
 
         BOOL keptAnything = selfVisible;
+        // A cell clips its content, so its children are on screen only where
+        // the cell is. Some apps report the children of off-screen (recycled)
+        // cells at a placeholder y inside the viewport; taken at face value
+        // they would drag off-screen rows into a visible_only read.
+        CGRect childViewport = viewport;
+        if (culling && type == 75 && frame.size.width > 0 && frame.size.height > 0) {
+            CGRect clip = CGRectIntersection(viewport, frame);
+            childViewport = CGRectIsNull(clip) ? CGRectMake(-100000, -100000, 1, 1) : clip;
+        }
         if (depth < maxDepth) {
             SEL s = NSSelectorFromString(@"children");
             if ([node respondsToSelector:s]) {
@@ -744,7 +943,7 @@ static BOOL ICTRLRenderNode(id node, NSInteger depth, NSInteger maxDepth,
                         // children (see ICTRLRectVisible). Pruning here is what a
                         // naive implementation gets wrong.
                         if (ICTRLRenderNode(k, depth + 1, maxDepth, maxElements,
-                                            lines, count, truncated, viewport)) {
+                                            lines, count, truncated, childViewport)) {
                             keptAnything = YES;
                         }
                     }
@@ -850,6 +1049,9 @@ static void ICTRLCollect(id node, NSInteger depth, ICTRLLocateCtx *ctx,
             NSInteger tier = -1, quality = 0;
             if (label.length && [label isEqualToString:ctx->needle]) { tier = 0; }
             else if (ident.length && [ident isEqualToString:ctx->needle]) { tier = 1; }
+            // Text some apps put only in `value` (tab titles, calendar
+            // days): matched exactly too, as its own tier.
+            else if (value.length && [value isEqualToString:ctx->needle]) { tier = 3; }
             else if (ctx->contains) {
                 NSString *hay = [NSString stringWithFormat:@"%@ %@", label ?: @"", value ?: @""];
                 NSRange r = [hay rangeOfString:ctx->needle options:NSCaseInsensitiveSearch];
@@ -857,14 +1059,18 @@ static void ICTRLCollect(id node, NSInteger depth, ICTRLLocateCtx *ctx,
             }
             // A hit with no label can't be re-resolved by label; its identifier
             // is the only handle a live query has.
-            if (tier >= 0 && (label.length || ident.length)) {
+            // A hit with only a value can't be re-resolved live; it is kept
+            // keyed by value, and callers act on its frame.
+            BOOL valueOnly = !label.length && !ident.length && value.length && (tier == 2 || tier == 3);
+            if (tier >= 0 && (label.length || ident.length || valueOnly)) {
                 BOOL byLabel = label.length > 0 && tier != 1;
                 NSMutableDictionary *c = [@{
-                    @"how": tier == 0 ? @"exact" : (tier == 1 ? @"id" : @"contains"),
+                    @"how": tier == 0 ? @"exact" : (tier == 1 ? @"id" : (tier == 3 ? @"value" : @"contains")),
                     @"tier": @(tier), @"quality": @(quality),
                     @"label": label ?: @"", @"identifier": ident ?: @"",
+                    @"value": value ?: @"",
                     @"type": @(type),
-                    @"key": byLabel ? @"label" : @"identifier",
+                    @"key": valueOnly ? @"value" : (byLabel ? @"label" : @"identifier"),
                     @"ordinal": @(byLabel ? labelOrdinal : identOrdinal),
                     @"order": @(out.count),
                     @"in_chrome": @(inChrome),

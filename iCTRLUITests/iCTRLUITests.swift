@@ -26,6 +26,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     static let copyLogsActionID = "COPY_LOGS"
 
     static let logBuffer = LogBuffer(capacity: 1000)
+    /// Longest one accessibility message to an app may take (see setAXTimeout).
+    static let axTimeoutSeconds = 5.0
 
     /// Persisted preference key. Defaults to false (localhost-only) on a fresh install.
     static let allowRemoteAccessKey = "allowRemoteAccess"
@@ -114,8 +116,9 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             // when the point is to find out which private API is missing.
             let screen = XCUIScreen.main
             let initSel = Selector(("initWithUniformTypeIdentifier:compressionQuality:"))
-            guard screen.responds(to: Selector(("screenshotWithPreferredEncoding:rect:options:error:"))) else {
-                failStep = "XCUIScreen lacks screenshotWithPreferredEncoding:rect:options:error:"; return
+            let newShape = screen.responds(to: Selector(("screenshotWithPreferredEncoding:rect:error:")))
+            guard newShape || screen.responds(to: Selector(("screenshotWithPreferredEncoding:rect:options:error:"))) else {
+                failStep = "XCUIScreen lacks screenshotWithPreferredEncoding:rect:(options:)error:"; return
             }
             guard let encodingClass = NSClassFromString("XCTImageEncoding") as? NSObject.Type else {
                 failStep = "XCTImageEncoding class not found"; return
@@ -127,21 +130,33 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             guard let encoding = ObjCException.makeImageEncoding(encodingClass,
                                                                  uti: "public.jpeg",
                                                                  quality: captureJPEGQuality,
-                                                                 diagnosis: &diag)
-                                    as? XCTImageEncoding else {
+                                                                 diagnosis: &diag) else {
                 failStep = "makeImageEncoding returned nil [\(diag ?? "no diagnosis")]"; return
             }
-            guard let shot = try? screen.screenshot(withPreferredEncoding: encoding,
-                                                    rect: .null, options: nil) else {
-                failStep = "screenshotWithPreferredEncoding threw/returned nil"; return
+            _ = newShape
+            // Through objc_msgSend, not a Swift protocol cast: on Xcode 27 the
+            // encoding object no longer bridges to XCTImageEncoding, so the
+            // cast failed and every frame took the slow bitmap path.
+            let raw = ObjCException.screenshot(of: screen, encoding: encoding)
+            // Xcode 27 returns the XCTImage itself; older SDKs wrap it in an
+            // XCUIScreenshot.
+            let xctImageAny: AnyObject?
+            if let shot = raw as? XCUIScreenshot, shot.responds(to: Selector(("internalImage"))) {
+                xctImageAny = shot.internalImage()
+            } else if let obj = raw as AnyObject?, obj.responds(to: Selector(("data"))) {
+                xctImageAny = obj
+            } else {
+                xctImageAny = nil
             }
-            guard shot.responds(to: Selector(("internalImage"))), let xctImage = shot.internalImage() else {
-                failStep = "screenshot has no internalImage"; return
+            guard let xctImage = xctImageAny else {
+                failStep = "screenshotWithPreferredEncoding returned \(raw.map { String(describing: type(of: $0)) } ?? "nil") " +
+                    "(encoding \((encoding as AnyObject).description ?? ""))"; return
             }
             guard xctImage.responds(to: Selector(("data"))) else {
                 failStep = "XCTImage lacks data"; return
             }
-            guard let data = xctImage.data() else {
+            // A private class: no Swift cast (it doesn't link), just the call.
+            guard let data = xctImage.perform(Selector(("data")))?.takeUnretainedValue() as? Data else {
                 failStep = "XCTImage.data was nil (frame kept as a bitmap, not encoded)"; return
             }
             guard let img = UIImage(data: data), img.cgImage != nil else {
@@ -164,6 +179,37 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                              + "Stopped at: \(raised ?? failStep)")
         }
         return nil
+    }
+
+    /// One screen frame, cheapest path first: a JPEG the capture side
+    /// compressed for us, else the bitmap without the PNG round-trip, else the
+    /// public API. Main thread only. Shared by the video stream and the
+    /// post-action settle check.
+    static func captureFrame() -> UIImage? {
+        // Fast path: ask the capture side to hand back a JPEG. The
+        // default `screenshot()` produces a full-resolution bitmap
+        // (~6 MB at 828x1792) that we then copy again; capture and
+        // that copy are what degrade 15-20x under thermal pressure,
+        // while encoding barely moves. Compressing at the source
+        // keeps the big buffer out of this process entirely.
+        if let img = Self.grabJPEGFrame() { return img }
+        // Otherwise take the bitmap directly, still skipping the
+        // PNG round-trip that `.image` would do. Also private, and
+        // also behind an ObjC @try: on an OS where the selector
+        // exists but behaves differently, an NSException here would
+        // abort the runner rather than fall through.
+        let shot = XCUIScreen.main.screenshot()
+        var fast: UIImage?
+        _ = ObjCException.catching {
+            guard shot.responds(to: Selector(("internalImage"))),
+                  let xctImage = shot.internalImage(),
+                  xctImage.responds(to: Selector(("platformImage"))),
+                  let img = xctImage.platformImage(),
+                  img.cgImage != nil else { return }  // encoder needs CGImage
+            fast = img
+        }
+        if let img = fast { return img }
+        return shot.image
     }
 
     private static var lifecycleObserved = false
@@ -263,6 +309,14 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // ("Timed out while enabling automation mode"). Reaching this line proves
         // automation mode is already enabled, so the cap is safe here.
         QuiescenceDisabler.applyInteractionStateTimeout()
+
+        // Bound each accessibility message to an app. Unbounded, a walk of a
+        // large accessibility tree can run for minutes, holding the serial
+        // UI queue the whole time. A walk past this now fails fast instead,
+        // and the slow-tree paths take over. Set here, after bootstrap, for
+        // the same reason as the state timeout above. WebDriverAgent sets it too.
+        let previousAX = ForegroundApp.setAXTimeout(Self.axTimeoutSeconds)
+        Self.logBuffer.append("⏳ AX timeout \(previousAX)s → \(Self.axTimeoutSeconds)s")
 
         // Last-resort exit visibility: register atexit + signal handlers so a
         // silent teardown / kill leaves a trace in the persisted log.
@@ -823,7 +877,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// by (or delay) a slow UI action.
     private static let mainThreadMethods: Set<String> = [
         "tap", "double_tap", "long_press", "swipe", "scroll", "drag",
-        "page", "page_down", "page_up",
+        "page", "page_down", "page_up", "collect",
         "type", "clear_text", "screenshot", "page_source", "view_tree", "ui_tree",
         "scroll_to_element", "scroll_to", "find_element", "tap_element", "find_and_tap",
         "launch_app", "activate_app", "terminate_app",
@@ -991,7 +1045,9 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// landed tap fires it twice. The longer watchdog does not hold the serial
     /// queue any longer — the work occupies it either way — it only keeps the
     /// client waiting for the real answer.
-    private static let extendedTimeoutMethods: Set<String> = ["page_source", "find_and_tap", "tap_element"]
+    // screen_text: OCR alone can take seconds on a busy or thermally
+    // throttled device, pushing a normally finishing call past 6s.
+    private static let extendedTimeoutMethods: Set<String> = ["page_source", "find_and_tap", "tap_element", "collect", "screen_text"]
     private static let extendedRpcTimeout: TimeInterval = 15
 
     private static func rpcBudget(for method: String) -> TimeInterval {
@@ -1154,32 +1210,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             // on the main thread — hop over there synchronously from whatever
             // queue the broadcaster ticks on.
             VideoBroadcaster.shared.configure(fps: fps, quality: quality) {
-                let grab: () -> UIImage? = {
-                    // Fast path: ask the capture side to hand back a JPEG. The
-                    // default `screenshot()` produces a full-resolution bitmap
-                    // (~6 MB at 828x1792) that we then copy again; capture and
-                    // that copy are what degrade 15-20x under thermal pressure,
-                    // while encoding barely moves. Compressing at the source
-                    // keeps the big buffer out of this process entirely.
-                    if let img = Self.grabJPEGFrame() { return img }
-                    // Otherwise take the bitmap directly, still skipping the
-                    // PNG round-trip that `.image` would do. Also private, and
-                    // also behind an ObjC @try: on an OS where the selector
-                    // exists but behaves differently, an NSException here would
-                    // abort the runner rather than fall through.
-                    let shot = XCUIScreen.main.screenshot()
-                    var fast: UIImage?
-                    _ = ObjCException.catching {
-                        guard shot.responds(to: Selector(("internalImage"))),
-                              let xctImage = shot.internalImage(),
-                              xctImage.responds(to: Selector(("platformImage"))),
-                              let img = xctImage.platformImage(),
-                              img.cgImage != nil else { return }  // encoder needs CGImage
-                        fast = img
-                    }
-                    if let img = fast { return img }
-                    return shot.image
-                }
+                let grab: () -> UIImage? = { Self.captureFrame() }
                 if Thread.isMainThread { return grab() }
                 var img: UIImage?
                 DispatchQueue.main.sync { img = grab() }

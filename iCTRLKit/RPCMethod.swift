@@ -49,6 +49,7 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "max_depth", type: "number", required: false, description: "Max tree depth. WARNING: labels/tappable controls live near the LEAVES, so a shallow depth (3-4) returns structure with NO useful labels and you'll have to re-fetch — a wasted call. Use max_depth ONLY to preview overall layout; to FIND an element use filter or find_element instead."),
                 RPCParamDef(name: "max_elements", type: "number", required: false, description: "Max nodes to RETURN (default 2000, hard cap 4000). If hit, response is truncated:true. NOTE this does not make the call faster: it trims after the tree is already fetched (measured: 20 vs 2000 both cost the same fetch time). To cut the TIME use max_depth or max_children, the only two limits the accessibility server applies while walking."),
                 RPCParamDef(name: "max_children", type: "number", required: false, description: "Max children per node the accessibility server will walk (default 1000, cap 5000). One of only two knobs that bound the FETCH itself — the expensive phase (on a chat list, fetch is ~99% of the call). Lower it on wide recycling lists where thousands of offscreen rows hang off one container."),
+                RPCParamDef(name: "enhanced", type: "boolean", required: false, description: "true = richest read, only when asked for everything: the whole tree (no visible-cells shortcut, max_children 5000) plus, as ocr_only, on-screen text the tree lacks (text drawn in images) read by OCR and de-duplicated against the tree. Seconds slower on long lists."),
                 RPCParamDef(name: "visible_only", type: "boolean", required: false, description: "Return ONLY nodes intersecting the screen, plus their ancestor path. Use on long/infinitely-scrolling lists (chat lists, feeds, timelines): such a list keeps far more rows in the tree than are on screen — measured 91% offscreen on a WeChat chat list — and those offscreen rows exhaust max_elements before the visible ones are reached, so the response truncates while still missing what you can see. This returns the CURRENT VIEWPORT only: to see more, scroll (page{direction:'down'}) and read again, or use scroll_to_element to jump to a known item. Omit it when you need to reason about content just offscreen — scroll_to_element needs the full tree. Cuts payload and node count sharply; cuts TIME only modestly, since a container's frame doesn't bound its children in a recycling list so every node is still visited."),
             ],
             returns: "{source: the tree as text, truncated, total_returned, max_children_used, timing:{fetch_ms,render_ms}, coordinate_space:'points', channel:{ax_coverage, recommended:'tree'|'ocr', why} for THIS screen, hint}. Includes visible overlay windows automatically. AUTOMATIC OCR FALLBACK: when the accessibility tree returns NO on-screen content (common on chat lists and feeds), the response also carries ocr_items[] — same keys as find_element, each tagged source:'ocr', tap via tap{x:center_x,y:center_y} — plus ocr_count, ocr_timing and ocr_reason explaining why. viewport_warning / sparse_hint flag a tree that is present but suspect."
@@ -74,7 +75,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "reset",
-            description: "Recover after UI automation stops responding (calls timing out, logs showing kAXErrorServerNotFound). Clears cached element refs, the sticky app binding and the cached screen size, and re-arms the circuit breaker that rejects UI calls once the channel is judged unhealthy. Does NOT itself restart XCTest's accessibility session — after calling it, launch_app (or activate_app) the target app to force a reconnect, then retry. If UI calls still time out, restart the runner: config{stop_server:true}, then relaunch it. Safe to call any time; runs off the UI queue so it works even while UI methods are blocked.",
+            description: "Recover after UI automation stops responding (calls timing out, logs showing kAXErrorServerNotFound). Clears cached element refs, the learned front-app ids and the cached screen size, and re-arms the circuit breaker that rejects UI calls once the channel is judged unhealthy. Does NOT itself restart XCTest's accessibility session — after calling it, launch_app (or activate_app) the target app to force a reconnect, then retry. If UI calls still time out, restart the runner: config{stop_server:true}, then relaunch it. Safe to call any time; runs off the UI queue so it works even while UI methods are blocked.",
             params: [],
             returns: "Object: {reset:true, cleared_refs, unbound?, foreground_app?, hint}"
         ),
@@ -93,6 +94,8 @@ struct RPCMethodRegistry {
             name: "tap",
             description: "Tap either by a stable 'ref' (from find_element/scroll_to_element — RECOMMENDED, re-resolves the live element and won't drift) OR by x,y coordinates in POINTS. If reading from a screenshot, convert: point = pixel / scale. Out-of-range coords return the valid range. Bottom tab bars sit just above the home-indicator safe area.",
             params: [
+                RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
+                RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
                 RPCParamDef(name: "ref", type: "string", required: false, description: "Element ref from find_element/scroll_to_element (preferred over x,y)"),
                 RPCParamDef(name: "x", type: "number", required: false, description: "X in points (0..point_width) — required if no ref"),
                 RPCParamDef(name: "y", type: "number", required: false, description: "Y in points (0..point_height) — required if no ref"),
@@ -104,6 +107,8 @@ struct RPCMethodRegistry {
             name: "double_tap",
             description: "Double tap by a 'ref' (from find_element/scroll_to_element — preferred) OR by x,y in POINTS.",
             params: [
+                RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
+                RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
                 RPCParamDef(name: "ref", type: "string", required: false, description: "Element ref (preferred over x,y)"),
                 RPCParamDef(name: "x", type: "number", required: false, description: "X in points — required if no ref"),
                 RPCParamDef(name: "y", type: "number", required: false, description: "Y in points — required if no ref"),
@@ -114,6 +119,8 @@ struct RPCMethodRegistry {
             name: "long_press",
             description: "Long press by a 'ref' (from find_element/scroll_to_element — preferred) OR by x,y in POINTS.",
             params: [
+                RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
+                RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
                 RPCParamDef(name: "ref", type: "string", required: false, description: "Element ref (preferred over x,y)"),
                 RPCParamDef(name: "x", type: "number", required: false, description: "X in points — required if no ref"),
                 RPCParamDef(name: "y", type: "number", required: false, description: "Y in points — required if no ref"),
@@ -125,6 +132,8 @@ struct RPCMethodRegistry {
             name: "swipe",
             description: "Low-level swipe gesture. Do NOT use swipe to read through results/feeds — its default 100pt travel barely moves the page so you under-scroll and waste calls; use 'page' (one full screen, precise Page Down/Up, no overshoot) for reading, and 'scroll_to_element' to reach a known element. Reserve swipe for custom gestures (partial drags, horizontal carousels, pull-to-refresh). x,y OPTIONAL (default screen center). 'distance' = finger travel in points (default 100). 'velocity': 'fast'/'flick' adds iOS momentum (scrolls far, easy to overshoot), 'normal' (default), 'slow'/'precise' = exact drag.",
             params: [
+                RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
+                RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
                 RPCParamDef(name: "x", type: "number", required: false, description: "Start X (default: screen center)"),
                 RPCParamDef(name: "y", type: "number", required: false, description: "Start Y (default: screen center)"),
                 RPCParamDef(name: "direction", type: "string", required: false, description: "Finger direction: up/down/left/right (default: up). 'up' reveals content below."),
@@ -138,10 +147,24 @@ struct RPCMethodRegistry {
             name: "page",
             description: "Scroll by one screenful — like Page Down / Page Up on a keyboard. This is the RECOMMENDED way to read through a long page: it's PRECISE (no momentum/overshoot), so you won't skip content the way swipe with velocity:'fast' does. Use {\"direction\":\"down\"} (default, reveal content below) or {\"direction\":\"up\"}; the aliases page_down / page_up force the direction. After paging, re-read with page_source or screenshot. To jump straight to a known element, prefer scroll_to_element.",
             params: [
+                RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
+                RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
                 RPCParamDef(name: "direction", type: "string", required: false, description: "'down' (default, reveal below) or 'up'"),
-                RPCParamDef(name: "distance", type: "number", required: false, description: "Number of screenfuls (default 1; e.g. 0.5 = half a page, 2 = two pages). One screenful travels 70% of the height, leaving ~30% overlap so nothing falls between consecutive reads. Raising this past 1 trades that safety for fewer calls — on a feed, items can then pass between reads with no way to notice."),
+                RPCParamDef(name: "distance", type: "number", required: false, description: "Number of screenfuls (default 1; e.g. 0.5 = half a page, 2 = two pages). One screenful travels two thirds of the height, leaving a third overlapping so nothing falls between consecutive reads. Raising this past 1 trades that safety for fewer calls — on a feed, items can then pass between reads with no way to notice."),
             ],
             returns: "{message, screen, moved, position?, at_end?, hint?}. **moved:false means the gesture changed nothing** — you are at the end of the scrollable content in that direction, so scrolling again is wasted. `position` gives {percent, fraction, scrolled_pt, scrollable_pt, content_pt, content_top_y, content_bottom_y, rows_seen, row_estimate, confidence} derived from row frames; check `confidence` (estimated | low | exact) before trusting it, and note lazily-built lists report only visible rows so the figure pins near 0 or 100. A page still loading also reads as unmoved."
+        ),
+        RPCMethodDef(
+            name: "collect",
+            description: "Read a long list in ONE call: reads the visible screen, then pages down (the same precise, overlapping page as `page`) and reads again, up to `pages` times, stopping at the end. Returns only text it has not returned before for this app (consecutive calls continue the list, nothing repeated), each item with its type and frame so you can tap it by {x,y}. Use instead of page + page_source pairs on feeds and search results; it costs about 1s a screen. On a screen whose channel is ocr pass source:'ocr' (OCR per screen, ~1.5s each); in auto mode it switches to OCR by itself when the app stops answering accessibility (long-scrolled feeds).",
+            params: [
+                RPCParamDef(name: "pages", type: "integer", required: false, description: "Page moves after the first read (default 3, max 8); 0 = just read the current screen."),
+                RPCParamDef(name: "direction", type: "string", required: false, description: "'down' (default) or 'up'"),
+                RPCParamDef(name: "min_length", type: "integer", required: false, description: "Skip labels shorter than this many characters (default 2)."),
+                RPCParamDef(name: "fresh", type: "boolean", required: false, description: "true = forget what earlier collect calls returned (start a new list)."),
+                RPCParamDef(name: "source", type: "string", required: false, description: "'auto' (default: the tree, switching to OCR when the app's accessibility stops answering), 'tree', or 'ocr' (screens whose channel is ocr)."),
+            ],
+            returns: "{items:[{text, type, x, y, width, height, screen}], new_count, screens_read, at_end, elapsed_ms, hint}"
         ),
         RPCMethodDef(
             name: "scroll_to_element",
@@ -160,6 +183,8 @@ struct RPCMethodRegistry {
             name: "scroll",
             description: "DEPRECATED — use 'swipe' instead (it supports velocity/momentum, custom distance, and start point), or 'scroll_to_element' to reach a specific element. This coarse full-screen scroll is kept only for compatibility.",
             params: [
+                RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
+                RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
                 RPCParamDef(name: "direction", type: "string", required: false, description: "Direction: up/down/left/right (default: down)"),
             ],
             returns: "{message}"
@@ -168,6 +193,8 @@ struct RPCMethodRegistry {
             name: "type",
             description: "Type text into the focused input field. A text field must already have keyboard focus — tap a real textfield first (see 'searching_and_typing'). Type always runs, but if no keyboard could be confirmed the response includes a 'warning' (keyboard detection can't see all third-party keyboards, so this is advisory, not a failure) — if the text didn't land, re-focus the field and type again. Set clear:true to EMPTY the field before typing (replace its contents); set submit:true to append Return/Search so the field's action (search/go/send) fires. See searching_and_typing guidance for the full search flow.",
             params: [
+                RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
+                RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
                 RPCParamDef(name: "text", type: "string", required: true, description: "Text to type (optional if clear:true — then it just empties the field)"),
                 RPCParamDef(name: "clear", type: "boolean", required: false, description: "Empty the field before typing. Use whenever you are REPLACING contents — typing alone APPENDS, so a search box still holding the last query silently searches the concatenation (measured: '椰子汁' typed into a box holding '黄桃' searched '黄桃椰子汁'). The response carries append_warning when this is detected, but detection needs a readable focused field, so prefer clear:true over relying on it. Field must be focused first."),
                 RPCParamDef(name: "submit", type: "boolean", required: false, description: "Append Return/Search to submit the field (recommended for search boxes)"),
@@ -185,7 +212,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "home",
-            description: "Press the home button and wait until SpringBoard is actually frontmost. Verified, not fire-and-forget: it polls for the transition and retries once, then errors if the foreground app never changed (a modal alert or system sheet can swallow the press). Also clears the sticky app binding, since the caller has explicitly left that app.",
+            description: "Press the home button and wait until SpringBoard is actually frontmost. Verified, not fire-and-forget: it polls for the transition and retries once, then errors if the foreground app never changed (a modal alert or system sheet can swallow the press).",
             params: [],
             returns: "{message, foreground_app, previous_app}"
         ),
@@ -236,15 +263,15 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "launch_app",
-            description: "Open an app by bundle identifier (non-blocking, via LSApplicationWorkspace). If you don't know the bundle_id, use resolve_app to find it (e.g. '大麦' → cn.damai.iphone). The opened app becomes the STICKY TARGET for subsequent UI actions (see app_binding). NOTE: the app is still launching/rendering when this returns — wait 2-3s (call wait) before page_source, or you'll match splash/placeholder elements.",
+            description: "Open an app by bundle identifier (non-blocking, via LSApplicationWorkspace). If you don't know the bundle_id, use resolve_app to find it (e.g. 'Maps' → com.apple.Maps). There is no target app: every read and action applies to whatever is on screen, so if the app later jumps elsewhere, read the screen and decide. The app may still be drawing its first screen when this returns: read right away, and if you see a splash/placeholder, read again (poll ~0.5s, capped) — don't sleep a fixed time.",
             params: [
                 RPCParamDef(name: "bundle_id", type: "string", required: true, description: "App bundle identifier (from resolve_app)"),
             ],
-            returns: "{message, bound_app, advice}"
+            returns: "{message, hint}"
         ),
         RPCMethodDef(
             name: "activate_app",
-            description: "Bring an already-installed app to the foreground and make it the STICKY TARGET (see app_binding). Like launch_app but uses XCUIApplication.activate. Errors if the app isn't installed / can't be activated.",
+            description: "Bring an already-installed app to the foreground. Like launch_app but uses XCUIApplication.activate. Errors if the app isn't installed / can't be activated.",
             params: [
                 RPCParamDef(name: "bundle_id", type: "string", required: true, description: "App bundle identifier"),
             ],
@@ -273,6 +300,8 @@ struct RPCMethodRegistry {
             name: "tap_element",
             description: "Convenience: find an element by label/id and tap it in one call. Equivalent to find_element + tap{ref}. Prefer find_element when you also need the frame or want to double_tap/long_press.",
             params: [
+                RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
+                RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
                 RPCParamDef(name: "element_id", type: "string", required: true, description: "Accessibility label or identifier"),
                 RPCParamDef(name: "match", type: "string", required: false, description: "'exact' (default) or 'contains'"),
                 RPCParamDef(name: "element_type", type: "string", required: false, description: "Element type filter"),
@@ -283,6 +312,8 @@ struct RPCMethodRegistry {
             name: "find_and_tap",
             description: "Locate an element by label/identifier and tap it in one call. Default is a synthesized tap at the element's center (fast, ~1s). Call `wait` 1-2s after any navigation (back/tab-switch/page open) before using this: mid-transition, every locate step runs 5-30x slower and matches mid-animation geometry, so the same call that takes ~1s settled can take 10s+ and still succeed — do NOT blindly retry a timeout (the tap may have landed; check /logs). IMPORTANT: on SwiftUI List/ForEach rows a synthesized tap can report success yet never land — if the tap visibly does nothing, retry with fast:false, which drives the native XCUIElement.tap() pipeline (slower, waits for quiescence, but resolves the element at hit time). Same match semantics: element_id may be a label OR identifier; pair with match:'contains' for partial substring matching.",
             params: [
+                RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
+                RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
                 RPCParamDef(name: "element_id", type: "string", required: true, description: "Accessibility label or identifier (see page_source)"),
                 RPCParamDef(name: "match", type: "string", required: false, description: "'exact' (default) or 'contains' (substring)"),
                 RPCParamDef(name: "element_type", type: "string", required: false, description: "Restrict to type: button/textfield/label/image/cell/switch/icon"),
@@ -295,6 +326,8 @@ struct RPCMethodRegistry {
             name: "drag",
             description: "Drag between two points. Endpoints may be coordinates (from_x/from_y/to_x/to_y in POINTS) OR element refs (from_ref/to_ref, which resolve to the element center). Use for reordering/sliders; for a simple scroll flick use swipe.",
             params: [
+                RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
+                RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
                 RPCParamDef(name: "from_ref", type: "string", required: false, description: "Start element ref (alternative to from_x/from_y)"),
                 RPCParamDef(name: "to_ref", type: "string", required: false, description: "End element ref (alternative to to_x/to_y)"),
                 RPCParamDef(name: "from_x", type: "number", required: false, description: "Start X (points)"),
@@ -307,7 +340,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "wait",
-            description: "Pause for a fixed duration. Use SPARINGLY — most waits are wasted latency. tap/type/swipe/page/scroll already block on UI quiescence before they return, and page_source reads whatever is currently settled, so after an interaction you can read/act DIRECTLY without waiting. Legit uses: (a) 2-3s once after a COLD launch_app while the app renders; (b) a known async delay (search results loading over the network, a video). If a page_source comes back mid-transition (splash/placeholder/empty), wait ~1s and re-read REACTIVELY — don't pre-emptively sleep after every step.",
+            description: "Pause for a fixed duration. Almost never the right tool: tap/swipe/page/type already wait for the screen to settle and report it in `settle` — when settle.stable is true, read right away; if not, read again (with a cap). A fixed pause is too long when the app is fast and too short when it is slow. Use it only for a delay that is genuinely time-based (a countdown, a video).",
             params: [
                 RPCParamDef(name: "duration", type: "number", required: false, description: "Duration in seconds (default: 1.0)"),
             ],
@@ -340,7 +373,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.35.0"
+    static let serverVersion = "1.96.0"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///
@@ -373,6 +406,7 @@ struct RPCMethodRegistry {
         "open_url",            // open_url deep links
         "resolve_app",         // resolve_app name → bundle_id
         "page",                // page{direction} precise paging
+        "collect",             // collect{pages}: page + read N screens in one call
         "stop_server",         // config{stop_server:true}
         "logs_history",        // GET /logs/history (persisted logs)
         "screenshot_jpeg",     // screenshot{format:'jpeg'|'png', quality} — jpeg is the default
@@ -448,38 +482,29 @@ struct RPCMethodRegistry {
                     "(5) CHEAP RECOVERY: don't restart the task from scratch. The resolved bundle_id is stable — REUSE it, do NOT call resolve_app again. The key is idle-expiry (30 days unused) and persists across restarts, so re-pair only if a call actually returns 401. If you know a deep link back to where you were (open_url), use it instead of re-navigating from the app's home screen.",
                 "searching_and_typing": [
                     "Searching inside an app is the #1 place automation goes wrong. Follow this sequence:",
-                    "DON'T BLIND-WAIT between steps. tap/type/swipe/page already block on UI quiescence before returning, so after them you can page_source/find_element DIRECTLY — no wait call. The ONLY routine wait is after a COLD launch_app (2-3s, the app is still rendering). If a read comes back mid-transition (splash/placeholder/empty), THEN wait ~1s and re-read — reactively, not by default. Blind 2-3s sleeps after every tap just add latency.",
-                    "1. launch_app, then wait 2-3s ONCE (cold render). If you opened via open_url to a specific screen, often no wait is needed.",
+                    "DON'T WAIT A FIXED TIME between steps — not after launch_app either. Actions wait for the screen to settle before returning (settle.stable:true → read right away, no wait); if it is still changing or loading, read again (capped). Fixed sleeps after every step just add latency.",
+                    "1. launch_app, then read the screen. If it shows a splash or placeholder, read again until it changes.",
                     "2. Find the search ENTRY by its visible label (whatever the app's language). It's often a Button/StaticText that opens a search PAGE, not a real input — is_text_input:false confirms it's an entry, not the field. find_element{element_id:'<label>'} → tap{ref}.",
-                    "3. tap{ref} that entry (use the ref from step 2, not coordinates). No wait — tap already settled; go straight to step 4.",
+                    "3. tap{ref} that entry (use the ref from step 2, not coordinates), then go straight to step 4 — if the search page isn't up yet, step 4 finds nothing; read again.",
                     "4. Locate the REAL input: find_element{element_type:\"textfield\"} (or searchField), confirm is_text_input:true, then tap{ref} to focus. (The keyboard comes up as part of that tap.)",
                     "5. type{text:\"…\", submit:true}. If type returns a 'no keyboard/focus' warning, re-focus the textfield (step 4) and retry — don't assume it went in.",
-                    "6. Read results with page_source directly (no wait) — only if it's still loading do you wait ~1s and re-read.",
+                    "6. Read results with page_source right away; if they're still loading, read again (poll) rather than sleeping.",
                     "Key trap: type() into an unfocused field silently loses the text and submit:true then searches an empty/garbage query. type() returns a 'warning' when it can't confirm a focused keyboard — heed it and re-focus if needed.",
                     "To REPLACE existing text, use type{clear:true, text:\"…\"} (empties first) or clear_text; tap the field to focus before clearing.",
                 ],
-                "app_binding":
-                    "After you open an app with launch_app/activate_app it becomes the STICKY TARGET (see 'bound_app' " +
-                    "in the launch_app response). INTERACTION methods (tap, double_tap, long_press, tap_element, " +
-                    "swipe, scroll, scroll_to_element, drag, page) re-focus the bound app automatically if the " +
-                    "foreground drifted — the response then carries an 'app_note' saying it was re-focused — so " +
-                    "launch an app then 'tap …' always acts on THAT app even if another app came to the front. " +
-                    "READ-ONLY methods (page_source, screenshot, find_element) do NOT re-activate the bound app: " +
-                    "they read whatever is CURRENTLY in the foreground, because force-activating just to read can " +
-                    "stall on launch/transition animations. If the bound app was pushed to the background and you " +
-                    "want to read IT specifically, either run one interaction first (which re-focuses it) or pass the " +
-                    "app's explicit bundle_id to the read call (e.g. page_source{bundle_id:'<the bound app>'}). " +
-                    "For interaction methods, two situations abort with a clear error instead of doing the wrong thing: " +
-                    "(1) the bound app has CRASHED/EXITED (state notRunning) → error tells you to launch_app again; " +
-                    "(2) a SYSTEM ALERT/permission dialog is covering the app → error tells you to read it via " +
-                    "page_source{bundle_id:'com.apple.springboard'} and tap its button first. " +
-                    "To act on a DIFFERENT app for one call, pass an explicit bundle_id (does not change the sticky " +
-                    "target). Opening another app moves the target; terminate_app on the target clears it.",
+                "front_app":
+                    "There is no bound or target app. Reads (page_source, find_element, screen_text, screenshot) " +
+                    "and actions always apply to what is on screen now. Apps jump (login, payment, store, an ad) and " +
+                    "users switch, so after any surprise, read again before acting. A ref belongs to the app it was " +
+                    "found in: if that app is no longer in front, tapping it is refused with a clear error. A SYSTEM " +
+                    "ALERT/permission dialog covering the app blocks ref/element actions: read it via " +
+                    "page_source{bundle_id:'com.apple.springboard'} and tap its button by coordinates. Pass an " +
+                    "explicit bundle_id to read one specific app.",
                 "opening_apps_and_urls": [
                     "Don't guess bundle IDs. To open an app by name:",
                     "1. resolve_app{text:'携程'} → resolves a name/keyword to a bundle_id via a built-in catalog, " +
                     "falling back to the iTunes Search API (source field says which). Returns candidates with bundle_id + name.",
-                    "2. launch_app{bundle_id:<resolved>} → opens it and binds it as the sticky target.",
+                    "2. launch_app{bundle_id:<resolved>} → opens it.",
                     "list_apps returns the bundle IDs actually INSTALLED on this device — use it to confirm an app is present.",
                     "open_url{url:'scheme://…'} opens an app URL scheme / deep link (often faster than launch_app and can jump " +
                     "straight to a feature). Use it when you already know the app's scheme; use launch_app when you just want the app's home.",

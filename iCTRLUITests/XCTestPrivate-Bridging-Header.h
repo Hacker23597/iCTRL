@@ -86,6 +86,11 @@ NS_ASSUME_NONNULL_BEGIN
                                                          rect:(CGRect)rect
                                                       options:(NSDictionary * _Nullable)options
                                                         error:(NSError * _Nullable * _Nullable)error;
+/// Xcode 27's shape: the options argument is gone (the 4-argument form above
+/// no longer exists there, which silently forced the slow bitmap path).
+- (XCUIScreenshot * _Nullable)screenshotWithPreferredEncoding:(id<XCTImageEncoding>)encoding
+                                                         rect:(CGRect)rect
+                                                        error:(NSError * _Nullable * _Nullable)error;
 @end
 
 NS_ASSUME_NONNULL_END

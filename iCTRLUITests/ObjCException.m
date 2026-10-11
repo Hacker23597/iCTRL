@@ -1,5 +1,6 @@
 #import "ObjCException.h"
 #import <objc/message.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 // performSelector on a runtime-resolved selector: ARC cannot see the
 // ownership convention, and these all follow the standard one.
@@ -19,6 +20,23 @@
 }
 
 
++ (nullable id)screenshotOf:(id)screen encoding:(id)encoding {
+    @try {
+        NSError *err = nil;
+        SEL three = NSSelectorFromString(@"screenshotWithPreferredEncoding:rect:error:");
+        if ([screen respondsToSelector:three]) {
+            id (*fn)(id, SEL, id, CGRect, NSError **) = (id (*)(id, SEL, id, CGRect, NSError **))objc_msgSend;
+            return fn(screen, three, encoding, CGRectNull, &err);
+        }
+        SEL four = NSSelectorFromString(@"screenshotWithPreferredEncoding:rect:options:error:");
+        if ([screen respondsToSelector:four]) {
+            id (*fn)(id, SEL, id, CGRect, id, NSError **) = (id (*)(id, SEL, id, CGRect, id, NSError **))objc_msgSend;
+            return fn(screen, four, encoding, CGRectNull, nil, &err);
+        }
+    } @catch (__unused NSException *e) {}
+    return nil;
+}
+
 + (nullable id)makeImageEncoding:(Class)encodingClass
                              uti:(NSString *)uti
                          quality:(double)quality
@@ -36,11 +54,15 @@
             @"compressionQuality": @(quality),
         };
         id obj = [[encodingClass alloc] performSelector:dictSel withObject:spec];
-        if (obj) {
+        // Xcode 27 renamed the keys: the object comes back with a nil type
+        // and quality 0, which encodes nothing. Only keep it if it took.
+        BOOL took = NO;
+        @try { took = [obj valueForKey:@"uniformTypeIdentifier"] != nil; } @catch (__unused NSException *e) {}
+        if (obj && took) {
             if (diagnosis) { *diagnosis = @"via initWithDictionary:"; }
             return obj;
         }
-        [tried addObject:@"initWithDictionary:->nil"];
+        [tried addObject:obj ? @"initWithDictionary:->empty" : @"initWithDictionary:->nil"];
     }
 
     // 2. The class's own factory. No arguments, so nothing can be mis-marshalled;

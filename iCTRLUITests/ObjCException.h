@@ -15,6 +15,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// naming its type in Swift would leave the linker hunting for a symbol that
 /// isn't there, so it has to be built through the runtime. Returns nil if the
 /// class or initializer is missing on this OS.
+/// Screenshot with an encoding object, through objc_msgSend: Xcode 27's
+/// encoding class no longer bridges to the Swift protocol type, and its
+/// screenshot selector lost the options argument. Tries
+/// screenshotWithPreferredEncoding:rect:error: then the 4-argument form.
++ (nullable id)screenshotOf:(id)screen encoding:(id)encoding;
+
 + (nullable id)makeImageEncoding:(Class)encodingClass
                              uti:(NSString *)uti
                          quality:(double)quality

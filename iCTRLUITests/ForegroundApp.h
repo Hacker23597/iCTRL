@@ -9,6 +9,18 @@ NS_ASSUME_NONNULL_BEGIN
 @interface ForegroundApp : NSObject
 
 + (nullable NSString *)currentBundleID;
+/// pid of the app in front (SpringBoard at the home screen), from the
+/// accessibility client's activeApplications; 0 if unavailable. Readable
+/// where currentBundleID can't name the app: Xcode 27's XCTest dropped the
+/// -[XCUIApplication initWithProcessID:] that pid → bundle id lookup used.
++ (pid_t)frontmostPID;
+/// Cap how long one accessibility message to an app may take (XCTest's
+/// AX timeout). Returns the previous value, or a negative number if the
+/// private API is missing.
++ (double)setAXTimeout:(double)seconds;
+/// pid XCTest knows for an app (0 if not running or not tracked). Used for
+/// SpringBoard, which XCTest always tracks.
++ (pid_t)processIDForBundleID:(NSString *)bundleId;
 
 /// Lists installed apps as [{bundle_id, name}] via the private
 /// LSApplicationWorkspace API. Returns nil if unavailable. `userOnly` filters
@@ -18,6 +30,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// Opens an app by bundle id WITHOUT blocking (LSApplicationWorkspace, same as
 /// WebDriverAgent). Returns NO immediately if the app can't be opened — no hang.
 + (BOOL)openBundleID:(NSString *)bundleId;
++ (nullable NSDictionary *)visibleListParts:(NSString *)bundleId screen:(CGRect)screen maxElements:(NSInteger)maxElements;
 
 /// Opens an arbitrary URL (any scheme, with query) from inside the XCTest runner,
 /// where UIApplication.openURL is unreliable. Uses LSApplicationWorkspace's

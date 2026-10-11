@@ -114,3 +114,9 @@ schemes:
       targets:
         - iCTRLUITests
       testPlans: []
+      # testStartServer is one test that runs for hours and always ends killed,
+      # i.e. "failed" — so XCTest's default screen recording (30fps H.264 in
+      # testmanagerd's tmp, kept on failure) piled up as tens of GB of "System
+      # Data" on the phone. The server takes its own frames; record nothing.
+      preferredScreenCaptureFormat: screenshots
+      captureScreenshotsAutomatically: false

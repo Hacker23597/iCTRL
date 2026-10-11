@@ -22,7 +22,7 @@ enum RemoteHTML {
 <html lang="en" class="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>iCTRL Remote</title>
 <style>
   /* ── shadcn-inspired tokens (dark) ── */
@@ -87,7 +87,21 @@ enum RemoteHTML {
     position: absolute; inset: 0;
     /* invisible input catcher — sits above <video>, receives clicks/keys */
     cursor: crosshair;
+    /* On a phone, a drag here is a swipe for the device — not a page scroll,
+       pinch-zoom or double-tap zoom of this page. */
+    touch-action: none;
   }
+  /* Shown while disconnected: nothing connects on its own (each connection
+     streams video and polls the device), and on a phone the Connect button
+     in the drawer is out of sight. */
+  #connectCta {
+    position: absolute; z-index: 6;
+    left: 50%; top: 50%; transform: translate(-50%, -50%);
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    color: var(--muted); font-size: 12px; text-align: center;
+  }
+  #connectCta[hidden] { display: none; }
+  #connectCta .btn { min-height: 44px; padding: 10px 28px; font-size: 15px; }
   .stage .hud {
     position: absolute; top: 10px; left: 12px; right: 12px;
     display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
@@ -207,6 +221,7 @@ enum RemoteHTML {
   #status {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
     padding: 8px 12px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
     border-top: 1px solid var(--border);
     font-size: 12px; color: var(--muted);
     background: rgba(24,24,27,.92);
@@ -236,7 +251,7 @@ enum RemoteHTML {
   /* ── mobile: sidebar collapses into a FAB + bottom-sheet drawer ── */
   #fab {
     display: none;
-    position: fixed; right: 16px; bottom: 56px; z-index: 30;
+    position: fixed; right: 16px; bottom: calc(56px + env(safe-area-inset-bottom)); z-index: 30;
     width: 56px; height: 56px; border-radius: 999px;
     background: var(--fg); color: var(--primary-fg);
     border: none; box-shadow: 0 6px 20px rgba(0,0,0,.5);
@@ -253,7 +268,7 @@ enum RemoteHTML {
   /* Drawer styling only kicks in on narrow viewports — on desktop the sidebar
      is a normal grid column. */
   @media (max-width: 720px) {
-    .app { grid-template-columns: minmax(0, 1fr); padding: 8px; padding-bottom: 40px; }
+    .app { grid-template-columns: minmax(0, 1fr); padding: 8px; padding-bottom: calc(40px + env(safe-area-inset-bottom)); }
     .app > aside {
       position: fixed; left: 0; right: 0; bottom: 0; z-index: 25;
       max-height: 78dvh; overflow-y: auto;
@@ -274,6 +289,8 @@ enum RemoteHTML {
     .stage { border-radius: 12px; }
     .section { padding: 10px; }
     .grid-3 { max-width: 240px; }
+    /* iOS Safari zooms the page into any field under 16px when it gains focus. */
+    .input { font-size: 16px; }
   }
   /* landscape phones: keep video full width, drawer larger */
   @media (max-width: 720px) and (orientation: landscape) {
@@ -303,6 +320,10 @@ enum RemoteHTML {
     </div>
     <!-- overlay catches pointer + keyboard events -->
     <div class="overlay" id="overlay" tabindex="0"></div>
+    <div id="connectCta">
+      <button class="btn primary" id="ctaBtn">Connect</button>
+      <span id="ctaNote">Not connected — streaming starts when you connect.</span>
+    </div>
   </section>
 
   <!-- ── RIGHT: control panel ── -->
@@ -1028,6 +1049,7 @@ enum RemoteHTML {
       setStatus('autoplay blocked — click the video', 'err');
     }
     connectBtn.disabled = true; stopBtn.disabled = false;
+    connectCta.hidden = true;
     setStatus('connected — waiting for first frame…', 'ok');
     overlay.focus();
   }
@@ -1035,6 +1057,7 @@ enum RemoteHTML {
     if (player) { try { player.stop(); } catch(_){} player = null; }
     stopSysmon();
     connectBtn.disabled = false; stopBtn.disabled = true;
+    connectCta.hidden = false;
     setStatus('stopped');
     hudDot.className = 'dot off';
   }
@@ -1220,8 +1243,19 @@ enum RemoteHTML {
   // Prevent the video overlay from stealing swipes over the drawer.
   document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
 
-  // Auto-connect when a key from a previous visit is already in the box.
-  if (savedKey) queueMicrotask(connect);
+  // Never connect on load: a connection streams video and polls the device,
+  // and a forgotten tab (or every reload) would keep doing that. A saved key
+  // just makes Connect one tap.
+  const connectCta = document.getElementById('connectCta');
+  document.getElementById('ctaBtn').addEventListener('click', connect);
+  if (savedKey) {
+    document.getElementById('ctaNote').textContent = 'Saved key found — tap Connect to start streaming.';
+  }
+  // Leaving the tab (or locking the phone) ends the session for the same
+  // reason; coming back shows Connect again.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && player) { stop(); setStatus('stopped while the page was hidden — tap Connect'); }
+  });
 })();
 </script>
 </body>
