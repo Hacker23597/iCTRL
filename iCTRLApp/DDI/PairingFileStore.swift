@@ -12,16 +12,53 @@ import UniformTypeIdentifiers
 /// idevice library, never here.
 enum PairingFileStore {
 
+    /// Types the import picker accepts.
+    ///
+    /// `.fileImporter` matches a picked file's type against this list, and the
+    /// match has to hold for the file's *actual* UTI. A pairing record is an
+    /// XML property list, which iOS types as `public.xml` — a sibling of
+    /// `public.data`, not a subtype, so `.data` alone does not let it through.
+    ///
+    /// Two traps made the old list miss real files:
+    ///  * `UTType(filenameExtension:)` returns nil for `plist` /
+    ///    `mobiledevicepairing` on iOS — no such UTI is registered — so those
+    ///    entries silently vanished and the list collapsed to `.data`.
+    ///  * A picker only enables what the list *contains*; `.xml` has to be
+    ///    listed on its own because it is not covered by `.data`.
+    ///
+    /// So declare every type explicitly with `UTType(tag:tagClass:conformingTo:)`
+    /// (which does not depend on a system-registered UTI) and keep `.data` last
+    /// as the permissive catch-all. The file is validated after the pick anyway,
+    /// so a wider list costs nothing but a clearer failure.
     static let supportedContentTypes: [UTType] = {
-        var types: [UTType] = [.propertyList, .xml, .data]
-        // The extensions Apple's tooling and the community write. Declared as
-        // conforming to .data so the picker accepts them even though the system
-        // has no UTI registered for them.
-        for ext in ["mobiledevicepairing", "mobiledevicepair", "plist"] {
-            if let t = UTType(filenameExtension: ext, conformingTo: .data) {
+        var types: [UTType] = []
+
+        // The standard property-list type (both XML and binary forms).
+        types.append(.propertyList)
+        // A pairing record is usually XML: iOS reports `public.xml`, and the
+        // picker must be told about it explicitly.
+        types.append(.xml)
+
+        // Apple's tooling and the community write these extensions. Build the
+        // types from their tags rather than by filename lookup, so they exist
+        // even where the system has no UTI registered for the extension.
+        for ext in ["mobiledevicepairing", "mobiledevicepair"] {
+            if let t = UTType(tag: ext, tagClass: .filenameExtension,
+                              conformingTo: .propertyList) {
                 types.append(t)
             }
         }
+        // A plain `.plist` extension, in case the file keeps it.
+        if let t = UTType(tag: "plist", tagClass: .filenameExtension,
+                          conformingTo: .propertyList) {
+            types.append(t)
+        }
+
+        // Permissive catch-all: every file conforms to `.data`, so this keeps
+        // the picker from greying out a record saved under an unexpected
+        // extension. Content is validated by `validate(_:)` after import.
+        types.append(.data)
+
         return types
     }()
 
