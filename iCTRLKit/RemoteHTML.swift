@@ -14,6 +14,21 @@ import Foundation
 /// the browser (WebCrypto HMAC-SHA256): every /rpc body is sealed locally and
 /// the key itself is never transmitted.
 enum RemoteHTML {
+    /// Web app manifest for GET /remote/manifest.webmanifest. Added to the Home
+    /// Screen, the page opens in full screen with nothing of the browser around it.
+    static let manifest: String = #"""
+{
+  "name": "iCTRL Remote",
+  "short_name": "iCTRL Remote",
+  "start_url": "/remote?fullscreen=1",
+  "scope": "/remote",
+  "display": "fullscreen",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [{ "src": "/remote/icon.png", "sizes": "180x180", "type": "image/png" }]
+}
+"""#
+
     /// Full HTML for GET /remote. The stream is fragmented MP4 (`Content-Type:
     /// video/mp4`) via MSE — every major browser decodes it natively, so this
     /// page has zero JS decoder dependency.
@@ -23,6 +38,16 @@ enum RemoteHTML {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- Opened from the Home Screen, the page runs without Safari's bars: the only
+     full screen an iPhone offers a page that isn't a bare <video>. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#09090b">
+<meta name="apple-mobile-web-app-title" content="iCTRL Remote">
+<link rel="manifest" href="/remote/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/remote/icon.png">
+<link rel="icon" type="image/png" href="/remote/icon.png">
 <title>iCTRL Remote</title>
 <style>
   /* ── shadcn-inspired tokens (dark) ── */
@@ -106,6 +131,9 @@ enum RemoteHTML {
     position: absolute; top: 10px; left: 12px; right: 12px;
     display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
     color: var(--muted); font-size: 12px; pointer-events: none;
+    /* Above the input overlay, which comes later in the stage and would
+       otherwise take the clicks meant for the HUD's buttons. */
+    z-index: 5;
   }
   /* Device badge and connection state stay on one line, full stage width. */
   .hud-row {
@@ -116,6 +144,14 @@ enum RemoteHTML {
     background: rgba(0,0,0,.5); border: 1px solid var(--border);
     padding: 2px 8px; border-radius: 999px;
   }
+  .hud-end { display: flex; align-items: center; gap: 6px; }
+  .hud-btn {
+    pointer-events: auto;
+    background: rgba(0,0,0,.5); border: 1px solid var(--border); color: var(--fg);
+    border-radius: 999px; width: 26px; height: 26px; padding: 0;
+    font-size: 13px; line-height: 1; cursor: pointer;
+  }
+  .hud-btn:hover { border-color: var(--border-hi); }
   /* ── device health overlay ──
      Sits in the HUD directly under the device badge, so identity and live state
      read as one top-left cluster. A portrait phone on a landscape stage leaves
@@ -208,6 +244,7 @@ enum RemoteHTML {
   .btn.icon { padding: 8px; min-width: 34px; }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
   .btn.full { width: 100%; }
+  a.btn { text-decoration: none; }
 
   /* ── inputs ── */
   .input {
@@ -248,44 +285,146 @@ enum RemoteHTML {
   }
   .hint { color: var(--muted-2); font-size: 11px; margin-top: 6px; }
 
-  /* ── mobile: sidebar collapses into a FAB + bottom-sheet drawer ── */
-  #fab {
-    display: none;
-    position: fixed; right: 16px; bottom: calc(56px + env(safe-area-inset-bottom)); z-index: 30;
-    width: 56px; height: 56px; border-radius: 999px;
-    background: var(--fg); color: var(--primary-fg);
-    border: none; box-shadow: 0 6px 20px rgba(0,0,0,.5);
-    font-size: 22px; cursor: pointer;
-    align-items: center; justify-content: center;
-  }
-  #fab:active { transform: translateY(1px); }
+  /* ── drawer mode: on a phone, and in full screen, the sidebar becomes a
+     bottom sheet and a floating ball is the only control left on screen ── */
   #scrim {
     display: none;
     position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 20;
     backdrop-filter: blur(2px);
   }
+  .app.drawer { grid-template-columns: minmax(0, 1fr); }
+  .app.drawer > aside {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 25;
+    max-height: 78dvh; overflow-y: auto; overscroll-behavior: contain;
+    background: var(--card);
+    border-top: 1px solid var(--border);
+    border-top-left-radius: 16px; border-top-right-radius: 16px;
+    padding: 8px 12px calc(24px + env(safe-area-inset-bottom));
+    transform: translateY(105%);
+    transition: transform .22s ease;
+  }
+  .app.drawer > aside::before {
+    content: ''; display: block; width: 44px; height: 4px; margin: 6px auto 10px;
+    background: var(--border-hi); border-radius: 999px;
+  }
+  .app.drawer.open > aside { transform: translateY(0); }
+  .app.drawer.open ~ #scrim { display: block; }
 
-  /* Drawer styling only kicks in on narrow viewports — on desktop the sidebar
-     is a normal grid column. */
+  /* Translucent, draggable; tap it for the quick controls. It snaps to the
+     nearest side when let go, so it never parks over the middle of the screen. */
+  #ball {
+    display: none;
+    position: fixed; right: 12px; bottom: calc(56px + env(safe-area-inset-bottom)); z-index: 30;
+    width: 48px; height: 48px; border-radius: 999px; padding: 0;
+    background: rgba(250,250,250,.16); color: var(--fg);
+    border: 1px solid rgba(250,250,250,.3);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 4px 16px rgba(0,0,0,.45);
+    font-size: 20px; cursor: grab;
+    align-items: center; justify-content: center;
+    opacity: .55; transition: opacity .15s, background-color .3s, border-color .3s;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  /* Over a light part of the picture the pale glass disappears, so the ball
+     turns dark there (the script samples the frame beneath it). */
+  #ball.on-light {
+    background: rgba(24,24,27,.55); border-color: rgba(0,0,0,.55);
+    box-shadow: 0 4px 16px rgba(0,0,0,.25); opacity: .7;
+  }
+  #ball:hover, #ball.active { opacity: 1; }
+  #ball.dragging { cursor: grabbing; opacity: 1; }
+  .app.drawer ~ #ball { display: inline-flex; }
+  .app.drawer.open ~ #ball { display: none; }   /* the sheet is open: it would sit on its controls */
+
+  #quick {
+    position: fixed; z-index: 31;
+    display: grid; grid-template-columns: repeat(4, 64px); gap: 6px;
+    padding: 8px; border-radius: 16px;
+    background: rgba(24,24,27,.82); border: 1px solid var(--border-hi);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    box-shadow: 0 10px 30px rgba(0,0,0,.5);
+  }
+  #quick[hidden] { display: none; }
+  #quick button {
+    appearance: none; border: none; border-radius: 12px;
+    background: rgba(250,250,250,.06); color: var(--fg);
+    height: 60px; padding: 4px 0; cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+    font-size: 20px; -webkit-tap-highlight-color: transparent;
+  }
+  #quick button span { font-size: 11px; color: var(--muted); }
+  #quick button:active { background: rgba(250,250,250,.16); }
+
+  /* Modal sheets: Add to Home Screen steps, screenshot preview. */
+  .sheet {
+    position: fixed; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.6); padding: 16px;
+  }
+  .sheet[hidden] { display: none; }
+  .sheet .card {
+    background: var(--card); border: 1px solid var(--border-hi); border-radius: 16px;
+    padding: 18px; max-width: 360px; width: 100%;
+  }
+  .sheet h4 { margin: 0 0 10px; font-size: 16px; }
+  .sheet ol { margin: 0 0 12px; padding-left: 20px; line-height: 1.6; }
+  .sheet .hint { margin: 0 0 14px; }
+  #shotImg {
+    display: block; width: 100%; max-height: 62dvh; object-fit: contain;
+    border-radius: 10px; background: #000; margin-bottom: 12px;
+    /* A long-press would otherwise start a Live Text selection. */
+    -webkit-user-select: none; user-select: none;
+  }
+
+  .check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--fg); cursor: pointer; }
+  .check + .check { margin-top: 8px; }
+
+  /* ── display preferences (Display panel) ── */
+  body.hide-hud .hud-row { display: none; }
+  body.hide-sysmon #sysmon { display: none; }
+  /* Without the status bar, a short action result still shows, as a pill at
+     the top. */
+  body.hide-statusbar #status, body.immersive #status {
+    top: calc(10px + env(safe-area-inset-top)); bottom: auto; left: 50%; right: auto;
+    transform: translateX(-50%);
+    background: none; border: none; backdrop-filter: none; -webkit-backdrop-filter: none;
+    padding: 0; min-height: 0; pointer-events: none;
+  }
+  body.hide-statusbar #status > :not(.toast),
+  body.immersive #status > :not(.toast) { display: none; }
+  body.hide-statusbar .app { padding-bottom: 12px; }
+
+  /* Opened from the Home Screen the page runs under the status bar. */
+  body.standalone .app { padding-top: max(8px, env(safe-area-inset-top)); }
+
+  /* ── full screen: the picture edge to edge, nothing but the ball on top ── */
+  body.immersive { background: #000; }
+  body.immersive .app { padding: 0; gap: 0; }
+  body.immersive .stage { border: none; border-radius: 0; }
+  /* Safari on iPhone (iOS 26 and later) floats its toolbar over the page and
+     shows whatever part of the document lies beneath it. In full screen with
+     the picture filling the window, the page is made as tall as the screen
+     below the status bar (the height is set from script), so the picture runs
+     to the bottom edge behind the toolbar, as it would on the phone itself.
+     Safari paints the colour of anything fixed to the bottom edge across that
+     strip, over the picture, and keeps doing so after the element has moved
+     away; only display:none clears it. So the closed drawer is taken out of
+     the layout there, and so is the status bar except while it shows a
+     message (as a pill at the top). */
+  html.under-bars, html.under-bars body { height: auto; }
+  html.under-bars .app.drawer:not(.open) > aside { display: none; }
+  html.under-bars #status:not(.has-toast) { display: none; }
+  html.under-bars .app.drawer.open > aside { transform: none; animation: sheetIn .22s ease; }
+  @keyframes sheetIn { from { transform: translateY(105%); } to { transform: none; } }
+
+  /* How the picture meets the window in full screen (Display → Picture). */
+  body.immersive[data-fit="cover"] #video { object-fit: cover; }
+  body.immersive[data-fit="fill"] #video { object-fit: fill; }
+  body.immersive .hud { display: none; }
+
   @media (max-width: 720px) {
-    .app { grid-template-columns: minmax(0, 1fr); padding: 8px; padding-bottom: calc(40px + env(safe-area-inset-bottom)); }
-    .app > aside {
-      position: fixed; left: 0; right: 0; bottom: 0; z-index: 25;
-      max-height: 78dvh; overflow-y: auto;
-      background: var(--card);
-      border-top: 1px solid var(--border);
-      border-top-left-radius: 16px; border-top-right-radius: 16px;
-      padding: 8px 12px 24px;
-      transform: translateY(100%);
-      transition: transform .22s ease;
-    }
-    .app > aside::before {
-      content: ''; display: block; width: 44px; height: 4px; margin: 6px auto 10px;
-      background: var(--border-hi); border-radius: 999px;
-    }
-    .app.open > aside { transform: translateY(0); }
-    .app.open #scrim { display: block; }
-    #fab { display: inline-flex; }
+    .app { padding: 8px; padding-bottom: calc(40px + env(safe-area-inset-bottom)); }
     .stage { border-radius: 12px; }
     .section { padding: 10px; }
     .grid-3 { max-width: 240px; }
@@ -294,8 +433,8 @@ enum RemoteHTML {
   }
   /* landscape phones: keep video full width, drawer larger */
   @media (max-width: 720px) and (orientation: landscape) {
-    #fab { bottom: 12px; right: 12px; width: 48px; height: 48px; font-size: 20px; }
-    .app > aside { max-height: 92dvh; }
+    #ball { bottom: 12px; }
+    .app.drawer > aside { max-height: 92dvh; }
   }
 </style>
 </head>
@@ -307,7 +446,10 @@ enum RemoteHTML {
     <div class="hud">
       <div class="hud-row">
         <span class="badge" id="hudDevice">—</span>
-        <span class="badge"><span id="statusDot" class="dot off"></span><span id="hudState">Disconnected</span></span>
+        <span class="hud-end">
+          <span class="badge"><span id="statusDot" class="dot off"></span><span id="hudState">Disconnected</span></span>
+          <button class="hud-btn" data-fs title="Full screen">⛶</button>
+        </span>
       </div>
       <!-- Device health, directly under the device badge: same top-left
            cluster, so identity and live state read as one block. The stage
@@ -374,6 +516,25 @@ enum RemoteHTML {
     </div>
 
     <div class="panel section">
+      <h3>Display</h3>
+      <label class="check"><input type="checkbox" data-pref="hud" checked> Device and connection badges</label>
+      <label class="check"><input type="checkbox" data-pref="sysmon" checked> Device health (thermal, CPU, memory)</label>
+      <label class="check"><input type="checkbox" data-pref="statusbar" checked> Status bar</label>
+      <label class="label" style="margin-top:10px">Picture in full screen</label>
+      <select class="input" id="fitSel">
+        <option value="cover">Fill the screen (crops the edges)</option>
+        <option value="contain">Whole picture (black bars)</option>
+        <option value="fill">Stretch to the window</option>
+      </select>
+      <button class="btn full" style="margin-top:10px" data-fs>⛶ Full screen</button>
+      <button class="btn full" style="margin-top:8px" id="installBtn">📲 Add to Home Screen</button>
+      <div class="hint">Full screen leaves only the floating ball: drag it anywhere, tap it
+      for quick controls. In a Safari tab on iPhone the picture runs behind the
+      browser's toolbar, and what lies under the toolbar can't be tapped there; added
+      to the Home Screen it opens with no browser bars at all.</div>
+    </div>
+
+    <div class="panel section">
       <h3>Device</h3>
       <div class="grid-2">
         <button class="btn" data-act="home">🏠 Home</button>
@@ -416,7 +577,41 @@ enum RemoteHTML {
 </div>
 
 <div id="scrim"></div>
-<button id="fab" aria-label="Open controls" title="Controls">⚙︎</button>
+<button id="ball" aria-label="Controls" title="Controls — drag to move">◎</button>
+<div id="quick" hidden>
+  <button data-act="home">🏠<span>Home</span></button>
+  <button data-act="type-text">⌨️<span>Type</span></button>
+  <button data-act="screenshot">📷<span>Shot</span></button>
+  <button data-act="open-app">📱<span>Open app</span></button>
+  <button id="quickConn">⏻<span>Connect</span></button>
+  <button data-fs>⛶<span>Full screen</span></button>
+  <button id="quickMore">⚙︎<span>More</span></button>
+</div>
+
+<div id="installSheet" class="sheet" hidden>
+  <div class="card">
+    <h4>Add to Home Screen</h4>
+    <ol id="installSteps">
+      <li>Open Safari's Share menu (on iOS 26: the menu button in the address bar, then Share).</li>
+      <li>Choose <b>Add to Home Screen</b>.</li>
+      <li>Keep <b>Open as Web App</b> on and tap <b>Add</b>.</li>
+    </ol>
+    <div class="hint">The icon opens this page full screen, with no browser bars.
+    It keeps its own storage, so pair once more the first time.</div>
+    <button class="btn primary full" id="installClose">OK</button>
+  </div>
+</div>
+
+<div id="shotSheet" class="sheet" hidden>
+  <div class="card">
+    <img id="shotImg" alt="Screenshot">
+    <div class="hint" id="shotHint">On iPhone, Download saves it to Files › Downloads (the ↓ in Safari's address bar).</div>
+    <div class="row">
+      <a class="btn primary full" id="shotSave" download>Download</a>
+      <button class="btn full" id="shotClose">Close</button>
+    </div>
+  </div>
+</div>
 
 <div id="status">
   <span class="dot off" id="statusDotBar"></span>
@@ -469,12 +664,19 @@ enum RemoteHTML {
     const cls = 'dot ' + (kind === 'ok' ? 'on' : kind === 'err' ? 'err' : 'off');
     statusDot.className = cls; hudDot.className = cls;
   }
-  function setToast(msg, kind = 'ok', ttl = 2400) {
+  // In full screen the page should look like the phone itself, so only
+  // failures (and the few hints passed with force) are shown.
+  function setToast(msg, kind = 'ok', ttl = 2400, force = false) {
+    if (document.body.classList.contains('immersive') && kind !== 'err' && !force) return;
     lastAction.textContent = msg;
     lastAction.className = 'toast ' + (kind || '');
     lastAction.style.display = '';
+    lastAction.parentElement.classList.add('has-toast');
     if (toastTimer) clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { lastAction.style.display = 'none'; }, ttl);
+    toastTimer = setTimeout(() => {
+      lastAction.style.display = 'none';
+      lastAction.parentElement.classList.remove('has-toast');
+    }, ttl);
   }
   // Legacy shim: existing call sites use setStatus(msg, kind). Route lifecycle
   // words to the sticky connection line, everything else to the toast.
@@ -832,14 +1034,20 @@ enum RemoteHTML {
   // POINTS via device_info's point_width/point_height. video.videoWidth/Height
   // is the encoded pixel size; the letterboxed layout inside the element uses
   // getBoundingClientRect for the visible box.
+  //
+  // In full screen the picture can also fill the window (object-fit: cover,
+  // edges cropped) or be stretched to it (fill); the box below follows
+  // whichever is in effect, so a touch still lands where it is drawn.
   function videoBox() {
     const rect = video.getBoundingClientRect();
     const vw = video.videoWidth || rect.width;
     const vh = video.videoHeight || rect.height;
     if (!vw || !vh) return null;
-    // fit-to-contain: compute the shown image rect inside the element
-    const scale = Math.min(rect.width / vw, rect.height / vh);
-    const w = vw * scale, h = vh * scale;
+    const fit = getComputedStyle(video).objectFit;
+    let sx = Math.min(rect.width / vw, rect.height / vh), sy = sx;
+    if (fit === 'cover') sx = sy = Math.max(rect.width / vw, rect.height / vh);
+    else if (fit === 'fill') { sx = rect.width / vw; sy = rect.height / vh; }
+    const w = vw * sx, h = vh * sy;
     const x0 = rect.left + (rect.width - w) / 2;
     const y0 = rect.top + (rect.height - h) / 2;
     return { x0, y0, w, h, vw, vh };
@@ -854,6 +1062,14 @@ enum RemoteHTML {
   }
 
   // ── input handling on the video ──
+  // Every touch on the picture belongs to the phone being controlled. Without
+  // this the browser also reads a sideways drag as its own back/forward swipe
+  // and leaves the page mid-gesture; touch-action doesn't cover navigation
+  // gestures, cancelling the touch events does. Input itself comes from the
+  // pointer events below, which still fire.
+  for (const type of ['touchstart', 'touchmove']) {
+    overlay.addEventListener(type, e => { if (e.cancelable) e.preventDefault(); }, { passive: false });
+  }
   overlay.addEventListener('pointerdown', e => {
     // Left button (or a touch) only: the right button is Home.
     lastPointerType = e.pointerType;
@@ -975,6 +1191,29 @@ enum RemoteHTML {
     }
   });
 
+  // ── screenshot ──
+  // Shown in a sheet rather than downloaded straight away, so the result is
+  // visible: on iPhone a download only asks once and then lands silently in
+  // Files › Downloads.
+  const shotSheet = $('#shotSheet'), shotImg = $('#shotImg'), shotSave = $('#shotSave');
+  let shotURL = null;
+  async function showScreenshot() {
+    const scale = Math.min(3, deviceInfo?.screen_scale || 2);
+    const s = await rpc('screenshot', { scale, quality: 0.92 });
+    const mime = s.format === 'png' ? 'image/png' : 'image/jpeg';
+    const bytes = Uint8Array.from(atob(s.data), c => c.charCodeAt(0));
+    if (shotURL) URL.revokeObjectURL(shotURL);
+    shotURL = URL.createObjectURL(new Blob([bytes], { type: mime }));
+    shotImg.src = shotURL;
+    shotSave.href = shotURL;
+    shotSave.download = `ictrl-shot-${Date.now()}.${s.format === 'png' ? 'png' : 'jpg'}`;
+    $('#shotHint').hidden = !/iPhone|iPad|iPod/.test(navigator.userAgent);
+    closeDrawer(); hideQuick();
+    shotSheet.hidden = false;
+  }
+  $('#shotClose').addEventListener('click', () => { shotSheet.hidden = true; });
+  shotSheet.addEventListener('click', e => { if (e.target === shotSheet) shotSheet.hidden = true; });
+
   // ── side-panel buttons ──
   document.querySelectorAll('[data-act]').forEach(btn => {
     btn.addEventListener('click', async () => {
@@ -986,14 +1225,7 @@ enum RemoteHTML {
           if (!confirm('Lock the phone?\nUnlocking may need the passcode entered on the device.')) return;
           await rpc('lock'); setStatus('lock', 'ok');
         }
-        else if (act === 'screenshot') {
-          const s = await rpc('screenshot', { scale: 1 });
-          const a = document.createElement('a');
-          a.href = 'data:image/png;base64,' + s.data;
-          a.download = `ictrl-shot-${Date.now()}.png`;
-          a.click();
-          setStatus('screenshot saved', 'ok');
-        }
+        else if (act === 'screenshot') { await showScreenshot(); }
         else if (act === 'open-app') {
           const name = prompt('App name to open:'); if (!name) return;
           setStatus(`resolving "${name}"…`);
@@ -1070,10 +1302,11 @@ enum RemoteHTML {
       try { localStorage.setItem(STORE_KEY, hexKey.toLowerCase()); } catch (_) {}
     } catch (err) { setStatus('rpc: ' + err.message, 'err'); return; }
 
-    // Native MSE — Chrome / Firefox / Edge / Safari all support fMP4 via
-    // MediaSource. No JS decoder library needed.
-    if (!('MediaSource' in window)) {
-      setStatus('browser lacks MediaSource', 'err');
+    // Native MSE — Chrome / Firefox / Edge / desktop Safari support fMP4 via
+    // MediaSource. No JS decoder library needed. Safari on iPhone has no
+    // MediaSource, only ManagedMediaSource (iOS 17.1+).
+    if (!MSE) {
+      setStatus('this browser can\'t play the stream (on iPhone it needs iOS 17.1 or later)', 'err');
       return;
     }
 
@@ -1091,16 +1324,25 @@ enum RemoteHTML {
 
     // Tear any previous MSE + fetch down before starting a new one.
     if (player) { try { player.stop(); } catch(_){} player = null; }
+    // "streaming" is shown once the first frame is decoded, not when the
+    // SourceBuffer opens: the stream headers can arrive before play() resolves,
+    // and the later "waiting" status would otherwise stick.
+    let mime = '';
     player = mseFragmentPlayer(video, src, {
-      onOpen: (info) => setStatus(`streaming` + (info?.mime ? ` (${info.mime})` : ''), 'ok'),
+      onOpen: (info) => { mime = info?.mime || ''; },
       onError: (msg) => setStatus('stream: ' + msg, 'err'),
     });
+    const current = player;
+    video.addEventListener('loadeddata', () => {
+      // The codec string is long and wraps on a phone; it goes in the tooltip.
+      if (player === current) { setStatus('streaming', 'ok'); hudState.title = mime; }
+    }, { once: true });
+    setStatus('connected — waiting for first frame…', 'ok');
+    connectBtn.disabled = true; stopBtn.disabled = false;
+    connectCta.hidden = true;
     try { await video.play(); } catch (_) {
       setStatus('autoplay blocked — click the video', 'err');
     }
-    connectBtn.disabled = true; stopBtn.disabled = false;
-    connectCta.hidden = true;
-    setStatus('connected — waiting for first frame…', 'ok');
     overlay.focus();
   }
   function stop() {
@@ -1132,8 +1374,17 @@ enum RemoteHTML {
   //  3) The server's X-Codec header carries the REAL profile/level
   //     from the SPS. Guessing (avc1.42E01F) makes MSE silently
   //     reject appends and the picture stays black.
+  //
+  //  4) Safari on iPhone only has ManagedMediaSource. It never opens unless
+  //     remote playback (AirPlay) is disabled or given an alternative source,
+  //     and it may evict buffered data on its own, which a live stream that
+  //     keeps only the last few seconds doesn't mind.
+  const MSE = window.MediaSource || window.ManagedMediaSource || null;
   function mseFragmentPlayer(videoEl, url, { onOpen, onError }) {
-    const ms = new MediaSource();
+    const ms = new MSE();
+    if (window.ManagedMediaSource && ms instanceof window.ManagedMediaSource) {
+      videoEl.disableRemotePlayback = true;
+    }
     videoEl.src = URL.createObjectURL(ms);
     const ac = new AbortController();
     let sb = null;
@@ -1176,7 +1427,7 @@ enum RemoteHTML {
 
     function attachSourceBuffer(codec) {
       const mime = `video/mp4; codecs="${codec}"`;
-      if (!MediaSource.isTypeSupported(mime)) {
+      if (!MSE.isTypeSupported(mime)) {
         onError?.(`browser doesn't support ${mime}`);
         return false;
       }
@@ -1287,21 +1538,288 @@ enum RemoteHTML {
     if (player) { setStatus(`verbose ${verboseChk.checked ? 'on' : 'off'}…`); connect(); }
   });
 
-  // ── mobile drawer (FAB opens/closes the sidebar as a bottom sheet) ──
-  const app = document.getElementById('app');
-  const fab = document.getElementById('fab');
-  const scrim = document.getElementById('scrim');
-  const isMobile = () => window.matchMedia('(max-width: 720px)').matches;
-  function openDrawer() { app.classList.add('open'); }
-  function closeDrawer() { app.classList.remove('open'); }
-  fab.addEventListener('click', () => app.classList.contains('open') ? closeDrawer() : openDrawer());
-  scrim.addEventListener('click', closeDrawer);
-  // Auto-close after tapping a control on mobile — keeps the video visible.
-  document.querySelectorAll('aside [data-act], aside [data-nav], aside [data-page]').forEach(el => {
-    el.addEventListener('click', () => { if (isMobile()) setTimeout(closeDrawer, 120); });
+  // ── preferences ──
+  // Per-browser display choices; storage can be unavailable (private mode),
+  // in which case the defaults simply apply.
+  const pref = {
+    get(k, d) { try { const v = localStorage.getItem('ictrl.' + k); return v === null ? d : v; } catch (_) { return d; } },
+    set(k, v) { try { localStorage.setItem('ictrl.' + k, v); } catch (_) {} },
+  };
+  document.querySelectorAll('[data-pref]').forEach(chk => {
+    const name = chk.dataset.pref;
+    const apply = () => document.body.classList.toggle('hide-' + name, !chk.checked);
+    chk.checked = pref.get('show.' + name, '1') === '1';
+    apply();
+    chk.addEventListener('change', () => { apply(); pref.set('show.' + name, chk.checked ? '1' : '0'); });
   });
-  // Prevent the video overlay from stealing swipes over the drawer.
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+
+  // How the picture meets the window in full screen. Filling it crops the
+  // edges when the window's shape differs from the phone's (a Safari tab);
+  // from the Home Screen the shapes match and nothing visible is lost.
+  const fitSel = document.getElementById('fitSel');
+  fitSel.value = pref.get('fit', 'cover');
+  document.body.dataset.fit = fitSel.value;
+  fitSel.addEventListener('change', () => {
+    document.body.dataset.fit = fitSel.value;
+    pref.set('fit', fitSel.value);
+    updateUnderBars();
+  });
+
+  // ── drawer (a bottom sheet on a phone and in full screen) ──
+  const app = document.getElementById('app');
+  const ball = document.getElementById('ball');
+  const quick = document.getElementById('quick');
+  const scrim = document.getElementById('scrim');
+  const narrow = window.matchMedia('(max-width: 720px)');
+  let immersive = false;
+  const drawerMode = () => app.classList.contains('drawer');
+  function updateDrawerMode() {
+    const on = narrow.matches || immersive;
+    app.classList.toggle('drawer', on);
+    if (!on) { app.classList.remove('open'); hideQuick(); }
+    updateUnderBars();
+    placeBall();
+  }
+  function openDrawer() { hideQuick(); app.classList.add('open'); }
+  function closeDrawer() { app.classList.remove('open'); }
+  scrim.addEventListener('click', closeDrawer);
+  // Close the sheet after a control is used, so the picture is visible again.
+  document.querySelectorAll('aside [data-act], aside [data-nav], aside [data-page]').forEach(el => {
+    el.addEventListener('click', () => { if (drawerMode()) setTimeout(closeDrawer, 120); });
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { closeDrawer(); hideQuick(); }
+  });
+
+  // ── floating ball ──
+  // Its spot is kept as a side plus a fraction of the height, so it survives
+  // rotation and window resizes.
+  const BALL_MARGIN = 10;
+  let ballSpot = (() => {
+    try { return JSON.parse(pref.get('ball', '')) || null; } catch (_) { return null; }
+  })();
+  function placeBall() {
+    if (!ballSpot) { ball.style.left = ball.style.top = ''; return; }
+    const size = ball.offsetWidth || 48;
+    const top = Math.min(Math.max(ballSpot.y * innerHeight, BALL_MARGIN), innerHeight - size - BALL_MARGIN);
+    ball.style.left = (ballSpot.side === 'left' ? BALL_MARGIN : innerWidth - size - BALL_MARGIN) + 'px';
+    ball.style.top = top + 'px';
+    ball.style.right = ball.style.bottom = 'auto';
+  }
+  let ballDrag = null;
+  // Dragging the ball sideways must not start the browser's back swipe either.
+  for (const type of ['touchstart', 'touchmove']) {
+    ball.addEventListener(type, e => { if (e.cancelable) e.preventDefault(); }, { passive: false });
+  }
+  ball.addEventListener('pointerdown', e => {
+    const r = ball.getBoundingClientRect();
+    ballDrag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, dx: e.clientX - r.left, dy: e.clientY - r.top, moved: false };
+    ball.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  ball.addEventListener('pointermove', e => {
+    if (!ballDrag || e.pointerId !== ballDrag.id) return;
+    if (!ballDrag.moved && Math.hypot(e.clientX - ballDrag.sx, e.clientY - ballDrag.sy) < 6) return;
+    if (!ballDrag.moved) { ballDrag.moved = true; ball.classList.add('dragging'); hideQuick(); }
+    const size = ball.offsetWidth;
+    ball.style.left = Math.min(Math.max(e.clientX - ballDrag.dx, 0), innerWidth - size) + 'px';
+    ball.style.top = Math.min(Math.max(e.clientY - ballDrag.dy, 0), innerHeight - size) + 'px';
+    ball.style.right = ball.style.bottom = 'auto';
+  });
+  function endBallDrag(e) {
+    if (!ballDrag || e.pointerId !== ballDrag.id) return;
+    const moved = ballDrag.moved;
+    ballDrag = null;
+    ball.classList.remove('dragging');
+    if (!moved) { quick.hidden ? showQuick() : hideQuick(); return; }
+    const r = ball.getBoundingClientRect();
+    ballSpot = { side: r.left + r.width / 2 < innerWidth / 2 ? 'left' : 'right', y: r.top / innerHeight };
+    pref.set('ball', JSON.stringify(ballSpot));
+    placeBall();
+  }
+  ball.addEventListener('pointerup', endBallDrag);
+  ball.addEventListener('pointercancel', endBallDrag);
+  window.addEventListener('resize', () => { updateUnderBars(); placeBall(); if (!quick.hidden) positionQuick(); });
+
+  // The ball is pale glass, which vanishes over a white screen. Twice a
+  // second, read the patch of the frame under it and switch to the dark
+  // style when that patch is light. Without a picture it stays pale.
+  const ballProbe = document.createElement('canvas');
+  ballProbe.width = ballProbe.height = 8;
+  const ballProbeCtx = ballProbe.getContext('2d', { willReadFrequently: true });
+  setInterval(() => {
+    let light = false;
+    try {
+      const b = player && drawerMode() && !ballDrag ? videoBox() : null;
+      if (b && video.readyState >= 2) {
+        const r = ball.getBoundingClientRect();
+        const kx = b.vw / b.w, ky = b.vh / b.h;
+        ballProbeCtx.drawImage(video, (r.left - b.x0) * kx, (r.top - b.y0) * ky,
+                               r.width * kx, r.height * ky, 0, 0, 8, 8);
+        const d = ballProbeCtx.getImageData(0, 0, 8, 8).data;
+        let sum = 0;
+        for (let i = 0; i < d.length; i += 4) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        light = sum / 64 > 150;
+      }
+    } catch (_) {}
+    ball.classList.toggle('on-light', light);
+  }, 500);
+
+  // ── quick controls, opened from the ball ──
+  function positionQuick() {
+    const b = ball.getBoundingClientRect();
+    const q = quick.getBoundingClientRect();
+    const gap = 8;
+    let left = b.left + b.width / 2 < innerWidth / 2 ? b.left : b.right - q.width;
+    let top = b.top - q.height - gap;
+    if (top < gap) top = b.bottom + gap;
+    left = Math.min(Math.max(left, gap), innerWidth - q.width - gap);
+    top = Math.min(Math.max(top, gap), innerHeight - q.height - gap);
+    quick.style.left = left + 'px';
+    quick.style.top = top + 'px';
+  }
+  // Connect and Stop live in the drawer, out of reach while the picture is
+  // in use; the quick menu carries whichever one applies now.
+  const quickConn = document.getElementById('quickConn');
+  function showQuick() {
+    quickConn.querySelector('span').textContent = player ? 'Stop' : 'Connect';
+    quick.hidden = false; ball.classList.add('active'); positionQuick();
+  }
+  quickConn.addEventListener('click', () => {
+    hideQuick();
+    if (player) stop(); else connect();
+  });
+  function hideQuick() { quick.hidden = true; ball.classList.remove('active'); }
+  quick.querySelectorAll('[data-act]').forEach(el => el.addEventListener('click', () => setTimeout(hideQuick, 120)));
+  document.getElementById('quickMore').addEventListener('click', openDrawer);
+  document.addEventListener('pointerdown', e => {
+    if (!quick.hidden && !quick.contains(e.target) && e.target !== ball) hideQuick();
+  }, true);
+
+  // ── full screen ──
+  // The page's own full screen where the browser has one (desktop, iPad,
+  // Android); iPhone Safari only offers it for a bare <video>, which would take
+  // the controls away, so there it is the same layout without the browser's
+  // full screen.
+  const root = document.documentElement;
+  const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement;
+  const standalone = navigator.standalone === true ||
+    window.matchMedia('(display-mode: standalone)').matches;
+  document.body.classList.toggle('standalone', standalone);
+  // A Safari tab on iPhone can't hide the browser's bars. From iOS 26 the
+  // toolbar floats over the page, so the picture can run underneath it to the
+  // bottom of the screen (updateUnderBars). On older versions the space
+  // between the bars is all there is, and it is shorter than the phone's
+  // screen: say how to get the whole screen, once per page load.
+  const barsStay = !standalone && !(root.requestFullscreen || root.webkitRequestFullscreen);
+  let barsHintShown = false;
+  const ua = navigator.userAgent;
+  const floatingBar = barsStay && /iPhone/.test(ua) && !/CriOS|FxiOS|EdgiOS|OPiOS/.test(ua) &&
+    Number((ua.match(/Version\/(\d+)/) || [])[1]) >= 26;
+  // Where the page starts on the screen (the status bar's height), which the
+  // browser doesn't expose: by screen size, in points.
+  function statusBarHeight() {
+    return ({ '375x812': 44, '414x896': 48, '390x844': 47, '428x926': 47,
+              '393x852': 59, '430x932': 59, '402x874': 62, '440x956': 62,
+              '420x912': 68 })[screen.width + 'x' + screen.height] || 54;
+  }
+  function updateUnderBars() {
+    const portrait = window.matchMedia('(orientation: portrait)').matches;
+    // In a Safari tab: under the floating toolbar, when the picture is set to
+    // fill the screen. From the Home Screen: the page starts at the top of
+    // the screen, but on some iOS versions its viewport is the status bar's
+    // height too short, which leaves a black band along the bottom; the same
+    // taller page covers it, with no scrolling needed.
+    const inTab = floatingBar && fitSel.value === 'cover';
+    const on = immersive && portrait && (inTab || standalone) && screen.height > innerHeight;
+    // Entering: the status bar must pass through display:none, even with a
+    // message up, or its strip stays painted over the bottom of the picture.
+    if (on && !root.classList.contains('under-bars')) {
+      document.getElementById('status').classList.remove('has-toast');
+    }
+    root.classList.toggle('under-bars', on);
+    // The page is made exactly as tall as the screen and scrolled up by the
+    // status bar's height, which puts its top edge at the top of the screen:
+    // Safari shows a scrolled page beneath the status bar as well.
+    app.style.height = on ? screen.height + 'px' : '';
+    underBarsScroll = on && !standalone ? statusBarHeight() : 0;
+    if (scrollY !== underBarsScroll) scrollTo(0, underBarsScroll);
+  }
+  let underBarsScroll = 0;
+  // Nothing else should move the page from that position.
+  window.addEventListener('scroll', () => {
+    if (root.classList.contains('under-bars') && Math.abs(scrollY - underBarsScroll) > 0.5) scrollTo(0, underBarsScroll);
+  });
+  let inBrowserFs = false;
+  function setImmersive(on, restoring = false) {
+    immersive = on;
+    document.body.classList.toggle('immersive', on);
+    document.querySelectorAll('[data-fs]').forEach(el => {
+      const label = el.querySelector('span');
+      if (label) label.textContent = on ? 'Exit' : 'Full screen';
+      else if (el.classList.contains('btn')) el.textContent = on ? '⛶ Exit full screen' : '⛶ Full screen';
+      el.title = on ? 'Exit full screen' : 'Full screen';
+    });
+    pref.set('immersive', on ? '1' : '0');
+    if (on && barsStay && !floatingBar && !barsHintShown && !restoring) {
+      barsHintShown = true;
+      setToast('Safari keeps its bars here. Add to Home Screen to fill the screen.', 'warn', 6000, true);
+    }
+    closeDrawer(); hideQuick();
+    updateDrawerMode();
+    try {
+      if (on && !fsElement()) {
+        const req = root.requestFullscreen || root.webkitRequestFullscreen;
+        const r = req && req.call(root);
+        if (r && r.catch) r.catch(() => {});
+      } else if (!on && fsElement()) {
+        const exit = document.exitFullscreen || document.webkitExitFullscreen;
+        const r = exit && exit.call(document);
+        if (r && r.catch) r.catch(() => {});
+      }
+    } catch (_) {}
+  }
+  // Leaving the browser's full screen (Esc, a system gesture) leaves ours too.
+  ['fullscreenchange', 'webkitfullscreenchange'].forEach(ev => document.addEventListener(ev, () => {
+    if (fsElement()) inBrowserFs = true;
+    else if (inBrowserFs) { inBrowserFs = false; if (immersive) setImmersive(false); }
+  }));
+  document.querySelectorAll('[data-fs]').forEach(el => el.addEventListener('click', () => setImmersive(!immersive)));
+  narrow.addEventListener?.('change', updateDrawerMode);
+  // A reload can't re-enter the browser's full screen (it needs a tap), but
+  // the layout comes back as it was.
+  // ?fullscreen=1 (the Home Screen app's start URL) always opens full screen;
+  // otherwise the last choice in this browser, and full screen by default when
+  // running as a Home Screen app.
+  const params = new URLSearchParams(location.search);
+  const startImmersive = params.get('fullscreen') === '1' ||
+    pref.get('immersive', standalone ? '1' : '0') === '1';
+  if (startImmersive) setImmersive(true, true); else updateDrawerMode();
+
+  // ── add to Home Screen ──
+  // Chrome and Edge offer an install prompt; Safari has no API for it, so
+  // there the page puts the full-screen URL in the address bar (what Add to
+  // Home Screen saves) and explains the steps.
+  const installBtn = document.getElementById('installBtn');
+  const installSheet = document.getElementById('installSheet');
+  let installPrompt = null;
+  window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; });
+  installBtn.hidden = standalone;
+  installBtn.addEventListener('click', async () => {
+    if (installPrompt) {
+      const p = installPrompt; installPrompt = null;
+      try { await p.prompt(); } catch (_) {}
+      return;
+    }
+    try { history.replaceState(null, '', '/remote?fullscreen=1'); } catch (_) {}
+    if (!/iPhone|iPad|iPod/.test(navigator.userAgent) && !(navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent))) {
+      document.getElementById('installSteps').innerHTML =
+        '<li>Open the browser menu.</li><li>Choose <b>Install</b> or <b>Add to Home screen</b>.</li>';
+    }
+    closeDrawer(); hideQuick();
+    installSheet.hidden = false;
+  });
+  document.getElementById('installClose').addEventListener('click', () => { installSheet.hidden = true; });
 
   // Never connect on load: a connection streams video and polls the device,
   // and a forgotten tab (or every reload) would keep doing that. A saved key

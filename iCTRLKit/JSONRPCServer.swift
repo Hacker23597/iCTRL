@@ -281,8 +281,22 @@ class JSONRPCServer {
         case ("GET", "/remote"):
             // The page itself is unauthenticated (it needs to load so the user can
             // paste a token). The RPC + stream calls it makes are authenticated.
+            // Revalidated on every load: the page ships inside the runner, and a
+            // Home Screen web app would otherwise keep an older copy after an update.
             sendHTTPResponse(connection: connection, status: 200,
+                             headers: ["Cache-Control": "no-cache"],
                              contentType: "text/html; charset=utf-8", body: RemoteHTML.page)
+
+        // What a Home Screen web app made from /remote needs: its manifest
+        // (which opens it full screen) and its icon. Unauthenticated, like the page.
+        case ("GET", "/remote/manifest.webmanifest"):
+            sendHTTPResponse(connection: connection, status: 200,
+                             contentType: "application/manifest+json", body: RemoteHTML.manifest)
+
+        case ("GET", "/remote/icon.png"):
+            sendHTTPData(connection: connection, status: 200,
+                         headers: ["Cache-Control": "max-age=86400"],
+                         contentType: "image/png", body: RemoteIcon.png)
 
         // Logs can carry sensitive context even redacted. They are GETs that a
         // browser issues directly, so they can't carry an envelope body — they

@@ -137,7 +137,9 @@ and the same Wi-Fi network.
   agents in on-device sandboxes such as Minis.
 
 **Also included:**
-- live H.264 screen stream (`GET /stream`) and a browser control page (`GET /remote`);
+- live H.264 screen stream (`GET /stream`) and a browser control page (`GET /remote`)
+  that also works from another phone: full screen, a floating quick-control ball,
+  and Add to Home Screen for a view with no browser bars;
 - deep links via `open_url`;
 - `home`, `lock`, `unlock`;
 - iOS 16 and later.
