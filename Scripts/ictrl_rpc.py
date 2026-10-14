@@ -15,9 +15,11 @@ Nearby (macOS, no shared network needed; the phone has Nearby Discovery on):
     ./ictrl_rpc.py --nearby "iPhone 15 (7f3a)" call device_info
     ./ictrl_rpc.py --nearby 7f3a shot out.jpg                 # name or id prefix
 
-The token is cached at ~/.ictrl/token.json keyed by host (or by device id for
-nearby devices), so pairing is a one-time step per device. With --nearby it
-happens automatically on first use: approve the prompt on the phone once.
+Keys are cached in ~/.ictrl/token.json, one per DEVICE (its stable id, from
+GET /whoami), so a phone paired once is reachable over USB, the LAN and nearby
+alike, and two phones that take turns at one address (USB forwarding to
+127.0.0.1) never overwrite each other's key. Pairing is a one-time step per
+device; with --nearby it happens on first use: approve the prompt once.
 
 Two notes for anything that moves a lot of data (server 1.5.0+):
 
@@ -224,14 +226,21 @@ _NC = "/usr/bin/nc"
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _ZonedHandler)
 
 
+# The device id the last response carried (X-ICTRL-Device), or None.
+_answered_by: list = [None]
+
+
 def _post(url: str, obj: dict, timeout: float) -> tuple[int, dict]:
     body = json.dumps(obj).encode()
     req = urllib.request.Request(url, data=body,
                                  headers={"Content-Type": "application/json"})
+    _answered_by[0] = None
     try:
         with _opener.open(req, timeout=timeout) as resp:
+            _answered_by[0] = resp.headers.get(DEVICE_HEADER)
             return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as e:
+        _answered_by[0] = e.headers.get(DEVICE_HEADER) if e.headers else None
         raw = e.read() or b"{}"
         try:
             return e.code, json.loads(raw)
@@ -239,12 +248,63 @@ def _post(url: str, obj: dict, timeout: float) -> tuple[int, dict]:
             return e.code, {"error": {"message": raw.decode("utf-8", "replace")}}
 
 
+def whoami(host: str, timeout: float = 5.0) -> dict | None:
+    """GET /whoami: {device_id, name, …}; None when the server predates it."""
+    try:
+        with _opener.open(f"http://{host}/whoami", timeout=timeout) as resp:
+            info = json.loads(resp.read() or b"{}")
+            return info if info.get("device_id") else None
+    except (urllib.error.HTTPError, json.JSONDecodeError):
+        return None
+
+
 # ---------------------------------------------------------------- token store
 #
-# The store is a map of "host:port" -> record, so keys for several devices live
-# side by side and can be used concurrently. Stores written by the pre-v1
-# plaintext-token client had their single record flattened at the top level
-# ("host"/"token"/…); those entries carry no key material and are ignored.
+# The store maps a name to a key record. Current records are named
+# "device:<device id>" — one per device, whatever the channel. Older clients
+# named them by address ("host:port") or, for nearby devices, "nearby:<id>";
+# such a record is still used, and is copied under its device name once a
+# call made with it succeeds (the old entry stays for older clients). Stores
+# written by the pre-v1 plaintext-token client had their single record
+# flattened at the top level ("host"/"token"/…); those carry no key and are
+# ignored.
+
+DEVICE_HEADER = "X-ICTRL-Device"
+# address -> device id, so the id need not be asked for on every call. Only a
+# shortcut: each response names its device, and a mismatch corrects it.
+ADDRESS_CACHE = os.path.expanduser("~/.ictrl/devices.json")
+
+
+def device_store_key(device_id: str) -> str:
+    return f"device:{device_id}"
+
+
+def _address_cache(update: dict | None = None) -> dict:
+    try:
+        with open(ADDRESS_CACHE) as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if update:
+        data.update(update)
+        os.makedirs(os.path.dirname(ADDRESS_CACHE), exist_ok=True)
+        with open(ADDRESS_CACHE, "w") as fh:
+            json.dump(data, fh, indent=2)
+    return data
+
+
+def device_id_for(host: str, fresh: bool = False) -> str | None:
+    """The id of the device at `host` (cached, else GET /whoami); None for a
+    server too old to say."""
+    if not fresh:
+        known = _address_cache().get(host)
+        if known:
+            return known
+    info = whoami(host)
+    if not info:
+        return None
+    _address_cache({host: info["device_id"]})
+    return info["device_id"]
 
 
 def _is_record(value) -> bool:
@@ -279,6 +339,27 @@ def save_token(host: str, record: dict) -> None:
     with open(STORE, "w") as fh:
         json.dump(all_tokens, fh, indent=2)
     os.chmod(STORE, 0o600)
+
+
+def _addresses(record: dict) -> list:
+    """Addresses a device record was last used at, most recent first."""
+    return [a.lstrip("@") for a in record.get("addresses", record.get("hosts", []))]
+
+
+def _remember_address(device_id: str, record: dict, host: str, name: str | None = None) -> None:
+    """Save `record` as this device's key, noting the address it was used at.
+
+    Addresses are stored with an "@" prefix: older clients find a record by
+    searching the file for the quoted address ("10.0.0.5:8200"), and a bare
+    copy inside this list would lead them to the wrong record's key."""
+    rec = dict(record)
+    rec.pop("hosts", None)
+    rec["device_id"] = device_id
+    if name:
+        rec["device_name"] = name
+    seen = [a for a in _addresses(record) if a != host]
+    rec["addresses"] = ["@" + a for a in [host] + seen[:4]]
+    save_token(device_store_key(device_id), rec)
 
 
 # --------------------------------------------------------------------- nearby
@@ -405,12 +486,12 @@ def _matches(dev: dict, query: str) -> bool:
 
 
 def nearby_target(query: str, fresh: bool = False) -> tuple[str, str, str]:
-    """Resolve a nearby device by name or id prefix -> (store key, host, name)."""
+    """Resolve a nearby device by name or id prefix -> (device id, host, name)."""
     if not fresh:
         now = time.time()
         for dev_id, ent in _nearby_cache().items():
             if now - ent.get("ts", 0) < NEARBY_CACHE_TTL and _matches({"id": dev_id, **ent}, query):
-                return f"nearby:{dev_id}", ent["host"], ent["name"]
+                return dev_id, ent["host"], ent["name"]
     devices = nearby_scan(wait=6.0, want=lambda d: _matches(d, query))
     hits = [d for d in devices if _matches(d, query)]
     if not hits:
@@ -420,23 +501,18 @@ def nearby_target(query: str, fresh: bool = False) -> tuple[str, str, str]:
                          + ", ".join(f"{d['name']} ({d['id'][:8]})" for d in hits))
     dev = hits[0]
     _nearby_cache({dev["id"]: {"name": dev["name"], "host": dev["host"], "ts": time.time()}})
-    return f"nearby:{dev['id']}", dev["host"], dev["name"]
+    return dev["id"], dev["host"], dev["name"]
 
 
 def nearby_call(query: str, method: str, params: dict | None, client_name: str) -> dict:
     """Call a nearby device; pairs on first use (the user approves on the phone)
     and re-resolves once if the cached address has gone stale."""
-    store, host, name = nearby_target(query)
-    if not load_token(store):
-        print(f"pairing with {name} — approve the prompt on the phone", file=sys.stderr)
-        rec = pair(host, client_name, plain=False, store_key=store)
-        rec["device_name"] = name
-        save_token(store, rec)
+    did, host, name = nearby_target(query)
     try:
-        return call(host, method, params, store_key=store)
+        return device_call(host, method, params, device_id=did, pair_as=client_name, device_name=name)
     except OSError:                       # includes URLError / timeouts
-        store, host, name = nearby_target(query, fresh=True)
-        return call(host, method, params, store_key=store)
+        did, host, name = nearby_target(query, fresh=True)
+        return device_call(host, method, params, device_id=did, pair_as=client_name, device_name=name)
 
 
 # --------------------------------------------------------------------- X25519
@@ -530,15 +606,10 @@ def pair(host: str, client_name: str, plain: bool, timeout: float = 90.0,
 
 # ------------------------------------------------------------------ transport
 
-def call(host: str, method: str, params: dict | None = None,
-         timeout: float = 60.0, rpc_id: int = 1, store_key: str | None = None) -> dict:
-    """One enveloped JSON-RPC call. Returns the decrypted response object.
-
-    `store_key` names the key record when it differs from `host` (nearby
-    devices are keyed by device id; their address changes)."""
-    record = load_token(store_key or host)
-    if not record:
-        raise SystemExit(f"no token for {store_key or host} — run `pair` first")
+def _call_with(host: str, record: dict, method: str, params: dict | None,
+               timeout: float, rpc_id: int) -> tuple[int, dict]:
+    """One enveloped call with `record`'s key: (200, decrypted response) or
+    (HTTP status, error body)."""
     key = bytes.fromhex(record["key"])
     tok = record["tok"]
 
@@ -557,9 +628,8 @@ def call(host: str, method: str, params: dict | None = None,
         "v": 1, "tok": tok, "ts": ts, "nonce": nonce.hex(),
         "ct": base64.b64encode(ct).decode(), "tag": tag.hex(),
     }, timeout)
-
     if status != 200:
-        raise SystemExit(f"rpc failed ({status}): {json.dumps(resp)}")
+        return status, resp
 
     # Response is sealed under the same nonce with the response-direction key.
     resp_ct = base64.b64decode(resp["ct"])
@@ -567,7 +637,79 @@ def call(host: str, method: str, params: dict | None = None,
     if not hmac.compare_digest(expect, bytes.fromhex(resp["tag"])):
         raise SystemExit("response MAC mismatch — discarding")
     k_enc_resp = _hmac(key, LABEL_ENC_RESP + nonce)
-    return json.loads(_keystream_xor(k_enc_resp, nonce, resp_ct))
+    return 200, json.loads(_keystream_xor(k_enc_resp, nonce, resp_ct))
+
+
+def call(host: str, method: str, params: dict | None = None,
+         timeout: float = 60.0, rpc_id: int = 1, store_key: str | None = None) -> dict:
+    """One enveloped JSON-RPC call. Returns the decrypted response object.
+
+    The key is the one stored for the device at `host` (see device_call);
+    `store_key` instead names a record explicitly."""
+    if not store_key:
+        return device_call(host, method, params, timeout=timeout, rpc_id=rpc_id)
+    record = load_token(store_key)
+    if not record:
+        raise SystemExit(f"no token for {store_key} — run `pair` first")
+    status, out = _call_with(host, record, method, params, timeout, rpc_id)
+    if status != 200:
+        raise SystemExit(f"rpc failed ({status}): {json.dumps(out)}")
+    return out
+
+
+def _key_for(host: str, device_id: str | None) -> tuple[dict | None, str | None]:
+    """(record, the older name it was found under or None) for this device."""
+    if device_id:
+        rec = load_token(device_store_key(device_id))
+        if rec:
+            return rec, None
+        for older in (f"nearby:{device_id}", host):
+            rec = load_token(older)
+            if rec:
+                return rec, older
+        return None, None
+    rec = load_token(host)                # server too old to name itself
+    return rec, None
+
+
+def device_call(host: str, method: str, params: dict | None = None, *,
+                device_id: str | None = None, timeout: float = 60.0, rpc_id: int = 1,
+                pair_as: str | None = None, device_name: str | None = None) -> dict:
+    """Call the device at `host` with the key stored for that DEVICE.
+
+    The device id comes from the caller (nearby discovery), the address cache
+    or GET /whoami. Every response names the device that sent it; when that is
+    not the one expected — another phone now behind this address — the cache
+    is corrected and a refused call is retried once with the right key.
+    `pair_as`: pair under this client name when there is no key yet."""
+    did = device_id or device_id_for(host)
+    for attempt in range(2):
+        record, older = _key_for(host, did)
+        if record is None:
+            if not pair_as:
+                raise SystemExit(f"no key for the device at {host} — run `pair` first")
+            print(f"pairing with {device_name or host} — approve the prompt on the phone", file=sys.stderr)
+            record = pair(host, pair_as, plain=False,
+                          store_key=device_store_key(did) if did else None)
+            older = None
+            if did:
+                _remember_address(did, record, host, device_name)
+        status, out = _call_with(host, record, method, params, timeout, rpc_id)
+        answered = _answered_by[0]
+        if answered and answered != did:
+            _address_cache({host: answered})
+            if status == 401 and attempt == 0:
+                did = answered
+                continue
+            did = answered
+        if status != 200:
+            raise SystemExit(f"rpc failed ({status}): {json.dumps(out)}")
+        # First success with a record kept under an older name, or from a new
+        # address: store it as this device's key.
+        if did and (older or (_addresses(record) or [None])[0] != host):
+            _remember_address(did, record, host, device_name or record.get("device_name"))
+        return out
+    raise SystemExit("rpc failed: the device at this address changed twice")
 
 
 def main() -> int:
@@ -612,35 +754,38 @@ def main() -> int:
         if not devices:
             print(NO_NEARBY_HINT)
         for d in devices:
-            paired = "paired" if load_token(f"nearby:{d['id']}") else ""
+            paired = "paired" if _key_for("", d["id"])[0] else ""
             print(f"{d['name']:32s} id={d['id'][:8]}  {paired}")
         return 0
     if args.cmd == "list":
         hosts = list_hosts()
         if not hosts:
             print("no paired devices — run `pair` first")
-        for h, r in sorted(hosts.items()):
+        devices = {h: r for h, r in hosts.items() if h.startswith("device:")}
+        for h, r in sorted(devices.items(), key=lambda kv: kv[1].get("device_name", "")):
+            seen = ", ".join(_addresses(r)[:3])
+            print(f"{r.get('device_name') or '?':24s} id={h.split(':', 1)[1][:8]}  tok={r['tok']}  {seen}")
+        older = {h: r for h, r in hosts.items() if not h.startswith("device:")}
+        if older:
+            print("by address (older entries; moved to their device on next use):")
+        for h, r in sorted(older.items()):
             name = r.get("device_name") or r.get("client_name", "")
-            print(f"{h:24s} tok={r['tok']}  {name}")
-    elif args.cmd == "pair" and args.nearby:
-        store, host, name = nearby_target(args.nearby)
-        rec = pair(host, args.name, plain=False, store_key=store)
-        rec["device_name"] = name
-        save_token(store, rec)
-        print(f"paired — tok={rec['tok']} {name} (key cached in {STORE})")
+            print(f"  {h:24s} tok={r['tok']}  {name}")
     elif args.cmd == "pair":
-        rec = pair(args.host, args.name, args.plain)
-        # Stamp the device's own name alongside the key: hosts move with DHCP,
-        # so the name is what identifies WHICH phone this key belongs to.
-        try:
-            info = call(args.host, "device_info").get("result", {})
-            if info.get("device_name"):
-                rec["device_name"] = info["device_name"]
-                save_token(args.host, rec)
-        except SystemExit:
-            pass   # pairing succeeded; naming is best-effort
-        label = rec.get("device_name", "")
-        print(f"paired — tok={rec['tok']} {label} (key cached in {STORE})")
+        if args.nearby:
+            did, host, name = nearby_target(args.nearby)
+        else:
+            host = args.host
+            info = whoami(host)
+            did, name = (info["device_id"], info.get("name")) if info else (None, None)
+            if did:
+                _address_cache({host: did})
+        rec = pair(host, args.name, args.plain and not args.nearby,
+                   store_key=device_store_key(did) if did else None)
+        if did:
+            _remember_address(did, rec, host, name)
+        print(f"paired — tok={rec['tok']} {name or host} (key cached in {STORE}"
+              + (f" for device {did[:8]})" if did else ")"))
     elif args.cmd == "shot":
         params = {"format": args.format, "scale": args.scale}
         if args.format == "jpeg":

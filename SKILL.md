@@ -1,7 +1,7 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
-skill_version: "1.98.6"
+skill_version: "1.98.7"
 ---
 
 # iCTRL — control an iPhone over HTTP
@@ -25,7 +25,7 @@ $I call tap '{"ref":"<ref>"}'
 - Keep the client in `~/.ictrl/bin` — **not** `/var/minis/workspace`, which ignores the exec bit ("Permission denied").
 - Elsewhere: `curl -o ictrl_rpc.py http://<host>:8200/skill/clients/python`, then `python3 ictrl_rpc.py --host <host>:8200 call …`. The CLI takes `--host`/`ICTRL_HOST`.
 - **Not on the phone's network (macOS):** have the user turn on *Nearby Discovery* (iCTRL notification; needs Remote Access and Wi-Fi on, no shared network). `ictrl_rpc.py scan` lists them; `--nearby "<name|id>"` replaces `--host`. First use pairs (one Allow). C CLI too, built on macOS.
-- Keys: `~/.ictrl/token.json`, one per `host:port` (nearby: per device); reuse them (expire after 30 days unused). Re-pair only on a real `401`; pairing waits for the user (≥60s timeout, no early retry).
+- Keys: `~/.ictrl/token.json`, one per device (`/whoami` id) for USB, LAN, nearby; reuse (30-day idle expiry). Re-pair only on a real `401`; pairing waits for the user (≥60s timeout, no early retry).
 
 ## Rules — read these first
 

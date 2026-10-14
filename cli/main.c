@@ -42,6 +42,9 @@
 /// Key-store entry to use when it differs from the host: nearby devices are
 /// keyed by "nearby:<device id>" because their link-local address changes.
 static const char *g_store_key = NULL;
+/// Set when the key in use was found under an older name: after a call with
+/// it succeeds, it is saved under this device's name too.
+static const char *g_adopt_to = NULL;
 /// Set while pairing implicitly before a call: progress goes to stderr so the
 /// call's JSON stays alone on stdout.
 static int g_pair_implicit = 0;
@@ -368,12 +371,25 @@ static int load_token(const char *host, uint8_t key[32], char tok[9]) {
     char *js = read_file(path, &n);
     if (!js) return -1;
 
-    // Records are keyed by "host:port"; scan to that object, then read its
-    // fields from the following text.
+    // Records are keyed by name ("device:<id>", or an older "host:port" /
+    // "nearby:<id>"); scan to that object, then read its fields from the
+    // following text. Match the name only as a key ("name": {) — the same
+    // string could appear as a value elsewhere in the file.
     char pat[256];
     snprintf(pat, sizeof pat, "\"%s\"", host);
-    const char *p = strstr(js, pat);
-    if (!p) { free(js); return -1; }
+    const char *p = js;
+    for (;;) {
+        p = strstr(p, pat);
+        if (!p) { free(js); return -1; }
+        const char *q = p + strlen(pat);
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (*q == ':') {
+            q++;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            if (*q == '{') break;
+        }
+        p += strlen(pat);
+    }
 
     char keyhex[80] = {0};
     if (json_str(p, "key", keyhex, sizeof keyhex) != 0 ||
@@ -549,6 +565,10 @@ static int rpc_call(const char *hostport, const char *method, const char *params
                 resp.data ? (const char *)resp.data : "");
         buf_free(&resp);
         return 1;
+    }
+    if (g_adopt_to) {
+        save_token(g_adopt_to, key, tok, "");
+        g_adopt_to = NULL;
     }
 
     char rct[64], rtag[80];
@@ -792,6 +812,43 @@ static int do_shot(const char *hostport, const char *path, int argc, char **argv
     return 0;
 }
 
+/// Point key lookup at this device's record, "device:<id>": one key per
+/// device whatever the channel (USB, LAN, nearby), so a phone paired once is
+/// reachable over all of them, and two phones taking turns at one address
+/// (USB forwarding to 127.0.0.1) keep their own keys. The id comes from
+/// nearby discovery or GET /whoami. A key still stored under an older name
+/// ("nearby:<id>", or the address) is used, and saved under the device name
+/// once a call with it succeeds. A server too old for /whoami keeps the
+/// address as the name.
+static void use_device_key(const char *hostport, const char *known_id) {
+    static char device_key[96], older[192];
+    char id[80] = {0};
+    if (known_id) {
+        snprintf(id, sizeof id, "%s", known_id);
+    } else {
+        char host[256], port[16];
+        split_host(hostport, host, sizeof host, port, sizeof port);
+        buf out;
+        int status = 0;
+        http_get(host, port, "/whoami", &out, &status);
+        if (status == 200 && out.data) json_str((const char *)out.data, "device_id", id, sizeof id);
+        buf_free(&out);
+    }
+    if (!id[0]) return;
+    snprintf(device_key, sizeof device_key, "device:%s", id);
+    g_store_key = device_key;
+    uint8_t key[32];
+    char tok[9];
+    if (load_token(device_key, key, tok) == 0) return;
+    snprintf(older, sizeof older, "nearby:%s", id);
+    if (load_token(older, key, tok) != 0) snprintf(older, sizeof older, "%s", hostport);
+    if (load_token(older, key, tok) == 0) {
+        g_store_key = older;
+        g_adopt_to = device_key;
+    }
+    // Otherwise no key yet: pairing saves it under the device name.
+}
+
 int main(int argc, char **argv) {
     const char *hostport = getenv("ICTRL_HOST");
     if (!hostport) hostport = "127.0.0.1:8200";
@@ -817,16 +874,17 @@ int main(int argc, char **argv) {
         if (n == 0) printf("no nearby devices — on the phone, turn on Nearby Discovery (iCTRL notification) "
                            "and keep Wi-Fi switched on; it need not be joined to a network\n");
         for (int k = 0; k < n; k++) {
-            char store[96];
-            snprintf(store, sizeof store, "nearby:%s", devs[k].id);
+            char store[96], older[96];
+            snprintf(store, sizeof store, "device:%s", devs[k].id);
+            snprintf(older, sizeof older, "nearby:%s", devs[k].id);
             uint8_t key[32];
             char tok[9];
-            printf("%-32s id=%.8s  %s\n", devs[k].name, devs[k].id,
-                   load_token(store, key, tok) == 0 ? "paired" : "");
+            int paired = load_token(store, key, tok) == 0 || load_token(older, key, tok) == 0;
+            printf("%-32s id=%.8s  %s\n", devs[k].name, devs[k].id, paired ? "paired" : "");
         }
         return 0;
     }
-    static char nearby_store[96], nearby_host[128];
+    static char nearby_host[128];
     if (nearby) {
         int n = nearby_scan(devs, NEARBY_MAX, 6.0, nearby);
         if (n == -1) die("no awdl0 interface — is Wi-Fi turned on?");
@@ -838,10 +896,9 @@ int main(int argc, char **argv) {
             hit = &devs[k];
         }
         if (!hit) die("no nearby device matches \"%s\" — run: ictrl scan. On the phone, turn on Nearby Discovery and keep Wi-Fi switched on", nearby);
-        snprintf(nearby_store, sizeof nearby_store, "nearby:%s", hit->id);
         snprintf(nearby_host, sizeof nearby_host, "%s", hit->host);
-        g_store_key = nearby_store;
         hostport = nearby_host;
+        use_device_key(hostport, hit->id);
         // First use pairs (approve once on the phone); later runs reuse the key.
         uint8_t key[32];
         char tok[9];
@@ -858,6 +915,9 @@ int main(int argc, char **argv) {
     if (nearby || !strcmp(cmd, "scan"))
         die("nearby discovery needs macOS (Apple peer-to-peer Wi-Fi)");
 #endif
+
+    if (!nearby && (!strcmp(cmd, "pair") || !strcmp(cmd, "call") || !strcmp(cmd, "shot")))
+        use_device_key(hostport, NULL);
 
     if (!strcmp(cmd, "pair")) {
         const char *name = "minis";
