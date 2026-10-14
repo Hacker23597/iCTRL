@@ -1162,6 +1162,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 guard let self = self, let srv = srv, self.server === srv else { return }
                 Self.logBuffer.append("📡 Nearby status: \(status.rawValue)")
                 self.postStatusNotification(detail: self.addressLines(port: srv.port), silent: true)
+                if status == .denied { self.requestLocalNetworkForNearby() }
             }
         }
         srv.onRPCRequest = { [weak self] method, params, completion in
@@ -1547,15 +1548,51 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         guard !selfWokeForCurrentOutage else { return }
         selfWokeForCurrentOutage = true
 
-        let woke = ForegroundApp.open(Self.selfWakeURL)
-        Self.logBuffer.append(woke ? "🔼 self-wake via ictrl:// requested (foreground for LN prompt)"
-                                   : "⚠️ self-wake via ictrl:// failed")
+        let woke = bringRunnerForward()
+        Self.logBuffer.append(woke ? "🔼 runner brought forward (foreground for LN prompt)"
+                                   : "⚠️ could not bring the runner forward")
 
         // Give the app ~1s to reach the foreground, then touch the LAN to raise
         // the permission prompt.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.triggerLocalNetworkPrompt()
         }
+    }
+
+    /// Set once nearby discovery has asked for Local Network access since it
+    /// was last switched on, so a refusal doesn't keep pulling the runner
+    /// to the front.
+    private var nearbyPermissionRequested = false
+
+    /// A refused nearby registration usually means Local Network access was
+    /// never granted. iOS refuses a background app's Bonjour registration
+    /// without asking, and nothing else may have asked: the remote-access
+    /// self-check connects to the device's own address, which needs no
+    /// permission, and on cellular it is skipped. So bring the runner to the
+    /// front — the prompt only appears there — touch the LAN, and retry the
+    /// registration while it is in front, which raises the prompt if the
+    /// question is still open. Once per enable: after an explicit refusal iOS
+    /// never asks again, and the status notification says what is needed.
+    private func requestLocalNetworkForNearby() {
+        guard nearbyEnabled, !nearbyPermissionRequested else { return }
+        nearbyPermissionRequested = true
+        let woke = bringRunnerForward()
+        Self.logBuffer.append(woke
+            ? "📡 Nearby refused (Local Network) — bringing the runner forward to request access"
+            : "⚠️ Nearby refused (Local Network) and the runner could not come forward to ask")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.triggerLocalNetworkPrompt()
+            self?.server?.retryNearbyNow()
+        }
+    }
+
+    /// Put the runner in front, where iOS can show it a permission prompt.
+    /// By bundle id, like tapping its icon: opening its own `ictrl://` scheme
+    /// is refused (the XCTest daemon will not hand a runner its own URL), so
+    /// that is only the fallback.
+    private func bringRunnerForward() -> Bool {
+        if let id = Bundle.main.bundleIdentifier, ForegroundApp.openBundleID(id) { return true }
+        return ForegroundApp.open(Self.selfWakeURL)
     }
 
     /// Send a datagram to the mDNS multicast group (224.0.0.251:5353) — real
@@ -1744,6 +1781,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
         nearbyEnabled = on
         Self.persistedNearby = on
+        if on { nearbyPermissionRequested = false }
         if on { server?.startNearby() } else { server?.stopNearby() }
         // Advertising normally confirms within a moment; the state callback
         // posts again when it does. Refresh now so the menu flips immediately.

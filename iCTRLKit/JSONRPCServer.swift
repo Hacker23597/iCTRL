@@ -162,6 +162,11 @@ class JSONRPCServer {
         queue.async { self.nearbyAdvertiser?.recheck() }
     }
 
+    /// Retry a refused nearby registration without waiting for the back-off.
+    func retryNearbyNow() {
+        queue.async { self.nearbyAdvertiser?.retryNow() }
+    }
+
     private func setNearbyStatus(_ status: NearbyAdvertiser.Status) {
         nearbyStatusLock.lock()
         let changed = nearbyStatusValue != status

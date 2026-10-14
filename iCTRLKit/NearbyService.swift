@@ -224,6 +224,15 @@ final class NearbyAdvertiser {
         queue.async { self.evaluate() }
     }
 
+    /// Retry a refused registration now rather than after the back-off — for
+    /// when the cause may just have been fixed (the permission prompt shown).
+    func retryNow() {
+        queue.async {
+            self.nextRetry = .distantPast
+            self.evaluate()
+        }
+    }
+
     /// Current state of `awdl0`.
     static func linkState() -> LinkState {
         var state = LinkState()
