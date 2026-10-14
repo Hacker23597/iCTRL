@@ -488,27 +488,64 @@ def _dedupe(devices: list[dict]) -> list[dict]:
     return sorted(out, key=lambda d: (d["name"].lower(), d["channel"] != "lan"))
 
 
+def _dns_name(msg: bytes, i: int) -> tuple[str, int]:
+    """A (possibly compressed) DNS name at offset i -> (name, offset after it)."""
+    labels, jumped, end, hops = [], False, i, 0
+    while True:
+        n = msg[i]
+        if n == 0:
+            i += 1
+            break
+        if n & 0xC0 == 0xC0:                         # compression pointer
+            hops += 1
+            if hops > 32:                            # a pointer loop in a hostile packet
+                raise ValueError("DNS name pointer loop")
+            if not jumped:
+                end = i + 2
+            jumped = True
+            i = ((n & 0x3F) << 8) | msg[i + 1]
+            continue
+        labels.append(msg[i + 1:i + 1 + n].decode("utf-8", "replace"))
+        i += 1 + n
+    return ".".join(labels), (end if jumped else i)
+
+
+def _parse_mdns(msg: bytes, instances: dict, srv: dict, txt: dict, addrs: dict) -> None:
+    """Collect PTR/SRV/TXT/A records of one mDNS response into the dicts.
+    Raises IndexError/ValueError on a malformed packet."""
+    counts = [int.from_bytes(msg[k:k + 2], "big") for k in (4, 6, 8, 10)]
+    i = 12
+    for _ in range(counts[0]):
+        _, i = _dns_name(msg, i)
+        i += 4
+    for _ in range(sum(counts[1:])):
+        rname, i = _dns_name(msg, i)
+        if i + 10 > len(msg):
+            raise IndexError("truncated record")
+        rtype = int.from_bytes(msg[i:i + 2], "big")
+        rdlen = int.from_bytes(msg[i + 8:i + 10], "big")
+        rdata_at, i = i + 10, i + 10 + rdlen
+        if i > len(msg):
+            raise IndexError("truncated record data")
+        if rtype == 12:                                  # PTR -> instance
+            inst, _ = _dns_name(msg, rdata_at)
+            if inst.endswith("._ictrl._tcp.local"):
+                instances[inst] = inst.split("._ictrl._tcp", 1)[0]
+        elif rtype == 33 and rdlen >= 7:                 # SRV -> port, target
+            target, _ = _dns_name(msg, rdata_at + 6)
+            srv[rname] = (int.from_bytes(msg[rdata_at + 4:rdata_at + 6], "big"), target)
+        elif rtype == 16:                                # TXT
+            txt[rname] = _txt(msg[rdata_at:rdata_at + rdlen])
+        elif rtype == 1 and rdlen == 4:                  # A
+            addr = socket.inet_ntoa(msg[rdata_at:rdata_at + 4])
+            if not addr.startswith("169.254."):
+                addrs.setdefault(rname, addr)
+
+
 def _mdns_scan(wait: float, want=None) -> list[dict]:
     """LAN discovery without dns_sd (Linux and others): one mDNS question for
     _ictrl._tcp.local, asked from an ordinary port so responders answer by
     unicast (RFC 6762 §6.7), which needs no multicast group membership."""
-    def name_at(msg, i):
-        labels, jumped, end = [], False, i
-        while True:
-            n = msg[i]
-            if n == 0:
-                i += 1
-                break
-            if n & 0xC0 == 0xC0:                         # compression pointer
-                if not jumped:
-                    end = i + 2
-                jumped = True
-                i = ((n & 0x3F) << 8) | msg[i + 1]
-                continue
-            labels.append(msg[i + 1:i + 1 + n].decode("utf-8", "replace"))
-            i += 1 + n
-        return ".".join(labels), (end if jumped else i)
-
     q = b"".join(bytes([len(p)]) + p.encode() for p in ("_ictrl", "_tcp", "local")) + b"\0"
     packet = b"\0\0\0\0\0\1\0\0\0\0\0\0" + q + b"\0\x0c\0\x01"      # PTR IN
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -530,28 +567,10 @@ def _mdns_scan(wait: float, want=None) -> list[dict]:
         except (socket.timeout, OSError):
             msg = None
         if msg and len(msg) > 12:
-            counts = [int.from_bytes(msg[k:k + 2], "big") for k in (4, 6, 8, 10)]
-            i = 12
-            for _ in range(counts[0]):
-                _, i = name_at(msg, i)
-                i += 4
-            for _ in range(sum(counts[1:])):
-                rname, i = name_at(msg, i)
-                rtype = int.from_bytes(msg[i:i + 2], "big")
-                rdlen = int.from_bytes(msg[i + 8:i + 10], "big")
-                rdata_at, i = i + 10, i + 10 + rdlen
-                if rtype == 12:                          # PTR -> instance
-                    inst, _ = name_at(msg, rdata_at)
-                    instances[inst] = inst.split("._ictrl._tcp", 1)[0]
-                elif rtype == 33:                        # SRV -> port, target
-                    target, _ = name_at(msg, rdata_at + 6)
-                    srv[rname] = (int.from_bytes(msg[rdata_at + 4:rdata_at + 6], "big"), target)
-                elif rtype == 16:                        # TXT
-                    txt[rname] = _txt(msg[rdata_at:rdata_at + rdlen])
-                elif rtype == 1 and rdlen == 4:          # A
-                    addr = socket.inet_ntoa(msg[rdata_at:rdata_at + 4])
-                    if not addr.startswith("169.254."):
-                        addrs.setdefault(rname, addr)
+            try:
+                _parse_mdns(msg, instances, srv, txt, addrs)
+            except (IndexError, ValueError):
+                pass                                     # malformed or hostile packet: skip it
         devices = []
         for inst, name in instances.items():
             if inst in srv and srv[inst][1] in addrs:
@@ -782,10 +801,14 @@ def device_call(host: str, method: str, params: dict | None = None, *,
     is corrected and a refused call is retried once with the right key.
     `pair_as`: pair under this client name when there is no key yet."""
     did = device_id or device_id_for(host)
+    switched = False
     for attempt in range(2):
         record, older = _key_for(host, did)
         if record is None:
-            if not pair_as:
+            # Never pair because a response named another device: that header
+            # is unauthenticated, and whoever answers at an address could
+            # otherwise get this client to pair with it unasked.
+            if not pair_as or switched:
                 raise SystemExit(f"no key for the device at {host} — run `pair` first")
             print(f"pairing with {device_name or host} — approve the prompt on the phone", file=sys.stderr)
             record = pair(host, pair_as, plain=False,
@@ -799,6 +822,7 @@ def device_call(host: str, method: str, params: dict | None = None, *,
             _address_cache({host: answered})
             if status == 401 and attempt == 0:
                 did = answered
+                switched = True
                 continue
             did = answered
         if status != 200:

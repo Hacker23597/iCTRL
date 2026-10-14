@@ -152,7 +152,9 @@ static int nc_relay(const char *host, const char *port) {
         dup2(errp[1], 2);
         close(sv[0]); close(sv[1]); close(errp[0]); close(errp[1]);
         // -G: connect timeout; -w: idle timeout; -v: report "succeeded!".
-        execl(NC_PATH, "nc", "-6", "-A", "-v", "-G", "10", "-w", "30", host, port, (char *)NULL);
+        // -w outlasts a pairing request, which waits up to 60 s for the
+        // user's answer with nothing on the wire.
+        execl(NC_PATH, "nc", "-6", "-A", "-v", "-G", "10", "-w", "120", host, port, (char *)NULL);
         _exit(127);
     }
     close(sv[1]);
@@ -566,11 +568,6 @@ static int rpc_call(const char *hostport, const char *method, const char *params
         buf_free(&resp);
         return 1;
     }
-    if (g_adopt_to) {
-        save_token(g_adopt_to, key, tok, "");
-        g_adopt_to = NULL;
-    }
-
     char rct[64], rtag[80];
     // ct can be megabytes (a screenshot), so pull it out by locating the field
     // rather than copying into a fixed buffer.
@@ -599,6 +596,11 @@ static int rpc_call(const char *hostport, const char *method, const char *params
     hmac_final(&rc2, expect);
     if (hex_decode(rtag, got, 32) != 0 || !ct_equal(expect, got, 32))
         die("response MAC mismatch — discarding");
+    // The key proved itself on this device: keep it under the device's name.
+    if (g_adopt_to) {
+        save_token(g_adopt_to, key, tok, "");
+        g_adopt_to = NULL;
+    }
 
     uint8_t k_enc_resp[32];
     l = strlen(LABEL_ENC_RESP);
@@ -820,7 +822,7 @@ static int do_shot(const char *hostport, const char *path, int argc, char **argv
 /// ("nearby:<id>", or the address) is used, and saved under the device name
 /// once a call with it succeeds. A server too old for /whoami keeps the
 /// address as the name.
-static void use_device_key(const char *hostport, const char *known_id) {
+static void use_device_key(const char *hostport, const char *known_id, int pairing) {
     static char device_key[96], older[192];
     char id[80] = {0};
     if (known_id) {
@@ -837,6 +839,7 @@ static void use_device_key(const char *hostport, const char *known_id) {
     if (!id[0]) return;
     snprintf(device_key, sizeof device_key, "device:%s", id);
     g_store_key = device_key;
+    if (pairing) return;   // a new key goes under the device name, never an older one
     uint8_t key[32];
     char tok[9];
     if (load_token(device_key, key, tok) == 0) return;
@@ -898,7 +901,7 @@ int main(int argc, char **argv) {
         if (!hit) die("no nearby device matches \"%s\" — run: ictrl scan. On the phone, turn on Nearby Discovery and keep Wi-Fi switched on", nearby);
         snprintf(nearby_host, sizeof nearby_host, "%s", hit->host);
         hostport = nearby_host;
-        use_device_key(hostport, hit->id);
+        use_device_key(hostport, hit->id, !strcmp(cmd, "pair"));
         // First use pairs (approve once on the phone); later runs reuse the key.
         uint8_t key[32];
         char tok[9];
@@ -917,7 +920,7 @@ int main(int argc, char **argv) {
 #endif
 
     if (!nearby && (!strcmp(cmd, "pair") || !strcmp(cmd, "call") || !strcmp(cmd, "shot")))
-        use_device_key(hostport, NULL);
+        use_device_key(hostport, NULL, !strcmp(cmd, "pair"));
 
     if (!strcmp(cmd, "pair")) {
         const char *name = "minis";
