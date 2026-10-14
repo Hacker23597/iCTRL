@@ -79,11 +79,34 @@ and the same Wi-Fi network.
 - **Bundle ID:** `com.openminis.ictrl`
 - **Transport:** JSON-RPC 2.0 over HTTP, port `8200`
 - **Auth:** encrypted envelope (X25519 pairing → HMAC-SHA256 sealed requests)
-- **Shipped as two IPAs:** `iCTRL.ipa` (host app) + `iCTRLUITests-Runner.ipa`
-  (the automation engine — **this is the one that must be running**)
+- **Shipped as two IPAs:** `iCTRLUITests-Runner.ipa` (the automation engine —
+  **required, and the one that must be running**) + `iCTRL.ipa` (the
+  companion app — **optional**, see [The iCTRL app](#the-ictrl-app-optional))
 - **Needs:** a way to sign the IPA (free Apple ID via SideStore, or a paid
   account) and the Developer Disk Image mounted — see
   [Installation](#before-you-start--two-things-you-need)
+
+## The iCTRL app (optional)
+
+The runner does all the automation and runs on its own. `iCTRL.ipa` is a
+companion app for doing the surrounding chores on the phone itself:
+
+- **Mount the Developer Disk Image without a Mac**, and re-mount it after a
+  reboot in one tap ([Option 3](#option-3--the-ictrl-app)). Pairing files can
+  be picked in the app or shared to iCTRL from Files, Mail, AirDrop or a chat.
+- **Start and stop the runner**, and see whether it is running and which
+  version.
+- **Visibility:** see and switch who can reach the runner — 🟢 this device
+  only, 🟡 LAN, or 🟡 LAN + nearby (AWDL).
+- **Authorized clients:** every computer, agent and browser holding a key,
+  where each last connected from (this device / USB, LAN, nearby, VPN), and
+  revoking any of them.
+- **Runner logs, live**, with pause, refresh and filter.
+
+The app pairs with the runner once like any client (one Allow in the runner's
+notification). You can skip it if you mount the DDI with Xcode or StikDebug and
+manage the runner from its notification or a computer — with a free Apple ID's
+three-app limit, installing StikDebug *or* the iCTRL app is enough.
 
 ## Features
 
@@ -382,7 +405,8 @@ four steps on that screen:
    there and brings you back.
 2. **Import a pairing file.** Use the one iLoader produces, or create one on a
    Mac with `idevicepair pair` (libimobiledevice) and send it over AirDrop,
-   Files or iCloud.
+   Files or iCloud. If the picker can't reach the file, share it to iCTRL from
+   the app that has it; iCTRL confirms once it is stored.
 3. **Download image files.** About 100 MB, downloaded once and reused.
 4. **Mount Developer Disk Image.**
 
