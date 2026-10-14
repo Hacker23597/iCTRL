@@ -10,8 +10,9 @@ Usage:
     ./ictrl_rpc.py --host 10.0.0.5:8200 call tap '{"x":100,"y":200}'
     ./ictrl_rpc.py --host 10.0.0.5:8200 shot out.jpg          # JPEG by default
 
-Nearby (macOS, no shared network needed; the phone has Nearby Discovery on):
-    ./ictrl_rpc.py scan                                       # list nearby devices
+Discovery (the phone has Nearby Discovery on): found on the LAN from any OS,
+and over Apple peer-to-peer Wi-Fi from macOS with no shared network needed:
+    ./ictrl_rpc.py scan                                       # list discoverable devices
     ./ictrl_rpc.py --nearby "iPhone 15 (7f3a)" call device_info
     ./ictrl_rpc.py --nearby 7f3a shot out.jpg                 # name or id prefix
 
@@ -371,8 +372,8 @@ def _remember_address(device_id: str, record: dict, host: str, name: str | None 
 # short-lived cache spares the lookup on back-to-back calls.
 
 NEARBY_CACHE = os.path.expanduser("~/.ictrl/nearby_cache.json")
-NO_NEARBY_HINT = ("no nearby devices — on the phone, turn on Nearby Discovery (iCTRL notification) and "
-                  "keep Wi-Fi switched on; it need not be joined to a network")
+NO_NEARBY_HINT = ("no devices found — on the phone, turn on Nearby Discovery (iCTRL notification or app) "
+                  "and keep Wi-Fi switched on; it need not be joined to a network")
 NEARBY_CACHE_TTL = 120          # seconds
 _DNSSD_FLAGS = 0x100000 | 0x20000   # kDNSServiceFlagsIncludeAWDL | IncludeP2P
 
@@ -388,21 +389,20 @@ def _txt(raw: bytes) -> dict:
 
 
 def nearby_scan(wait: float = 3.0, want=None) -> list[dict]:
-    """Browse AWDL for iCTRL devices; each result is {name, id, host}.
-
-    Stops early once `want(device)` is true; otherwise collects for `wait` s.
+    """Find iCTRL devices that have Nearby Discovery on: over Apple
+    peer-to-peer Wi-Fi (macOS) and on the LAN. Each result is
+    {name, id, host, channel: "lan"|"awdl"}; a device seen both ways appears
+    twice. Stops early once `want(device)` is true, else collects for `wait` s.
     """
     if sys.platform != "darwin":
-        raise SystemExit("nearby discovery needs macOS (Apple peer-to-peer Wi-Fi)")
+        return _mdns_scan(wait, want)
     import ctypes
     try:
         lib = ctypes.CDLL("/usr/lib/system/libsystem_dnssd.dylib")
-    except OSError as exc:
-        raise SystemExit(f"nearby discovery unavailable: cannot load dns_sd ({exc})")
+    except OSError:
+        return _mdns_scan(wait, want)
     lib.DNSServiceRefSockFD.restype = ctypes.c_int
     awdl = socket.if_nametoindex("awdl0") if hasattr(socket, "if_nametoindex") else 0
-    if not awdl:
-        raise SystemExit("no awdl0 interface — is Wi-Fi turned on?")
     ref_t = ctypes.c_void_p
     browse_t = ctypes.CFUNCTYPE(None, ref_t, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int32,
                                 ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p)
@@ -417,30 +417,39 @@ def nearby_scan(wait: float = 3.0, want=None) -> list[dict]:
         dev = found.get(ctx)
         if err or not sa or not dev or dev.get("host"):
             return
-        raw = ctypes.string_at(sa, 28)                      # sockaddr_in6
-        if raw[1] == socket.AF_INET6:
-            addr = socket.inet_ntop(socket.AF_INET6, raw[8:24])
+        family = ctypes.string_at(sa, 2)[1]
+        if dev["channel"] == "awdl" and family == socket.AF_INET6:
+            addr = socket.inet_ntop(socket.AF_INET6, ctypes.string_at(sa, 28)[8:24])
             dev["host"] = f"[{addr}%awdl0]:{dev.pop('port')}"
-            devices.append(dev)
+        elif dev["channel"] == "lan" and family == socket.AF_INET:
+            addr = socket.inet_ntop(socket.AF_INET, ctypes.string_at(sa, 16)[4:8])
+            if addr.startswith("169.254."):             # link-local: the USB link, not the LAN
+                return
+            dev["host"] = f"{addr}:{dev.pop('port')}"
+        else:
+            return
+        devices.append(dev)
 
-    def on_resolve(_r, _f, _i, err, _full, target, port, txt_len, txt, ctx):
+    def on_resolve(_r, _f, ifi, err, _full, target, port, txt_len, txt, ctx):
         dev = found.get(ctx)
         if err or not dev or "port" in dev or dev.get("host"):
             return
         info = _txt(ctypes.string_at(txt, txt_len)) if txt_len else {}
         dev.update(id=info.get("id", ""), v=info.get("v", ""), port=socket.ntohs(port))
+        proto = 2 if dev["channel"] == "awdl" else 1    # kDNSServiceProtocol_IPv6 / _IPv4
         ref = ref_t()
-        if lib.DNSServiceGetAddrInfo(ctypes.byref(ref), _DNSSD_FLAGS, awdl, 2, target,
+        if lib.DNSServiceGetAddrInfo(ctypes.byref(ref), _DNSSD_FLAGS, dev["ifi"], proto, target,
                                      cb_addr, ctypes.c_void_p(ctx)) == 0:
             refs.append(ref)
 
     def on_browse(_r, flags, ifi, err, name, typ, dom, _ctx):
-        if err or not flags & 0x2 or ifi != awdl:          # kDNSServiceFlagsAdd, AWDL only
+        if err or not flags & 0x2:                       # kDNSServiceFlagsAdd
             return
         ctx = len(found) + 1
-        found[ctx] = {"name": name.decode("utf-8", "replace")}
+        found[ctx] = {"name": name.decode("utf-8", "replace"), "ifi": ifi,
+                      "channel": "awdl" if awdl and ifi == awdl else "lan"}
         ref = ref_t()
-        if lib.DNSServiceResolve(ctypes.byref(ref), _DNSSD_FLAGS, awdl, name, typ, dom,
+        if lib.DNSServiceResolve(ctypes.byref(ref), _DNSSD_FLAGS, ifi, name, typ, dom,
                                  cb_resolve, ctypes.c_void_p(ctx)) == 0:
             refs.append(ref)
 
@@ -463,7 +472,96 @@ def nearby_scan(wait: float = 3.0, want=None) -> list[dict]:
     finally:
         for r in refs:
             lib.DNSServiceRefDeallocate(r)
-    return sorted(devices, key=lambda d: d["name"].lower())
+    return _dedupe(devices)
+
+
+def _dedupe(devices: list[dict]) -> list[dict]:
+    """One entry per device and channel (a LAN answer can arrive on several
+    interfaces), sorted by name, LAN before AWDL."""
+    seen, out = set(), []
+    for d in devices:
+        key = (d.get("id") or d["name"], d["channel"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({k: d[k] for k in ("name", "id", "host", "channel") if k in d})
+    return sorted(out, key=lambda d: (d["name"].lower(), d["channel"] != "lan"))
+
+
+def _mdns_scan(wait: float, want=None) -> list[dict]:
+    """LAN discovery without dns_sd (Linux and others): one mDNS question for
+    _ictrl._tcp.local, asked from an ordinary port so responders answer by
+    unicast (RFC 6762 §6.7), which needs no multicast group membership."""
+    def name_at(msg, i):
+        labels, jumped, end = [], False, i
+        while True:
+            n = msg[i]
+            if n == 0:
+                i += 1
+                break
+            if n & 0xC0 == 0xC0:                         # compression pointer
+                if not jumped:
+                    end = i + 2
+                jumped = True
+                i = ((n & 0x3F) << 8) | msg[i + 1]
+                continue
+            labels.append(msg[i + 1:i + 1 + n].decode("utf-8", "replace"))
+            i += 1 + n
+        return ".".join(labels), (end if jumped else i)
+
+    q = b"".join(bytes([len(p)]) + p.encode() for p in ("_ictrl", "_tcp", "local")) + b"\0"
+    packet = b"\0\0\0\0\0\1\0\0\0\0\0\0" + q + b"\0\x0c\0\x01"      # PTR IN
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+    sock.settimeout(0.3)
+    instances, srv, txt, addrs = {}, {}, {}, {}
+    try:
+        sock.sendto(packet, ("224.0.0.251", 5353))
+    except OSError:
+        return []
+    deadline, last_send = time.time() + wait, time.time()
+    devices: list[dict] = []
+    while time.time() < deadline:
+        if time.time() - last_send > 1.0:                # a second ask covers a lost packet
+            sock.sendto(packet, ("224.0.0.251", 5353))
+            last_send = time.time()
+        try:
+            msg, _ = sock.recvfrom(9000)
+        except (socket.timeout, OSError):
+            msg = None
+        if msg and len(msg) > 12:
+            counts = [int.from_bytes(msg[k:k + 2], "big") for k in (4, 6, 8, 10)]
+            i = 12
+            for _ in range(counts[0]):
+                _, i = name_at(msg, i)
+                i += 4
+            for _ in range(sum(counts[1:])):
+                rname, i = name_at(msg, i)
+                rtype = int.from_bytes(msg[i:i + 2], "big")
+                rdlen = int.from_bytes(msg[i + 8:i + 10], "big")
+                rdata_at, i = i + 10, i + 10 + rdlen
+                if rtype == 12:                          # PTR -> instance
+                    inst, _ = name_at(msg, rdata_at)
+                    instances[inst] = inst.split("._ictrl._tcp", 1)[0]
+                elif rtype == 33:                        # SRV -> port, target
+                    target, _ = name_at(msg, rdata_at + 6)
+                    srv[rname] = (int.from_bytes(msg[rdata_at + 4:rdata_at + 6], "big"), target)
+                elif rtype == 16:                        # TXT
+                    txt[rname] = _txt(msg[rdata_at:rdata_at + rdlen])
+                elif rtype == 1 and rdlen == 4:          # A
+                    addr = socket.inet_ntoa(msg[rdata_at:rdata_at + 4])
+                    if not addr.startswith("169.254."):
+                        addrs.setdefault(rname, addr)
+        devices = []
+        for inst, name in instances.items():
+            if inst in srv and srv[inst][1] in addrs:
+                info = txt.get(inst, {})
+                devices.append({"name": name, "id": info.get("id", ""), "channel": "lan",
+                                "host": f"{addrs[srv[inst][1]]}:{srv[inst][0]}"})
+        if want and any(want(d) for d in devices):
+            break
+    sock.close()
+    return _dedupe(devices)
 
 
 def _nearby_cache(update: dict | None = None) -> dict:
@@ -493,12 +591,13 @@ def nearby_target(query: str, fresh: bool = False) -> tuple[str, str, str]:
             if now - ent.get("ts", 0) < NEARBY_CACHE_TTL and _matches({"id": dev_id, **ent}, query):
                 return dev_id, ent["host"], ent["name"]
     devices = nearby_scan(wait=6.0, want=lambda d: _matches(d, query))
-    hits = [d for d in devices if _matches(d, query)]
+    hits = [d for d in devices if _matches(d, query) and d.get("host")]
     if not hits:
         raise SystemExit(f"no nearby device matches {query!r} — run `scan`. On" + NO_NEARBY_HINT.split(" — on", 1)[1])
     if len({d["id"] for d in hits}) > 1:
         raise SystemExit(f"{query!r} matches several devices; use the id: "
                          + ", ".join(f"{d['name']} ({d['id'][:8]})" for d in hits))
+    # The LAN when the device is on it (sorted first), else peer-to-peer Wi-Fi.
     dev = hits[0]
     _nearby_cache({dev["id"]: {"name": dev["name"], "host": dev["host"], "ts": time.time()}})
     return dev["id"], dev["host"], dev["name"]
@@ -717,10 +816,11 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1:8200")
     ap.add_argument("--nearby", metavar="NAME_OR_ID",
-                    help="reach a nearby device over peer-to-peer Wi-Fi (macOS) instead of --host")
+                    help="reach a discovered device by name or id instead of --host "
+                         "(over the LAN, else peer-to-peer Wi-Fi on macOS)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sc = sub.add_parser("scan", help="list nearby devices (macOS)")
+    sc = sub.add_parser("scan", help="list devices with Nearby Discovery on (LAN everywhere; AWDL on macOS)")
     sc.add_argument("--wait", type=float, default=3.0, help="seconds to listen (default 3)")
 
     p = sub.add_parser("pair", help="pair with the device (blocks on approval)")
@@ -753,9 +853,13 @@ def main() -> int:
         devices = nearby_scan(wait=args.wait)
         if not devices:
             print(NO_NEARBY_HINT)
+        by_id: dict = {}
         for d in devices:
-            paired = "paired" if _key_for("", d["id"])[0] else ""
-            print(f"{d['name']:32s} id={d['id'][:8]}  {paired}")
+            by_id.setdefault(d["id"] or d["name"], []).append(d)
+        for dev_id, ways in by_id.items():
+            reach = ", ".join(f"LAN {d['host']}" if d["channel"] == "lan" else "nearby (AWDL)" for d in ways)
+            paired = "  paired" if _key_for("", dev_id)[0] else ""
+            print(f"{ways[0]['name']:28s} id={dev_id[:8]}  {reach}{paired}")
         return 0
     if args.cmd == "list":
         hosts = list_hosts()
