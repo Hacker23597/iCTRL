@@ -212,7 +212,7 @@ class JSONRPCServer {
         l.start(queue: queue)
         nearbyListener = l
 
-        let advertiser = NearbyAdvertiser(port: nearbyPort, queue: queue) { [weak self] in self?.log($0) }
+        let advertiser = NearbyAdvertiser(port: nearbyPort, lanPort: port, queue: queue) { [weak self] in self?.log($0) }
         advertiser.onChange = { [weak self] status in self?.setNearbyStatus(status) }
         nearbyAdvertiser = advertiser
         advertiser.start()

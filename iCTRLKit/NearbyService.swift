@@ -113,13 +113,16 @@ enum NearbyIdentity {
     ]
 }
 
-/// Advertises the nearby listener over Bonjour on the AWDL interface only.
+/// Advertises the device over Bonjour while nearby discovery is on: the
+/// peer-to-peer listener on the AWDL interface, and the main listener on the
+/// LAN (see `registerLAN`), so a first connection needs no typed address.
+/// With nearby discovery off nothing is advertised anywhere.
 ///
-/// The service is registered with the *specific* interface index of `awdl0`.
-/// Neither interface 0 nor `kDNSServiceInterfaceIndexP2P` may be used: both
-/// also advertise on Wi-Fi/Ethernet (dns_sd.h maps P2P on Register to "any
-/// interface, including P2P"), which would announce the device to the whole
-/// LAN.
+/// The AWDL record is registered with the *specific* interface index of
+/// `awdl0`, and must stay so: interface 0 or `kDNSServiceInterfaceIndexP2P`
+/// with the AWDL flag would also put the peer-to-peer port on Wi-Fi/Ethernet
+/// (dns_sd.h maps P2P on Register to "any interface, including P2P"), where
+/// that listener refuses every connection anyway.
 ///
 /// `awdl0` can exist while it is unusable (Wi-Fi off): a registration made
 /// then never completes and never fails. So the interface's own state decides
@@ -157,9 +160,14 @@ final class NearbyAdvertiser {
     }
 
     private let port: UInt16
+    /// The main (LAN) listener's port, advertised on the LAN while nearby
+    /// discovery is on so a first connection needs no typed address.
+    private let lanPort: UInt16
     private let queue: DispatchQueue
     private let log: (String) -> Void
     private var ref: DNSServiceRef?
+    private var lanRef: DNSServiceRef?
+    private var lanRetryAt = Date.distantPast
     private var poll: DispatchSourceTimer?
     private var nextRetry = Date.distantPast
     private var stopped = true
@@ -178,8 +186,9 @@ final class NearbyAdvertiser {
     /// Back-off after a registration error before trying again.
     private static let retryInterval: TimeInterval = 30
 
-    init(port: UInt16, queue: DispatchQueue, log: @escaping (String) -> Void) {
+    init(port: UInt16, lanPort: UInt16, queue: DispatchQueue, log: @escaping (String) -> Void) {
         self.port = port
+        self.lanPort = lanPort
         self.queue = queue
         self.log = log
     }
@@ -187,6 +196,7 @@ final class NearbyAdvertiser {
     deinit {
         poll?.cancel()
         if let ref { DNSServiceRefDeallocate(ref) }
+        if let lanRef { DNSServiceRefDeallocate(lanRef) }
     }
 
     func start() {
@@ -194,6 +204,7 @@ final class NearbyAdvertiser {
             guard self.stopped else { return }
             self.stopped = false
             self.nextRetry = .distantPast
+            self.lanRetryAt = .distantPast
             self.startPolling()
             self.evaluate()
         }
@@ -205,6 +216,7 @@ final class NearbyAdvertiser {
             self.poll?.cancel()
             self.poll = nil
             self.deregister()
+            self.deregisterLAN()
             self.status = .off
         }
     }
@@ -212,7 +224,10 @@ final class NearbyAdvertiser {
     /// Re-register under the current `NearbyIdentity.name`.
     func refreshName() {
         queue.async {
-            guard !self.stopped, self.ref != nil else { return }
+            guard !self.stopped else { return }
+            self.deregisterLAN()
+            self.registerLAN()
+            guard self.ref != nil else { return }
             self.deregister()
             let link = Self.linkState()
             if link.usable { self.register(index: link.index) } else { self.evaluate() }
@@ -267,6 +282,7 @@ final class NearbyAdvertiser {
     /// Bring the registration in line with the interface.
     private func evaluate() {
         guard !stopped else { return }
+        if lanRef == nil, Date() >= lanRetryAt { registerLAN() }
         let link = Self.linkState()
         guard link.usable else {
             if status != .needsWiFi {
@@ -294,6 +310,7 @@ final class NearbyAdvertiser {
         defer { TXTRecordDeallocate(&txt) }
         setTXT(&txt, "v", String(RPCMethodRegistry.protocolVersion))
         setTXT(&txt, "id", NearbyIdentity.deviceID)
+        setTXT(&txt, "ch", "awdl")
 
         let name = NearbyIdentity.name
         var newRef: DNSServiceRef?
@@ -341,6 +358,58 @@ final class NearbyAdvertiser {
             + "; retrying in \(Int(Self.retryInterval))s")
         nextRetry = Date().addingTimeInterval(Self.retryInterval)
         status = denied ? .denied : .failed
+    }
+
+    // MARK: LAN
+
+    /// Advertise the main listener on the ordinary (non peer-to-peer)
+    /// interfaces: interface 0 without the AWDL/P2P flags, i.e. Wi-Fi and
+    /// wired, never AWDL. Same name and device id as the AWDL record, port of
+    /// the main listener, TXT ch=lan. Status reflects AWDL only; a LAN
+    /// failure is logged and retried after the back-off.
+    private func registerLAN() {
+        guard !stopped, lanRef == nil else { return }
+        var txt = TXTRecordRef()
+        TXTRecordCreate(&txt, 0, nil)
+        defer { TXTRecordDeallocate(&txt) }
+        setTXT(&txt, "v", String(RPCMethodRegistry.protocolVersion))
+        setTXT(&txt, "id", NearbyIdentity.deviceID)
+        setTXT(&txt, "ch", "lan")
+
+        var newRef: DNSServiceRef?
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let err = DNSServiceRegister(
+            &newRef, 0, 0, NearbyIdentity.name, Self.serviceType, nil, nil, lanPort.bigEndian,
+            TXTRecordGetLength(&txt), TXTRecordGetBytesPtr(&txt),
+            { _, _, errorCode, registeredName, _, _, context in
+                guard let context else { return }
+                let me = Unmanaged<NearbyAdvertiser>.fromOpaque(context).takeUnretainedValue()
+                me.lanRegistrationCallback(errorCode, registeredName.map { String(cString: $0) })
+            }, context)
+        guard err == kDNSServiceErr_NoError, let newRef,
+              DNSServiceSetDispatchQueue(newRef, queue) == kDNSServiceErr_NoError else {
+            if let newRef { DNSServiceRefDeallocate(newRef) }
+            log("📡 Nearby: LAN registration failed (\(err)); retrying in \(Int(Self.retryInterval))s")
+            lanRetryAt = Date().addingTimeInterval(Self.retryInterval)
+            return
+        }
+        lanRef = newRef
+    }
+
+    private func lanRegistrationCallback(_ err: DNSServiceErrorType, _ registeredName: String?) {
+        guard !stopped, lanRef != nil else { return }
+        if err == kDNSServiceErr_NoError {
+            log("📡 Nearby: also discoverable on the LAN as \"\(registeredName ?? "?")\", port \(lanPort)")
+        } else {
+            deregisterLAN()
+            log("📡 Nearby: LAN registration failed (\(err)); retrying in \(Int(Self.retryInterval))s")
+            lanRetryAt = Date().addingTimeInterval(Self.retryInterval)
+        }
+    }
+
+    private func deregisterLAN() {
+        if let lanRef { DNSServiceRefDeallocate(lanRef) }
+        lanRef = nil
     }
 
     /// Drop the registration; callers set the resulting `status`.
