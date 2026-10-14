@@ -43,17 +43,43 @@ private struct NoticeText: View {
     }
 }
 
-/// "Visibility: 🟢 This device only · safe" and the like.
+/// "Visibility: 🟢 This device only · safe" and the like; tap to change it.
 struct RunnerVisibilityRow: View {
+    @EnvironmentObject var admin: RunnerAdmin
     let visibility: RunnerAdmin.Visibility
 
+    private static let choices: [RunnerAdmin.Visibility] = [.local, .lan, .lanAndNearby]
+
     var body: some View {
-        HStack {
-            Text(L10n.t(.visibilityLabel))
-            Spacer()
-            Text(Self.text(visibility))
-                .foregroundColor(.secondary)
+        Menu {
+            ForEach(Self.choices, id: \.self) { choice in
+                Button {
+                    Task { await admin.setVisibility(choice) }
+                } label: {
+                    if choice == visibility {
+                        Label(Self.text(choice), systemImage: "checkmark")
+                    } else {
+                        Text(Self.text(choice))
+                    }
+                }
+            }
+        } label: {
+            HStack {
+                Text(L10n.t(.visibilityLabel))
+                    .foregroundColor(.primary)
+                Spacer()
+                if admin.changingVisibility {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text(Self.text(visibility))
+                        .foregroundColor(.secondary)
+                }
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
         }
+        .disabled(admin.changingVisibility)
     }
 
     /// 🟢 only for loopback; anything another device can reach is 🟡.

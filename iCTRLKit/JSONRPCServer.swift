@@ -992,7 +992,17 @@ class JSONRPCServer {
         }
 
         let method = rpcRequest.method
-        handler(method, rpcRequest.params) { [weak self] result, error in
+        var params = rpcRequest.params
+        // `config` may widen who can reach the device (nearby discovery), which
+        // only a caller on this device may do. Tell it where this request came
+        // from; set here, after authentication, and overwriting any value the
+        // caller sent, so it cannot be claimed.
+        if method == "config" {
+            var p = params ?? [:]
+            p[Self.peerSourceParam] = .string(Self.peer(of: connection)?.via ?? PeerSource.other.rawValue)
+            params = p
+        }
+        handler(method, params) { [weak self] result, error in
             let json = error.map { Self.errorJSON(rpcRequest.id, $0) }
                 ?? Self.resultJSON(rpcRequest.id, result ?? [:])
             self?.sendSealed(connection, seal: seal, json: json)
@@ -1089,6 +1099,8 @@ class JSONRPCServer {
     }
 
     static let deviceHeader = "X-ICTRL-Device"
+    /// Parameter the server adds to `config`: the request's `PeerSource`.
+    static let peerSourceParam = "_peer_source"
 
     /// Send a response whose body is raw bytes.
     ///

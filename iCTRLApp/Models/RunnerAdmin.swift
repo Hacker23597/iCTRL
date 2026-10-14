@@ -29,7 +29,7 @@ final class RunnerAdmin: ObservableObject {
     @Published private(set) var localNetworkDenied = false
 
     /// The runner's reach, widest first. Only local is safe from other devices.
-    enum Visibility: Equatable {
+    enum Visibility: Hashable {
         /// Loopback only: apps on this device and a computer over USB.
         case local
         /// Remote access on: anyone on the same network can try to pair.
@@ -119,6 +119,36 @@ final class RunnerAdmin: ObservableObject {
         logLines = []
         logsLoaded = false
         ictrlLog("Runner admin: disconnected")
+    }
+
+    // MARK: - Visibility
+
+    @Published private(set) var changingVisibility = false
+
+    /// Set who can reach the runner. Turning remote access on or off restarts
+    /// the runner's listener, so the reply can be lost; the state is read back
+    /// afterwards either way.
+    func setVisibility(_ target: Visibility) async {
+        guard target != visibility, !changingVisibility else { return }
+        changingVisibility = true
+        defer { changingVisibility = false }
+        var params: [String: Any]
+        switch target {
+        case .local: params = ["allow_remote_access": false]
+        case .lan: params = ["allow_remote_access": true, "nearby_discovery": false]
+        case .lanAndNearby: params = ["allow_remote_access": true, "nearby_discovery": true]
+        }
+        do {
+            _ = try await client.call("config", params)
+            ictrlLog("Runner admin: visibility -> \(target)")
+        } catch RunnerClient.Failure.notRunning {
+            // The listener restarting under the reply; checked below.
+        } catch {
+            handle(error)
+        }
+        // Nearby confirms its advertisement a moment after it is switched on.
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        await loadClients()
     }
 
     // MARK: - Logs

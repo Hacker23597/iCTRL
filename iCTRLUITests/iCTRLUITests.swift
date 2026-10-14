@@ -1410,6 +1410,25 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             }
         }
 
+        // Nearby discovery. Switching it ON widens who can reach the device, so
+        // it is accepted only from a caller on this device — the iCTRL app or a
+        // computer over USB — like the toggle on the device's own notification.
+        // Switching it off is accepted from anyone.
+        var nearbyChange: Bool?
+        if let nearby = params?["nearby_discovery"]?.boolValue, nearby != nearbyEnabled {
+            if nearby {
+                guard remoteAccessEnabled else {
+                    return (nil, JSONRPCError(code: -32602, message: "nearby_discovery needs allow_remote_access:true", data: nil))
+                }
+                guard params?[JSONRPCServer.peerSourceParam]?.stringValue == PeerSource.local.rawValue else {
+                    return (nil, JSONRPCError(code: -32602,
+                                              message: "nearby_discovery can be switched on only from this device: the iCTRL app, a computer over USB, or the iCTRL notification",
+                                              data: nil))
+                }
+            }
+            nearbyChange = nearby
+        }
+
         // Name advertised to nearby clients; "" restores the default.
         var nameError: JSONRPCError?
         if let newName = params?["device_name"]?.stringValue {
@@ -1435,20 +1454,40 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             }
         }
 
+        if let on = nearbyChange {
+            nearbyEnabled = on
+            Self.persistedNearby = on
+            if on { nearbyPermissionRequested = false }
+            Self.logBuffer.append(on ? "📡 Nearby discovery enabled via config" : "📴 Nearby discovery disabled via config")
+            if !restartNeeded {
+                if on { server?.startNearby() } else { server?.stopNearby() }
+                let port = UInt16(server?.port ?? 8200)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self = self else { return }
+                    self.postStatusNotification(detail: self.addressLines(port: port))
+                }
+            }
+        }
+
         if restartNeeded {
-            server?.onStateChange = nil
-            server?.stop()
-            let newServer = JSONRPCServer(port: newPort, localOnly: !remoteAccessEnabled)
-            wireNewServer(newServer)
-            do {
-                try newServer.start()
-                if remoteAccessEnabled && nearbyEnabled { newServer.startNearby() }
-                Self.logBuffer.append("⚙️ Config applied, server restarted on port \(newPort)")
-                let detail = remoteAccessEnabled ? addressLines(port: newPort) : L10n.t(.localOnlyBody)
-                DispatchQueue.main.async { self.postStatusNotification(detail: detail) }
-            } catch {
-                Self.logBuffer.append("🔴 Config restart failed: \(error)")
-                return (nil, .serverError("Failed to restart server with new config: \(error.localizedDescription)"))
+            // After the reply: stopping the listener now would also close the
+            // connection this reply has yet to go out on.
+            let port = newPort
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self = self else { return }
+                self.server?.onStateChange = nil
+                self.server?.stop()
+                let newServer = JSONRPCServer(port: port, localOnly: !self.remoteAccessEnabled)
+                self.wireNewServer(newServer)
+                do {
+                    try newServer.start()
+                    if self.remoteAccessEnabled && self.nearbyEnabled { newServer.startNearby() }
+                    Self.logBuffer.append("⚙️ Config applied, server restarted on port \(port)")
+                    let detail = self.remoteAccessEnabled ? self.addressLines(port: port) : L10n.t(.localOnlyBody)
+                    self.postStatusNotification(detail: detail)
+                } catch {
+                    Self.logBuffer.append("🔴 Config restart failed: \(error)")
+                }
             }
         }
 
