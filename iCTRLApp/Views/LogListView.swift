@@ -19,35 +19,51 @@ struct LogListView: View {
 
     var body: some View {
         List {
-            if files.isEmpty {
-                Text("No logs yet.")
-                    .foregroundColor(.secondary)
+            // The runner is a separate process with its own log; it is read
+            // live over the runner's RPC rather than from a file here.
+            Section {
+                NavigationLink {
+                    RunnerLogsView()
+                } label: {
+                    Label(L10n.t(.runnerLogs), systemImage: "dot.radiowaves.left.and.right")
+                }
+            } header: {
+                Text(L10n.t(.runnerSection))
             }
 
-            ForEach(files, id: \.self) { url in
-                NavigationLink {
-                    LogDetailView(url: url)
-                } label: {
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack {
-                            Text(Self.title(for: url))
-                            if url == AppLog.shared.fileURL {
-                                Text("current")
-                                    .font(.caption2)
-                                    .padding(.horizontal, 6).padding(.vertical, 2)
-                                    .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-                                    .foregroundColor(.accentColor)
+            Section {
+                if files.isEmpty {
+                    Text("No logs yet.")
+                        .foregroundColor(.secondary)
+                }
+
+                ForEach(files, id: \.self) { url in
+                    NavigationLink {
+                        LogDetailView(url: url)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(Self.title(for: url))
+                                if url == AppLog.shared.fileURL {
+                                    Text("current")
+                                        .font(.caption2)
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                                        .foregroundColor(.accentColor)
+                                }
                             }
+                            Text(Self.subtitle(for: url))
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
-                        Text(Self.subtitle(for: url))
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                    }
+                    .swipeActions {
+                        Button("Share") { shareURL = ShareItem(url: url) }
+                            .tint(.blue)
                     }
                 }
-                .swipeActions {
-                    Button("Share") { shareURL = ShareItem(url: url) }
-                        .tint(.blue)
-                }
+            } header: {
+                Text(L10n.t(.appLogsSection))
             }
         }
         .navigationTitle("Logs")

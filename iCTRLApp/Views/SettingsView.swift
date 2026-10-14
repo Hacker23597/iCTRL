@@ -17,6 +17,7 @@ struct SettingsView: View {
     @State private var launchFailed = false
     @State private var showMountSheet = false
     @StateObject private var runner = RunnerStatus(port: 8200)
+    @EnvironmentObject private var runnerAdmin: RunnerAdmin
     @State private var logCount = AppLog.allFiles().count
 
 
@@ -302,6 +303,26 @@ struct SettingsView: View {
                                 .foregroundColor(.secondary)
                         }
                     }
+                }
+                NavigationLink {
+                    RunnerClientsView()
+                } label: {
+                    HStack {
+                        Text(L10n.t(.authorizedClients))
+                        Spacer()
+                        if runnerAdmin.clientsLoaded {
+                            Text(verbatim: "\(runnerAdmin.clients.count)")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                // Show the count without opening the list (only once paired:
+                // pairing itself is never started from here).
+                .task { if runnerAdmin.isPaired { await runnerAdmin.loadClients() } }
+                NavigationLink {
+                    RunnerLogsView()
+                } label: {
+                    Text(L10n.t(.runnerLogs))
                 }
                 Button(role: .destructive) {
                     stopRunner()

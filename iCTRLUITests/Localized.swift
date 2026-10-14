@@ -77,6 +77,13 @@ enum L10n {
         case networkPermissionTitle, networkPermissionBody, networkDataPermission, localNetworkPermission, laterButton
         case wifiRequired, wifiConnected, wifiMissing, wifiFooter, notOnWiFi
         case mountIntro, uploadingImage
+        case authorizedClients, runnerLogs, appLogsSection, runnerSection
+        case connectRunnerTitle, connectRunnerBody, connectButton, waitingApproval
+        case runnerNotRunningHint, keyRejectedHint, pairDeniedHint, retryInSeconds
+        case thisApp, revokeButton, revokeOthers, revokeConfirmTitle, revokeConfirmBody
+        case revokeOthersConfirm, disconnectThisApp, disconnectConfirmBody
+        case noClients, pairedAt, lastActive, clientsFooter
+        case liveLabel, pausedLabel, filterPlaceholder, noLogLines, copyButton, runnerLogsCaption, cancelButton
     }
 
     // key → (lang → text). English is the required fallback for every key.
@@ -312,5 +319,48 @@ enum L10n {
         .networkDataPermission: [.en: "Wireless Data", .zhHans: "无线数据", .zhHant: "無線資料"],
         .localNetworkPermission: [.en: "Local Network", .zhHans: "本地网络", .zhHant: "區域網路"],
         .laterButton: [.en: "Later", .zhHans: "稍后", .zhHant: "稍後"],
+        .authorizedClients: [.en: "Authorized Clients", .zhHans: "已授权客户端", .zhHant: "已授權用戶端"],
+        .runnerLogs: [.en: "Runner Logs", .zhHans: "Runner 日志", .zhHant: "Runner 日誌"],
+        .appLogsSection: [.en: "This App", .zhHans: "本 App", .zhHant: "本 App"],
+        .runnerSection: [.en: "Runner", .zhHans: "Runner", .zhHant: "Runner"],
+        .connectRunnerTitle: [.en: "Connect to the Runner", .zhHans: "连接 Runner", .zhHant: "連接 Runner"],
+        .connectRunnerBody: [.en: "Managing clients and reading the runner's log need its approval once. Tap Connect, then long-press the iCTRL notification and choose Allow.",
+                             .zhHans: "管理客户端和查看 Runner 日志需要 Runner 授权一次。点击“连接”，然后长按 iCTRL 通知并选择“允许”。",
+                             .zhHant: "管理用戶端和查看 Runner 日誌需要 Runner 授權一次。點擊「連接」，然後長按 iCTRL 通知並選擇「允許」。"],
+        .connectButton: [.en: "Connect", .zhHans: "连接", .zhHant: "連接"],
+        .waitingApproval: [.en: "Waiting for Allow in the iCTRL notification…", .zhHans: "等待在 iCTRL 通知中允许…", .zhHant: "等待在 iCTRL 通知中允許…"],
+        .runnerNotRunningHint: [.en: "The runner is not running. Start the server first.", .zhHans: "Runner 未运行，请先启动服务。", .zhHant: "Runner 未運行，請先啟動服務。"],
+        .keyRejectedHint: [.en: "The runner no longer accepts this app (revoked or expired). Connect again.",
+                           .zhHans: "Runner 已不再接受本 App（已吊销或过期），请重新连接。",
+                           .zhHant: "Runner 已不再接受本 App（已撤銷或過期），請重新連接。"],
+        .pairDeniedHint: [.en: "Not allowed, or no answer within 60 seconds.", .zhHans: "未被允许，或 60 秒内未响应。", .zhHant: "未被允許，或 60 秒內未回應。"],
+        .retryInSeconds: [.en: "Try again in %d s.", .zhHans: "请 %d 秒后重试。", .zhHant: "請 %d 秒後重試。"],
+        .thisApp: [.en: "This app", .zhHans: "本 App", .zhHant: "本 App"],
+        .revokeButton: [.en: "Revoke", .zhHans: "吊销", .zhHant: "撤銷"],
+        .revokeOthers: [.en: "Revoke All Others", .zhHans: "吊销其他全部", .zhHant: "撤銷其他全部"],
+        .revokeConfirmTitle: [.en: "Revoke “%@”?", .zhHans: "吊销“%@”？", .zhHant: "撤銷「%@」？"],
+        .revokeConfirmBody: [.en: "Its key stops working at once. To come back it must pair again, approved on this device.",
+                             .zhHans: "其密钥立即失效。如需再次使用，必须重新配对并在本机允许。",
+                             .zhHant: "其金鑰立即失效。如需再次使用，必須重新配對並在本機允許。"],
+        .revokeOthersConfirm: [.en: "Revoke %d clients?", .zhHans: "吊销 %d 个客户端？", .zhHant: "撤銷 %d 個用戶端？"],
+        .disconnectThisApp: [.en: "Disconnect This App", .zhHans: "断开本 App", .zhHant: "中斷本 App"],
+        .disconnectConfirmBody: [.en: "This app's key is revoked. Viewing clients and logs again needs a new approval.",
+                                 .zhHans: "本 App 的密钥将被吊销，再次查看客户端和日志需要重新允许。",
+                                 .zhHant: "本 App 的金鑰將被撤銷，再次查看用戶端和日誌需要重新允許。"],
+        .noClients: [.en: "No authorized clients.", .zhHans: "没有已授权的客户端。", .zhHant: "沒有已授權的用戶端。"],
+        .pairedAt: [.en: "Paired %@", .zhHans: "授权于 %@", .zhHant: "授權於 %@"],
+        .lastActive: [.en: "active %@", .zhHans: "最近活动 %@", .zhHant: "最近活動 %@"],
+        .clientsFooter: [.en: "Computers, agents and browsers holding a key to this runner. Revoking takes effect immediately.",
+                         .zhHans: "持有本 Runner 密钥的电脑、Agent 和浏览器。吊销立即生效。",
+                         .zhHant: "持有本 Runner 金鑰的電腦、Agent 和瀏覽器。撤銷立即生效。"],
+        .liveLabel: [.en: "Live", .zhHans: "实时", .zhHant: "即時"],
+        .pausedLabel: [.en: "Paused", .zhHans: "已暂停", .zhHant: "已暫停"],
+        .filterPlaceholder: [.en: "Filter", .zhHans: "筛选", .zhHant: "篩選"],
+        .noLogLines: [.en: "No log lines.", .zhHans: "没有日志。", .zhHant: "沒有日誌。"],
+        .copyButton: [.en: "Copy", .zhHans: "复制", .zhHant: "拷貝"],
+        .runnerLogsCaption: [.en: "The runner's most recent 500 log lines, refreshed every 2 seconds while this screen is open.",
+                            .zhHans: "Runner 最近 500 行日志，停留在本页时每 2 秒刷新一次。",
+                            .zhHant: "Runner 最近 500 行日誌，停留在本頁時每 2 秒重新整理一次。"],
+        .cancelButton: [.en: "Cancel", .zhHans: "取消", .zhHant: "取消"],
     ]
 }

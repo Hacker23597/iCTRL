@@ -4,6 +4,8 @@ import SwiftUI
 struct iCTRLApp: App {
     @StateObject private var appState = AppState()
     @StateObject private var permission = NetworkPermission()
+    /// Clients and log of the runner on this device; shared by Settings and Logs.
+    @StateObject private var runnerAdmin = RunnerAdmin(port: 8200)
     @State private var showPermissionAlert = false
 
     init() {
@@ -19,6 +21,7 @@ struct iCTRLApp: App {
                     .environmentObject(appState)
             }
             .environmentObject(appState)
+            .environmentObject(runnerAdmin)
             .sheet(item: $appState.pendingAuthRequest) { request in
                 AuthRequestView(request: request)
                     .environmentObject(appState)
