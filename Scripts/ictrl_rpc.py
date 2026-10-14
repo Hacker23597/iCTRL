@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import hmac
 import http.client
@@ -151,11 +152,22 @@ class _ZonedHTTPConnection(http.client.HTTPConnection):
                 self.sock = self._direct(host, min(timeout, self._DIRECT_TIMEOUT))
                 return
             except OSError as exc:
+                # A timeout usually means the address went stale (AWDL
+                # addresses change when the link comes back): let the caller
+                # look the device up again rather than wait out nc too. Only
+                # an outright refusal — Local Network privacy — goes to nc.
+                if exc.errno not in _REFUSED:
+                    raise
                 if not os.access(_NC, os.X_OK):
                     raise OSError(f"cannot reach {host}: {exc}. If 'No route to host', allow Local "
                                   "Network access for the app running this client (System Settings "
                                   "› Privacy & Security › Local Network)") from exc
+                # A stale address is refused the same way; only a relay that
+                # then gets through shows the refusal was this process's.
+                self._nc = self._relay(host, timeout)
                 _ZonedHTTPConnection._via_nc = True
+                self.sock = _NcSocket(self._nc)
+                return
         self._nc = self._relay(host, timeout)
         self.sock = _NcSocket(self._nc)
 
@@ -221,6 +233,7 @@ class _ZonedHandler(urllib.request.HTTPHandler):
 _IPV6_BOUND_IF = 125            # <netinet6/in6.h>, macOS
 _SO_RECV_ANYIF = 0x1104         # <sys/socket.h> (private), macOS: accept input on a restricted interface
 _NC = "/usr/bin/nc"
+_REFUSED = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EPERM, errno.EACCES}
 # No proxy, ever: every iCTRL host is loopback, on the LAN or link-local, and
 # a proxy taken from http_proxy cannot reach any of them (a link-local
 # address not even in principle).
@@ -374,7 +387,7 @@ def _remember_address(device_id: str, record: dict, host: str, name: str | None 
 NEARBY_CACHE = os.path.expanduser("~/.ictrl/nearby_cache.json")
 NO_NEARBY_HINT = ("no devices found — on the phone, turn on Nearby Discovery (iCTRL notification or app) "
                   "and keep Wi-Fi switched on; it need not be joined to a network")
-NEARBY_CACHE_TTL = 120          # seconds
+NEARBY_CACHE_TTL = 30           # seconds; AWDL addresses change when the link restarts
 _DNSSD_FLAGS = 0x100000 | 0x20000   # kDNSServiceFlagsIncludeAWDL | IncludeP2P
 
 
