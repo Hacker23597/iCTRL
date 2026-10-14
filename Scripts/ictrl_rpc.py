@@ -10,8 +10,14 @@ Usage:
     ./ictrl_rpc.py --host 10.0.0.5:8200 call tap '{"x":100,"y":200}'
     ./ictrl_rpc.py --host 10.0.0.5:8200 shot out.jpg          # JPEG by default
 
-The token is cached at ~/.ictrl/token.json keyed by host, so `pair` is a
-one-time step per device.
+Nearby (macOS, no shared network needed; the phone has Nearby Discovery on):
+    ./ictrl_rpc.py scan                                       # list nearby devices
+    ./ictrl_rpc.py --nearby "iPhone 15 (7f3a)" call device_info
+    ./ictrl_rpc.py --nearby 7f3a shot out.jpg                 # name or id prefix
+
+The token is cached at ~/.ictrl/token.json keyed by host (or by device id for
+nearby devices), so pairing is a one-time step per device. With --nearby it
+happens automatically on first use: approve the prompt on the phone once.
 
 Two notes for anything that moves a lot of data (server 1.5.0+):
 
@@ -31,11 +37,15 @@ import argparse
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import secrets
+import select
+import socket
 import sys
 import time
+import urllib.error
 import urllib.request
 
 STORE = os.path.expanduser("~/.ictrl/token.json")
@@ -87,12 +97,39 @@ def _keystream_xor(key: bytes, nonce: bytes, data: bytes) -> bytes:
     return (int.from_bytes(data, "big") ^ int.from_bytes(bytes(out[:n]), "big")).to_bytes(n, "big")
 
 
+class _ZonedHTTPConnection(http.client.HTTPConnection):
+    """Dial a zoned link-local IPv6 host ("fe80::1%awdl0") with the socket bound
+    to that interface; macOS does not route to a peer-to-peer (AWDL) peer
+    otherwise. Every other host connects as usual."""
+
+    def connect(self):
+        host = self.host.strip("[]")
+        if "%" not in host:
+            return super().connect()
+        addr, zone = host.split("%", 1)
+        index = socket.if_nametoindex(zone)
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_IPV6, _IPV6_BOUND_IF, index)
+        sock.settimeout(self.timeout)
+        sock.connect((addr, self.port, 0, index))
+        self.sock = sock
+
+
+class _ZonedHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_ZonedHTTPConnection, req)
+
+
+_IPV6_BOUND_IF = 125            # <netinet6/in6.h>, macOS
+_opener = urllib.request.build_opener(_ZonedHandler)
+
+
 def _post(url: str, obj: dict, timeout: float) -> tuple[int, dict]:
     body = json.dumps(obj).encode()
     req = urllib.request.Request(url, data=body,
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener.open(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as e:
         raw = e.read() or b"{}"
@@ -144,9 +181,214 @@ def save_token(host: str, record: dict) -> None:
     os.chmod(STORE, 0o600)
 
 
+# --------------------------------------------------------------------- nearby
+#
+# Nearby discovery: the phone advertises "_ictrl._tcp" over Apple peer-to-peer
+# Wi-Fi (AWDL) only, with TXT "v" (protocol) and "id" (stable device id). macOS
+# only, through the system dns_sd API (ctypes, standard library). The address
+# is link-local and changes, so devices are keyed by id and re-resolved; a
+# short-lived cache spares the lookup on back-to-back calls.
+
+NEARBY_CACHE = os.path.expanduser("~/.ictrl/nearby_cache.json")
+NEARBY_CACHE_TTL = 120          # seconds
+_DNSSD_FLAGS = 0x100000 | 0x20000   # kDNSServiceFlagsIncludeAWDL | IncludeP2P
+
+
+def _txt(raw: bytes) -> dict:
+    out, i = {}, 0
+    while i < len(raw):
+        n = raw[i]
+        k, _, v = raw[i + 1:i + 1 + n].decode("utf-8", "replace").partition("=")
+        out[k] = v
+        i += 1 + n
+    return out
+
+
+def nearby_scan(wait: float = 3.0, want=None) -> list[dict]:
+    """Browse AWDL for iCTRL devices; each result is {name, id, host}.
+
+    Stops early once `want(device)` is true; otherwise collects for `wait` s.
+    """
+    if sys.platform != "darwin":
+        raise SystemExit("nearby discovery needs macOS (Apple peer-to-peer Wi-Fi)")
+    import ctypes
+    lib = ctypes.CDLL("/usr/lib/system/libsystem_dnssd.dylib")
+    lib.DNSServiceRefSockFD.restype = ctypes.c_int
+    awdl = socket.if_nametoindex("awdl0") if hasattr(socket, "if_nametoindex") else 0
+    if not awdl:
+        raise SystemExit("no awdl0 interface — is Wi-Fi turned on?")
+    ref_t = ctypes.c_void_p
+    browse_t = ctypes.CFUNCTYPE(None, ref_t, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int32,
+                                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p)
+    resolve_t = ctypes.CFUNCTYPE(None, ref_t, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int32,
+                                 ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_uint16,
+                                 ctypes.c_void_p, ctypes.c_void_p)
+    addr_t = ctypes.CFUNCTYPE(None, ref_t, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int32,
+                              ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p)
+    refs, found, devices, keep = [], {}, [], []
+
+    def on_addr(_r, _f, _i, err, _h, sa, _ttl, ctx):
+        dev = found.get(ctx)
+        if err or not sa or not dev or dev.get("host"):
+            return
+        raw = ctypes.string_at(sa, 28)                      # sockaddr_in6
+        if raw[1] == socket.AF_INET6:
+            addr = socket.inet_ntop(socket.AF_INET6, raw[8:24])
+            dev["host"] = f"[{addr}%awdl0]:{dev.pop('port')}"
+            devices.append(dev)
+
+    def on_resolve(_r, _f, _i, err, _full, target, port, txt_len, txt, ctx):
+        dev = found.get(ctx)
+        if err or not dev or "port" in dev or dev.get("host"):
+            return
+        info = _txt(ctypes.string_at(txt, txt_len)) if txt_len else {}
+        dev.update(id=info.get("id", ""), v=info.get("v", ""), port=socket.ntohs(port))
+        ref = ref_t()
+        if lib.DNSServiceGetAddrInfo(ctypes.byref(ref), _DNSSD_FLAGS, awdl, 2, target,
+                                     cb_addr, ctypes.c_void_p(ctx)) == 0:
+            refs.append(ref)
+
+    def on_browse(_r, flags, ifi, err, name, typ, dom, _ctx):
+        if err or not flags & 0x2 or ifi != awdl:          # kDNSServiceFlagsAdd, AWDL only
+            return
+        ctx = len(found) + 1
+        found[ctx] = {"name": name.decode("utf-8", "replace")}
+        ref = ref_t()
+        if lib.DNSServiceResolve(ctypes.byref(ref), _DNSSD_FLAGS, awdl, name, typ, dom,
+                                 cb_resolve, ctypes.c_void_p(ctx)) == 0:
+            refs.append(ref)
+
+    cb_browse, cb_resolve, cb_addr = browse_t(on_browse), resolve_t(on_resolve), addr_t(on_addr)
+    keep += [cb_browse, cb_resolve, cb_addr]
+    browse = ref_t()
+    if lib.DNSServiceBrowse(ctypes.byref(browse), _DNSSD_FLAGS, 0, b"_ictrl._tcp", None,
+                            cb_browse, None) != 0:
+        raise SystemExit("DNSServiceBrowse failed")
+    refs.append(browse)
+    deadline = time.time() + wait
+    try:
+        while time.time() < deadline:
+            if want and any(want(d) for d in devices):
+                break
+            fds = {lib.DNSServiceRefSockFD(r): r for r in refs}
+            ready, _, _ = select.select(list(fds), [], [], max(0.0, min(0.25, deadline - time.time())))
+            for fd in ready:
+                lib.DNSServiceProcessResult(fds[fd])
+    finally:
+        for r in refs:
+            lib.DNSServiceRefDeallocate(r)
+    return sorted(devices, key=lambda d: d["name"].lower())
+
+
+def _nearby_cache(update: dict | None = None) -> dict:
+    try:
+        with open(NEARBY_CACHE) as fh:
+            cache = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        cache = {}
+    if update is not None:
+        cache.update(update)
+        os.makedirs(os.path.dirname(NEARBY_CACHE), exist_ok=True)
+        with open(NEARBY_CACHE, "w") as fh:
+            json.dump(cache, fh)
+    return cache
+
+
+def _matches(dev: dict, query: str) -> bool:
+    q = query.lower()
+    return dev["name"].lower() == q or (len(q) >= 4 and dev.get("id", "").startswith(q))
+
+
+def nearby_target(query: str, fresh: bool = False) -> tuple[str, str, str]:
+    """Resolve a nearby device by name or id prefix -> (store key, host, name)."""
+    if not fresh:
+        now = time.time()
+        for dev_id, ent in _nearby_cache().items():
+            if now - ent.get("ts", 0) < NEARBY_CACHE_TTL and _matches({"id": dev_id, **ent}, query):
+                return f"nearby:{dev_id}", ent["host"], ent["name"]
+    devices = nearby_scan(wait=6.0, want=lambda d: _matches(d, query))
+    hits = [d for d in devices if _matches(d, query)]
+    if not hits:
+        raise SystemExit(f"no nearby device matches {query!r} — run `scan`; "
+                         "is Nearby Discovery on (long-press the iCTRL notification)?")
+    if len({d["id"] for d in hits}) > 1:
+        raise SystemExit(f"{query!r} matches several devices; use the id: "
+                         + ", ".join(f"{d['name']} ({d['id'][:8]})" for d in hits))
+    dev = hits[0]
+    _nearby_cache({dev["id"]: {"name": dev["name"], "host": dev["host"], "ts": time.time()}})
+    return f"nearby:{dev['id']}", dev["host"], dev["name"]
+
+
+def nearby_call(query: str, method: str, params: dict | None, client_name: str) -> dict:
+    """Call a nearby device; pairs on first use (the user approves on the phone)
+    and re-resolves once if the cached address has gone stale."""
+    store, host, name = nearby_target(query)
+    if not load_token(store):
+        print(f"pairing with {name} — approve the prompt on the phone", file=sys.stderr)
+        rec = pair(host, client_name, plain=False, store_key=store)
+        rec["device_name"] = name
+        save_token(store, rec)
+    try:
+        return call(host, method, params, store_key=store)
+    except OSError:                       # includes URLError / timeouts
+        store, host, name = nearby_target(query, fresh=True)
+        return call(host, method, params, store_key=store)
+
+
+# --------------------------------------------------------------------- X25519
+#
+# RFC 7748 X25519, so pairing needs nothing beyond the standard library. Uses
+# `cryptography` when it is installed; otherwise a plain Montgomery ladder. The
+# private key is single-use (one per pairing), so the pure-Python fallback's
+# lack of constant-time arithmetic exposes nothing reusable.
+
+_X25519_BASE = (9).to_bytes(32, "little")
+
+
+def _x25519(scalar: bytes, u: bytes) -> bytes:
+    try:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import (
+            X25519PrivateKey, X25519PublicKey)
+        from cryptography.hazmat.primitives import serialization
+        priv = X25519PrivateKey.from_private_bytes(scalar)
+        if u == _X25519_BASE:
+            return priv.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+        return priv.exchange(X25519PublicKey.from_public_bytes(u))
+    except ImportError:
+        pass
+    p = 2**255 - 19
+    k = bytearray(scalar)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    k = int.from_bytes(k, "little")
+    x1 = int.from_bytes(u, "little") & ((1 << 255) - 1)
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in reversed(range(255)):
+        bit = (k >> t) & 1
+        swap ^= bit
+        if swap:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = bit
+        a, b = (x2 + z2) % p, (x2 - z2) % p
+        aa, bb = a * a % p, b * b % p
+        e = (aa - bb) % p
+        c, d = (x3 + z3) % p, (x3 - z3) % p
+        da, cb = d * a % p, c * b % p
+        x3 = (da + cb) ** 2 % p
+        z3 = x1 * (da - cb) ** 2 % p
+        x2 = aa * bb % p
+        z2 = e * (aa + 121665 * e) % p
+    if swap:
+        x2, z2 = x3, z3
+    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+
+
 # -------------------------------------------------------------------- pairing
 
-def pair(host: str, client_name: str, plain: bool, timeout: float = 90.0) -> dict:
+def pair(host: str, client_name: str, plain: bool, timeout: float = 90.0,
+         store_key: str | None = None) -> dict:
     """Pair with the device. BLOCKS until the user taps Allow on-screen."""
     url = f"http://{host}/pair"
     if plain:
@@ -155,18 +397,9 @@ def pair(host: str, client_name: str, plain: bool, timeout: float = 90.0) -> dic
             raise SystemExit(f"pair failed ({status}): {resp}")
         key = bytes.fromhex(resp["token"])
     else:
-        # X25519 via cryptography if available; the device wraps K against it.
-        try:
-            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-            from cryptography.hazmat.primitives import serialization
-        except ImportError:
-            raise SystemExit(
-                "LAN pairing needs `pip install cryptography`, or use --plain over "
-                "USB/localhost (iproxy 8200 8200).")
-        priv = X25519PrivateKey.generate()
-        pub = priv.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw)
+        # X25519; the device wraps K against our public key.
+        priv = secrets.token_bytes(32)
+        pub = _x25519(priv, _X25519_BASE)
         print(f"key fingerprint: {hashlib.sha256(pub).hexdigest()[:8]}  "
               "(verify it matches the on-device prompt)", file=sys.stderr)
         status, resp = _post(url, {
@@ -175,9 +408,8 @@ def pair(host: str, client_name: str, plain: bool, timeout: float = 90.0) -> dic
         }, timeout)
         if status != 200:
             raise SystemExit(f"pair failed ({status}): {resp}")
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
         device_pub = base64.b64decode(resp["pub"])
-        shared = priv.exchange(X25519PublicKey.from_public_bytes(device_pub))
+        shared = _x25519(priv, device_pub)
         k_wrap = _hmac(shared, LABEL_PAIR + pub + device_pub)
         pad = _hmac(k_wrap, LABEL_WRAP)
         key = bytes(a ^ b for a, b in zip(bytes.fromhex(resp["token_ct"]), pad))
@@ -188,18 +420,21 @@ def pair(host: str, client_name: str, plain: bool, timeout: float = 90.0) -> dic
         "client_name": client_name,
         "expires": resp.get("expires"),
     }
-    save_token(host, record)
+    save_token(store_key or host, record)
     return record
 
 
 # ------------------------------------------------------------------ transport
 
 def call(host: str, method: str, params: dict | None = None,
-         timeout: float = 60.0, rpc_id: int = 1) -> dict:
-    """One enveloped JSON-RPC call. Returns the decrypted response object."""
-    record = load_token(host)
+         timeout: float = 60.0, rpc_id: int = 1, store_key: str | None = None) -> dict:
+    """One enveloped JSON-RPC call. Returns the decrypted response object.
+
+    `store_key` names the key record when it differs from `host` (nearby
+    devices are keyed by device id; their address changes)."""
+    record = load_token(store_key or host)
     if not record:
-        raise SystemExit(f"no token for {host} — run `pair` first")
+        raise SystemExit(f"no token for {store_key or host} — run `pair` first")
     key = bytes.fromhex(record["key"])
     tok = record["tok"]
 
@@ -235,7 +470,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1:8200")
+    ap.add_argument("--nearby", metavar="NAME_OR_ID",
+                    help="reach a nearby device over peer-to-peer Wi-Fi (macOS) instead of --host")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sc = sub.add_parser("scan", help="list nearby devices (macOS)")
+    sc.add_argument("--wait", type=float, default=3.0, help="seconds to listen (default 3)")
 
     p = sub.add_parser("pair", help="pair with the device (blocks on approval)")
     p.add_argument("--name", default=os.uname().nodename)
@@ -256,6 +496,21 @@ def main() -> int:
     s.add_argument("--scale", type=float, default=2.0)
 
     args = ap.parse_args()
+    client_name = os.uname().nodename
+
+    def rpc(method: str, params: dict | None = None) -> dict:
+        if args.nearby:
+            return nearby_call(args.nearby, method, params, client_name)
+        return call(args.host, method, params)
+
+    if args.cmd == "scan":
+        devices = nearby_scan(wait=args.wait)
+        if not devices:
+            print("no nearby devices — turn on Nearby Discovery from the iCTRL notification")
+        for d in devices:
+            paired = "paired" if load_token(f"nearby:{d['id']}") else ""
+            print(f"{d['name']:32s} id={d['id'][:8]}  {paired}")
+        return 0
     if args.cmd == "list":
         hosts = list_hosts()
         if not hosts:
@@ -263,6 +518,12 @@ def main() -> int:
         for h, r in sorted(hosts.items()):
             name = r.get("device_name") or r.get("client_name", "")
             print(f"{h:24s} tok={r['tok']}  {name}")
+    elif args.cmd == "pair" and args.nearby:
+        store, host, name = nearby_target(args.nearby)
+        rec = pair(host, args.name, plain=False, store_key=store)
+        rec["device_name"] = name
+        save_token(store, rec)
+        print(f"paired — tok={rec['tok']} {name} (key cached in {STORE})")
     elif args.cmd == "pair":
         rec = pair(args.host, args.name, args.plain)
         # Stamp the device's own name alongside the key: hosts move with DHCP,
@@ -281,7 +542,7 @@ def main() -> int:
         if args.format == "jpeg":
             params["quality"] = args.quality
         t0 = time.time()
-        result = call(args.host, "screenshot", params).get("result", {})
+        result = rpc("screenshot", params).get("result", {})
         if "data" not in result:
             print(f"screenshot failed: {json.dumps(result, ensure_ascii=False)}")
             return 1
@@ -302,7 +563,7 @@ def main() -> int:
               f"{px_w}x{px_h}px  ->  {pt_w}x{pt_h}pt  (scale {sc}: tap_x = px/{sc}, tap_y = py/{sc})  "
               f"{(time.time() - t0) * 1000:.0f}ms end-to-end")
     else:
-        out = call(args.host, args.method, json.loads(args.params))
+        out = rpc(args.method, json.loads(args.params))
         print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0
 

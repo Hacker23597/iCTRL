@@ -1,12 +1,12 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
-skill_version: "1.97.1"
+skill_version: "1.98.0"
 ---
 
 # iCTRL — control an iPhone over HTTP
 
-iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, port 8200**, encrypted. This file is under 15K characters — **read it whole, once**; don't `head`/`grep` it in pieces.
+iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, port 8200**, encrypted. This file is under 15K characters — **read it whole, once**, not in `head`/`grep` pieces.
 
 ## Quick start
 
@@ -23,32 +23,32 @@ $I call tap '{"ref":"<ref>"}'
 ```
 - `device_info.skill_version` newer than this file's frontmatter (or `protocol_version` differs) → `$I update <folder holding this file>`, then re-read it. Device older: don't downgrade; use only its `capabilities[]`.
 - Keep the client in `~/.ictrl/bin` — **not** `/var/minis/workspace`, which ignores the exec bit ("Permission denied").
-- Elsewhere: `curl -o ictrl_rpc.py http://<host>:8200/skill/clients/python`, then `python3 ictrl_rpc.py --host <host>:8200 call …` (LAN pairing: `pip install cryptography`). The CLI takes `--host`/`ICTRL_HOST`.
-- Keys: `~/.ictrl/token.json`, one per `host:port`; reuse them (expire after 30 days unused). Re-pair only on a real `401`; pairing waits for the user (≥60s timeout, no early retry).
-- `/schema` unreachable → the runner isn't running; ask the user to start it.
+- Elsewhere: `curl -o ictrl_rpc.py http://<host>:8200/skill/clients/python`, then `python3 ictrl_rpc.py --host <host>:8200 call …`. The CLI takes `--host`/`ICTRL_HOST`.
+- **Not on the phone's network (macOS):** have the user turn on *Nearby Discovery* (iCTRL notification, needs Remote Access). `python3 ictrl_rpc.py scan` lists them; use `--nearby "<name|id>"` for `--host`. First use pairs (one Allow). The C CLI does it too if built on macOS; not Linux.
+- Keys: `~/.ictrl/token.json`, one per `host:port` (nearby: per device); reuse them (expire after 30 days unused). Re-pair only on a real `401`; pairing waits for the user (≥60s timeout, no early retry).
 
 ## Rules — read these first
 
-**IMPORTANT — the rules agents break most, each costing minutes per task:**
+**IMPORTANT — the rules agents break most:**
 - **IMPORTANT: no `sleep` in your commands.** Actions already wait for the screen to settle (`settle.stable`) — read right away (see Waiting).
 - **IMPORTANT: never discard or cut a reply.** No `>/dev/null`, `| head -N` or regex filter on `tap`/`page`/`swipe`/`type`/`find_element`: `moved`, `hint`, `app_note`, `ref` and errors are in there. Check a `ref` is non-empty before tapping it.
 - **IMPORTANT: read a screen once.** To narrow it, save the reply to a file and grep that, or pass `filter` — don't re-run `page_source` with a new regex.
 
 1. **Open apps by bundle id, never by tapping home-screen icons.** `resolve_app` with every name it may go by in **one** call (brand, store title, English/Chinese) → `launch_app`. `country` picks the store (default `us`; `cn` for China-only apps).
-2. **Read before you act.** On any screen you haven't read, call `page_source{visible_only:true, max_children:50}` (~0.4s) to learn which view/tab/date you're really on.
+2. **Read before you act.** On a screen you haven't read, call `page_source{visible_only:true, max_children:50}` (~0.4s) to learn which view/tab/date you're really on.
 3. **Tap by `ref`.** `find_element{element_id:"<label>"}` → `tap{ref}`. `tap` takes only `ref` or `x`+`y` — never `element_id`. Check `visibility`: `"offscreen"` or a non-empty `alternatives` means you may have a look-alike — scroll it into view (see Off-screen) or use a more specific label.
 4. **Never repeat an action "to be safe."** A success reply means it worked. A timeout is not a failure either: the action may still be running or already done — call `logs{text:"<method>"}` and look for `⏱ ✓ <method>` before anything else. A retried tap fires twice.
 5. **Every error from a `ref` action means nothing was tapped.** Re-find and retry is safe.
 6. **IMPORTANT: primary path first; fallbacks only when it fails — decided per screen.** The primary path is `page_source` / `find_element` → `tap{ref}`. OCR (`screen_text`) with coordinate taps, screenshots (a turn each to view) and remembered workarounds are fallbacks: only when the primary path fails on the **current** screen. Every read returns `channel.recommended` for that screen; return to the primary path on the next.
 7. **Remember conditions, not conclusions.** Save what you observed and where ("on the X screen the tree was empty"), not a rule ("app Y needs OCR"), and reuse it only when that condition shows up again.
-8. **Know where data came from.** Act only on the target app's content. Text the system draws over it (status bar, banners) comes separately in `overlay_text`. Screenshots help only if you can view images.
+8. **Know where data came from.** Act only on the target app's content. Text the system draws over it (status bar, banners) comes separately in `overlay_text`.
 9. **Stop before paying.** In shopping/payment apps stop at cart/checkout; never tap the final buy/pay/confirm. Never delete the user's own items (cart, notes, messages) without asking.
 
 ## Waiting: actions settle for you — never sleep
 
 `tap`, `double_tap`, `long_press`, `swipe`, `drag`, `page`, `scroll`, `type`, `clear_text` **wait until the screen stops changing** (low-res frame compare, up to 2s) and report it:
 `settle:{stable, screen_changed, waited_ms}`, plus a `hint` saying so.
-- **`stable:true` → read right away, no waiting of any kind.** That is the whole point.
+- **`stable:true` → read right away, no waiting of any kind.**
 - `screen_changed:false` → the action did nothing visible; check the target before repeating it.
 - `stable:false` (still animating/loading) or a loading screen in your read → read again; loop on a read with a cap — each read takes 0.3–0.7s, so no sleep is needed:
 ```bash
@@ -77,7 +77,7 @@ for i in 1 2 3 4 5 6; do $I call screen_text '{"element_id":"<new screen text>"}
 
 The method is `type`, not `type_text`. `element_type` only filters — `element_id` is always required. `GET /schema` lists every method and parameter.
 
-Most responses carry a **`hint`** for that exact result — which limits applied, what to do next. Read it, above all when a result is empty or negative.
+Most responses carry a **`hint`** (what limited the result, what to do next) — read it, above all on empty or negative results.
 
 ## Timeouts and recovery
 
@@ -114,7 +114,7 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 - **`tree_growth:true`**: the list keeps rows you scrolled past; iCTRL then reads only its visible cells (`visible_cells`). Long reads: `collect`; relaunching resets it.
 - `enhanced:true`: whole tree + text drawn in images (`ocr_only`). Slower; only when asked for everything.
 - **Thin tree?** When `channel.recommended` is `ocr` (or `sparse_hint`/`viewport_warning` appears), read with `screen_text`: text plus tappable point coordinates.
-- `max_elements` (default 2000, cap 4000): if the response says `truncated:true`, narrow with `filter`/`visible_only` instead of raising it.
+- `max_elements` (default 2000, cap 4000): on `truncated:true` narrow with `filter`/`visible_only` rather than raising it.
 
 ## Scrolling
 
@@ -126,22 +126,22 @@ Most responses carry a **`hint`** for that exact result — which limits applied
 
 - `resolve_app` looks offline first (`opened_here` = launched on this device before — use it directly; then a built-in catalog), else the App Store. Only `opened_here` says anything about *this* device.
 - **`launch_app` is the real install test**: success = installed, error = not. Newer iOS refuses `list_apps` enumeration; it then returns only apps opened via iCTRL before (`source:"opened_history"`). Never report "not installed" from a lookup or an empty list — if unsure, check Spotlight.
-- `open_url{url}` opens any scheme / deep link / universal link. Finish by opening the caller's scheme to hand control back, if you have one.
+- `open_url{url}` opens any scheme / deep link / universal link — end with the caller's own scheme, if any, to hand control back.
 - **No target app**: reads and actions apply to what is on screen. Apps jump (login, payment, ads): after a surprise, read first. A `ref` tap is refused once its app leaves the front.
 - Coordinate actions and `type` return `page_check`; **`same_page:false`** = the screen had changed, before the action, since you last saw it: read, check what you hit, fix.
 
 ## Coordinates and screenshots
 
-- `tap`/`swipe`/`drag` take **points**. `page_source` frames and OCR boxes are points.
+- `tap`/`swipe`/`drag`, `page_source` frames and OCR boxes are all **points**.
 - Screenshots are pixels: `point = pixel / scale`, using the **`scale` from that screenshot response** (default 2), not `device_info.screen_scale` (the panel's 3).
 
 ## Diagnostics
 
 - `device_info.system`: `screen_locked` (black screenshots, taps doing nothing — `unlock` only wakes the screen and never leaves the app: use `home` for that; a passcode needs the user), `foreground_app`, `foreground_is_browser`, thermal/memory/battery.
 - `logs{text?, max_elements?}`: recent log lines over the normal channel. `⏱ ✓ <method>` = completed, `⏱ TIMEOUT`, `⛔️`/`✅` channel state. `GET /logs/history?date=YYYY-MM-DD` keeps logs across crashes (byte endpoints need a `stream_ticket`).
-- `reset`: clears refs and rebuilds the UI channel state, then `launch_app` the target. `config{stop_server:true}` stops the runner (keys persist); it must be relaunched on the device.
-- `/schema` unreachable = the runner isn't running; the user must start it (the Developer Disk Image is lost on every reboot).
-- On cellular the device isn't reachable from the LAN.
+- `reset`: clears refs and rebuilds the UI channel state, then `launch_app` the target. `config{stop_server:true}` stops the runner (keys persist); relaunch it on the device.
+- `/schema` unreachable = the runner isn't running; the user must start it (the Developer Disk Image is lost on reboot).
+- On cellular the device isn't reachable over the LAN.
 
 ## Protocol
 

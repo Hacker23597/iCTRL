@@ -44,3 +44,22 @@ none) and fixes the mode on first use.
 
 Keys live in `~/.ictrl/token.json` — the same file and format the Python client
 uses, so the two are interchangeable.
+
+## Nearby devices (macOS)
+
+On a Mac the same source builds natively and gains nearby discovery: reaching a
+phone over Apple peer-to-peer Wi-Fi when the two are not on the same network.
+The phone must have *Nearby Discovery* turned on (long-press the iCTRL
+notification; it needs Remote Access).
+
+```sh
+cc -O2 -std=c11 -o ictrl main.c sha256.c x25519.c util.c nearby.c
+./ictrl scan                                  # nearby devices: name and id
+./ictrl --nearby "iPhone 15 (7f3a)" call device_info
+./ictrl --nearby 7f3a shot screen.jpg         # an id prefix works too
+```
+
+The first call to a device pairs with it (approve the prompt on the phone once).
+Its key is stored under the device id rather than an address, because the
+peer-to-peer address changes. `nearby.c` uses the system dns_sd API and is not
+part of the Linux build.

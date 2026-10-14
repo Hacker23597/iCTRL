@@ -10,6 +10,9 @@
 // HMAC-SHA256 only; X25519 appears solely in LAN pairing.
 
 #include "ictrl.h"
+#ifdef __APPLE__
+#include "nearby.h"
+#endif
 
 #include <errno.h>
 #include <stdarg.h>
@@ -31,6 +34,14 @@
 #define LABEL_ENC_RESP "ictrl-v1|enc-resp"
 #define LABEL_PAIR     "ictrl-pair"
 #define LABEL_WRAP     "ictrl-wrap"
+
+/// Key-store entry to use when it differs from the host: nearby devices are
+/// keyed by "nearby:<device id>" because their link-local address changes.
+static const char *g_store_key = NULL;
+/// Set while pairing implicitly before a call: progress goes to stderr so the
+/// call's JSON stays alone on stdout.
+static int g_pair_implicit = 0;
+#define STORE_KEY(hostport) (g_store_key ? g_store_key : (hostport))
 
 static void die(const char *fmt, ...) {
     va_list ap;
@@ -104,6 +115,14 @@ static int tcp_connect(const char *host, const char *port) {
     for (rp = res; rp; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
+#ifdef __APPLE__
+        // A zoned link-local peer (fe80::…%awdl0) is reachable only with the
+        // socket bound to that interface.
+        if (rp->ai_family == AF_INET6) {
+            unsigned int idx = ((struct sockaddr_in6 *)rp->ai_addr)->sin6_scope_id;
+            if (idx) setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof idx);
+        }
+#endif
         if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
         close(fd);
         fd = -1;
@@ -346,6 +365,15 @@ static void save_token(const char *host, const uint8_t key[32], const char *tok,
 // ── RPC ─────────────────────────────────────────────────────────────────────
 
 static void split_host(const char *hostport, char *host, size_t hn, char *port, size_t pn) {
+    if (hostport[0] == '[') {                 // [v6addr%zone]:port
+        const char *end = strchr(hostport, ']');
+        size_t hl = end ? (size_t)(end - hostport - 1) : strlen(hostport + 1);
+        if (hl >= hn) hl = hn - 1;
+        memcpy(host, hostport + 1, hl);
+        host[hl] = 0;
+        snprintf(port, pn, "%s", end && end[1] == ':' ? end + 2 : "8200");
+        return;
+    }
     const char *colon = strrchr(hostport, ':');
     if (colon && strchr(hostport, ':') == colon) {
         size_t hl = (size_t)(colon - hostport);
@@ -363,8 +391,8 @@ static void split_host(const char *hostport, char *host, size_t hn, char *port, 
 static int rpc_call(const char *hostport, const char *method, const char *params) {
     uint8_t key[32];
     char tok[9];
-    if (load_token(hostport, key, tok) != 0)
-        die("no key for %s — run: ictrl --host %s pair", hostport, hostport);
+    if (load_token(STORE_KEY(hostport), key, tok) != 0)
+        die("no key for %s — run: ictrl --host %s pair", STORE_KEY(hostport), hostport);
 
     char host[256], port[16];
     split_host(hostport, host, sizeof host, port, sizeof port);
@@ -546,8 +574,9 @@ static int do_pair(const char *hostport, const char *client_name) {
     char tok[9];
     hex_encode(kh, 4, tok);
 
-    save_token(hostport, key, tok, client_name);
-    printf("paired — tok=%s (key cached in ~/.ictrl/token.json)\n", tok);
+    save_token(STORE_KEY(hostport), key, tok, client_name);
+    fprintf(g_pair_implicit ? stderr : stdout,
+            "paired — tok=%s (key cached in ~/.ictrl/token.json)\n", tok);
     buf_free(&resp);
     return 0;
 }
@@ -559,8 +588,12 @@ static void usage(void) {
         "  ictrl [--host HOST:PORT] pair [--name NAME]   pair (tap Allow on the device)\n"
         "  ictrl [--host HOST:PORT] call METHOD [JSON]   one RPC call\n"
         "  ictrl [--host HOST:PORT] shot [FILE]          save a screenshot (JPEG)\n"
-        "  ictrl [--host HOST:PORT] skill               fetch the operating manual\n\n"
-        "Default host is 127.0.0.1:8200 (inside Minis this is the device itself).\n"
+        "  ictrl [--host HOST:PORT] skill               fetch the operating manual\n"
+#ifdef __APPLE__
+        "  ictrl scan                                    list nearby devices (peer-to-peer Wi-Fi)\n"
+        "  ictrl --nearby NAME|ID call|shot|pair ...     use a nearby device; pairs on first use\n"
+#endif
+        "\nDefault host is 127.0.0.1:8200 (inside Minis this is the device itself).\n"
         "Env: ICTRL_HOST overrides the default host.\n");
 }
 
@@ -675,14 +708,66 @@ int main(int argc, char **argv) {
     if (!hostport) hostport = "127.0.0.1:8200";
 
     int i = 1;
-    while (i < argc && !strncmp(argv[i], "--host", 6)) {
+    const char *nearby = NULL;
+    while (i < argc && (!strncmp(argv[i], "--host", 6) || !strcmp(argv[i], "--nearby"))) {
         if (i + 1 >= argc) { usage(); return 2; }
-        hostport = argv[i + 1];
+        if (!strcmp(argv[i], "--nearby")) nearby = argv[i + 1];
+        else hostport = argv[i + 1];
         i += 2;
     }
     if (i >= argc) { usage(); return 2; }
 
     const char *cmd = argv[i++];
+
+#ifdef __APPLE__
+    static nearby_device devs[NEARBY_MAX];
+    if (!strcmp(cmd, "scan")) {
+        int n = nearby_scan(devs, NEARBY_MAX, 3.0, NULL);
+        if (n == -1) die("no awdl0 interface — is Wi-Fi turned on?");
+        if (n < 0) die("nearby browse failed");
+        if (n == 0) printf("no nearby devices — turn on Nearby Discovery from the iCTRL notification\n");
+        for (int k = 0; k < n; k++) {
+            char store[96];
+            snprintf(store, sizeof store, "nearby:%s", devs[k].id);
+            uint8_t key[32];
+            char tok[9];
+            printf("%-32s id=%.8s  %s\n", devs[k].name, devs[k].id,
+                   load_token(store, key, tok) == 0 ? "paired" : "");
+        }
+        return 0;
+    }
+    static char nearby_store[96], nearby_host[128];
+    if (nearby) {
+        int n = nearby_scan(devs, NEARBY_MAX, 6.0, nearby);
+        if (n == -1) die("no awdl0 interface — is Wi-Fi turned on?");
+        const nearby_device *hit = NULL;
+        for (int k = 0; k < (n > 0 ? n : 0); k++) {
+            if (!nearby_matches(&devs[k], nearby)) continue;
+            if (hit && strcmp(hit->id, devs[k].id))
+                die("\"%s\" matches several devices; use the id", nearby);
+            hit = &devs[k];
+        }
+        if (!hit) die("no nearby device matches \"%s\" — run: ictrl scan", nearby);
+        snprintf(nearby_store, sizeof nearby_store, "nearby:%s", hit->id);
+        snprintf(nearby_host, sizeof nearby_host, "%s", hit->host);
+        g_store_key = nearby_store;
+        hostport = nearby_host;
+        // First use pairs (approve once on the phone); later runs reuse the key.
+        uint8_t key[32];
+        char tok[9];
+        if (strcmp(cmd, "pair") && load_token(g_store_key, key, tok) != 0) {
+            fprintf(stderr, "pairing with %s — approve the prompt on the phone\n", hit->name);
+            char name[256];
+            if (gethostname(name, sizeof name) != 0) snprintf(name, sizeof name, "ictrl");
+            g_pair_implicit = 1;
+            if (do_pair(hostport, name) != 0) return 1;
+            g_pair_implicit = 0;
+        }
+    }
+#else
+    if (nearby || !strcmp(cmd, "scan"))
+        die("nearby discovery needs macOS (Apple peer-to-peer Wi-Fi)");
+#endif
 
     if (!strcmp(cmd, "pair")) {
         const char *name = "minis";
