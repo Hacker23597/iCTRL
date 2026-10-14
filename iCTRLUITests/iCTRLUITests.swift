@@ -456,6 +456,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         keepRunning = true
         wireServerStateChange()
         observeNetworkChanges()
+        requestLocalNetworkAtLaunch()
 
         // When the app comes back to the foreground (e.g. the user opened it to
         // grant the Local Network permission), re-verify remote reachability — if
@@ -1162,7 +1163,14 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 guard let self = self, let srv = srv, self.server === srv else { return }
                 Self.logBuffer.append("📡 Nearby status: \(status.rawValue)")
                 self.postStatusNotification(detail: self.addressLines(port: srv.port), silent: true)
-                if status == .denied { self.requestLocalNetworkForNearby() }
+                if status == .denied {
+                    // Also catches access revoked while running; the re-check
+                    // it starts clears it again if that was something else.
+                    self.setLocalNetworkAccess("denied")
+                    self.requestLocalNetworkForNearby()
+                }
+                // Advertising at all proves the permission.
+                if status == .advertising { self.setLocalNetworkAccess("granted") }
             }
         }
         srv.onRPCRequest = { [weak self] method, params, completion in
@@ -1480,6 +1488,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 "enabled": .bool(nearbyEnabled),
                 "advertising": .bool(server?.isNearbyAdvertising ?? false),
                 "status": .string(nearbyEnabled ? (server?.nearbyStatus ?? .off).rawValue : "off"),
+                "local_network": .string(Self.localNetworkAccess),
                 "interface": NearbyAdvertiser.linkState().json,
                 "name": .string(NearbyIdentity.name),
                 "device_id": .string(NearbyIdentity.deviceID),
@@ -1557,6 +1566,87 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.triggerLocalNetworkPrompt()
         }
+    }
+
+    /// Local Network access as last observed: "granted", "denied" or
+    /// "unknown" (not answered yet / not observable). Reported by `config`.
+    private static var localNetworkAccess = "unknown"
+    private var launchBrowser: NWBrowser?
+
+    /// Ask for Local Network access while the runner is in front, right after
+    /// launch, instead of waiting for a feature to be refused in the
+    /// background — iOS shows the prompt only to the foreground app, and
+    /// LAN clients connecting in work without it, so nothing else surfaces
+    /// the gap. A short Bonjour browse for our own declared service type is
+    /// the reliable trigger, and its outcome tells us the answer: still ready
+    /// after a moment means granted, PolicyDenied means refused (iOS will not
+    /// ask again; the user must switch it on in Settings).
+    private func requestLocalNetworkAtLaunch() {
+        probeLocalNetwork(for: 60)
+    }
+
+    /// Browse briefly and record what it says about Local Network access.
+    /// `seconds`: how long to keep the browse (and so a prompt) open.
+    private func probeLocalNetwork(for seconds: TimeInterval) {
+        launchBrowser?.cancel()
+        let browser = NWBrowser(for: .bonjour(type: NearbyAdvertiser.serviceType, domain: "local."), using: .tcp)
+        launchBrowser = browser
+        // Whether THIS browse was refused; the stored state may still hold
+        // an earlier answer.
+        var refused = false
+        browser.stateUpdateHandler = { [weak self] state in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch state {
+                case .ready:
+                    // Ready comes first even when access is refused — the
+                    // refusal follows a moment later as a waiting state. So
+                    // only a browse still ready after a pause counts.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak browser] in
+                        guard let self = self, let browser = browser, !refused,
+                              case .ready = browser.state else { return }
+                        self.setLocalNetworkAccess("granted")
+                    }
+                case .waiting(let error), .failed(let error):
+                    if case .dns(let code) = error, code == DNSServiceErrorType(kDNSServiceErr_PolicyDenied) {
+                        refused = true
+                        self.setLocalNetworkAccess("denied")
+                    }
+                default:
+                    break
+                }
+            }
+        }
+        browser.start(queue: DispatchQueue(label: "com.openminis.ictrl.ln-browse"))
+        // Long enough for the user to answer the prompt; the browse itself
+        // has no other job.
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self, weak browser] in
+            guard let self = self, let browser = browser, self.launchBrowser === browser else { return }
+            browser.cancel()
+            self.launchBrowser = nil
+        }
+    }
+
+    /// While refused, look again every 30 s: access switched on in Settings
+    /// should clear the warning (and unblock nearby) without a relaunch.
+    private func scheduleLocalNetworkRecheck() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self = self, Self.localNetworkAccess == "denied" else { return }
+            self.probeLocalNetwork(for: 5)
+            self.scheduleLocalNetworkRecheck()
+        }
+    }
+
+    private func setLocalNetworkAccess(_ value: String) {
+        guard Self.localNetworkAccess != value else { return }
+        Self.localNetworkAccess = value
+        Self.logBuffer.append(value == "granted"
+            ? "🌐 Local Network access: granted"
+            : "🚫 Local Network access: denied — LAN clients can still connect in, but nearby discovery "
+              + "cannot advertise. Allow it in Settings › Privacy & Security › Local Network › iCTRLUITests-Runner")
+        // Granted just now (the prompt was answered): don't make a waiting
+        // nearby registration sit out its back-off.
+        if value == "granted" { server?.retryNearbyNow() } else { scheduleLocalNetworkRecheck() }
     }
 
     /// Set once nearby discovery has asked for Local Network access since it
