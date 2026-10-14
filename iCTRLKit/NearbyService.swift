@@ -166,6 +166,9 @@ final class NearbyAdvertiser {
     private let queue: DispatchQueue
     private let log: (String) -> Void
     private var ref: DNSServiceRef?
+    /// The awdl0 index `ref` was registered on. If the interface is rebuilt
+    /// under a new index the old registration is silently dead.
+    private var registeredIndex: UInt32 = 0
     private var lanRef: DNSServiceRef?
     private var lanRetryAt = Date.distantPast
     private var poll: DispatchSourceTimer?
@@ -292,6 +295,12 @@ final class NearbyAdvertiser {
             status = .needsWiFi
             return
         }
+        if ref != nil, link.index != registeredIndex {
+            log("📡 Nearby: \(Self.interfaceName) is now index \(link.index) (was \(registeredIndex)) — registering again")
+            deregister()
+            register(index: link.index)
+            return
+        }
         switch status {
         case .advertising, .starting:
             return
@@ -336,6 +345,7 @@ final class NearbyAdvertiser {
             return
         }
         ref = newRef
+        registeredIndex = index
         status = .starting
         log("📡 Nearby: registering \"\(name)\" on \(Self.interfaceName) (index \(index)), port \(port)")
     }

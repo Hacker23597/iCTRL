@@ -131,6 +131,7 @@ class JSONRPCServer {
         // Nearby teardown belongs on the server queue, where that state lives.
         // Hand over the objects rather than self: stop() also runs from deinit.
         let nearbyListener = self.nearbyListener, nearbyAdvertiser = self.nearbyAdvertiser
+        queue.async { [weak self] in self?.nearbyWanted = false }
         self.nearbyListener = nil
         self.nearbyAdvertiser = nil
         nearbyConnections.removeAll()
@@ -154,11 +155,35 @@ class JSONRPCServer {
     /// accept peer-to-peer connections only; anything arriving over another
     /// interface is refused. Not available while the server is local-only.
     func startNearby() {
-        queue.async { self.startNearbyOnQueue() }
+        queue.async {
+            self.nearbyWanted = true
+            self.nearbyRetryDelay = 5
+            self.startNearbyOnQueue()
+        }
     }
 
     func stopNearby() {
-        queue.async { self.stopNearbyOnQueue() }
+        queue.async {
+            self.nearbyWanted = false
+            self.stopNearbyOnQueue()
+        }
+    }
+
+    /// Nearby discovery should be running (on `queue`): a failed listener is
+    /// rebuilt while this holds, instead of leaving discovery dead until it
+    /// is switched off and on again.
+    private var nearbyWanted = false
+    /// Back-off for rebuilding a failed nearby listener; reset once it is ready.
+    private var nearbyRetryDelay: TimeInterval = 5
+
+    private func scheduleNearbyRebuild() {
+        let delay = nearbyRetryDelay
+        nearbyRetryDelay = min(nearbyRetryDelay * 2, 30)
+        log("📡 Nearby: rebuilding the listener in \(Int(delay))s")
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self, self.nearbyWanted, self.nearbyListener == nil else { return }
+            self.startNearbyOnQueue()
+        }
     }
 
     /// Re-advertise under the current `NearbyIdentity.name`.
@@ -198,6 +223,7 @@ class JSONRPCServer {
         guard let l = try? NWListener(using: params, on: nwPort) else {
             log("📡 Nearby: could not open port \(nearbyPort)")
             setNearbyStatus(.failed)
+            if nearbyWanted { scheduleNearbyRebuild() }
             return
         }
         l.stateUpdateHandler = { [weak self] state in
@@ -205,10 +231,16 @@ class JSONRPCServer {
             switch state {
             case .ready:
                 self.log("📡 Nearby listener ready on port \(self.nearbyPort) (peer-to-peer only)")
+                self.nearbyRetryDelay = 5
             case .failed(let error):
+                // Advertising a listener that is gone would only mislead
+                // clients: take both down, then rebuild while still wanted.
                 self.log("📡 Nearby listener failed: \(error)")
                 self.stopNearbyOnQueue()
                 self.setNearbyStatus(.failed)
+                if self.nearbyWanted { self.scheduleNearbyRebuild() }
+            case .waiting(let error):
+                self.log("📡 Nearby listener waiting: \(error)")
             default:
                 break
             }
