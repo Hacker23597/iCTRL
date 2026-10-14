@@ -84,6 +84,8 @@ enum L10n {
         case revokeOthersConfirm, disconnectThisApp, disconnectConfirmBody
         case noClients, pairedAt, lastActive, clientsFooter
         case liveLabel, pausedLabel, filterPlaceholder, noLogLines, copyButton, runnerLogsCaption, cancelButton
+        case viaLocal, viaLAN, viaNearby, viaVPN, viaCellular, viaOther
+        case visibilityLabel, visibilityLocal, visibilityLAN, visibilityLANNearby
     }
 
     // key → (lang → text). English is the required fallback for every key.
@@ -362,5 +364,15 @@ enum L10n {
                             .zhHans: "Runner 最近 500 行日志，停留在本页时每 2 秒刷新一次。",
                             .zhHant: "Runner 最近 500 行日誌，停留在本頁時每 2 秒重新整理一次。"],
         .cancelButton: [.en: "Cancel", .zhHans: "取消", .zhHant: "取消"],
+        .viaLocal: [.en: "This device / USB", .zhHans: "本机 / USB", .zhHant: "本機 / USB"],
+        .viaLAN: [.en: "LAN", .zhHans: "局域网", .zhHant: "區域網路"],
+        .viaNearby: [.en: "Nearby (AWDL)", .zhHans: "近场 (AWDL)", .zhHant: "近場 (AWDL)"],
+        .viaVPN: [.en: "VPN", .zhHans: "VPN", .zhHant: "VPN"],
+        .viaCellular: [.en: "Cellular", .zhHans: "蜂窝网络", .zhHant: "行動網路"],
+        .viaOther: [.en: "Other", .zhHans: "其他", .zhHant: "其他"],
+        .visibilityLabel: [.en: "Visibility", .zhHans: "可见性", .zhHant: "可見性"],
+        .visibilityLocal: [.en: "🟢 This device only · safe", .zhHans: "🟢 仅本机 · 安全", .zhHant: "🟢 僅本機 · 安全"],
+        .visibilityLAN: [.en: "🟡 LAN", .zhHans: "🟡 局域网", .zhHant: "🟡 區域網路"],
+        .visibilityLANNearby: [.en: "🟡 LAN + Nearby (AWDL)", .zhHans: "🟡 局域网 + 近场 (AWDL)", .zhHant: "🟡 區域網路 + 近場 (AWDL)"],
     ]
 }

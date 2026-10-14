@@ -12,6 +12,10 @@ final class RunnerAdmin: ObservableObject {
         let name: String
         let grantedAt: Date?
         let lastActiveAt: Date?
+        /// Where its last request came from; nil before it was recorded.
+        let lastAddress: String?
+        /// `PeerSource` raw value: local, lan, nearby, vpn, cellular, other.
+        let lastVia: String?
     }
 
     @Published private(set) var isPaired: Bool
@@ -19,6 +23,18 @@ final class RunnerAdmin: ObservableObject {
     /// Why the last operation failed, in the user's language; nil when fine.
     @Published private(set) var notice: String?
     @Published private(set) var clients: [Client] = []
+    /// Who can reach the runner right now, from its `config`; nil until known.
+    @Published private(set) var visibility: Visibility?
+
+    /// The runner's reach, widest first. Only local is safe from other devices.
+    enum Visibility: Equatable {
+        /// Loopback only: apps on this device and a computer over USB.
+        case local
+        /// Remote access on: anyone on the same network can try to pair.
+        case lan
+        /// Remote access on and advertised over AWDL to nearby Apple devices.
+        case lanAndNearby
+    }
     @Published private(set) var clientsLoaded = false
     @Published private(set) var logLines: [String] = []
     @Published private(set) var logsLoaded = false
@@ -59,6 +75,7 @@ final class RunnerAdmin: ObservableObject {
         do {
             let result = try await client.call("config")
             clients = Self.parseClients(result["sessions"])
+            visibility = Self.parseVisibility(result)
             clientsLoaded = true
             notice = nil
         } catch {
@@ -70,6 +87,7 @@ final class RunnerAdmin: ObservableObject {
         do {
             let result = try await client.call("config", ["revoke_session_id": id])
             clients = Self.parseClients(result["sessions"])
+            visibility = Self.parseVisibility(result)
             ictrlLog("Runner admin: revoked session \(id)")
         } catch {
             handle(error)
@@ -94,6 +112,7 @@ final class RunnerAdmin: ObservableObject {
         isPaired = false
         clients = []
         clientsLoaded = false
+        visibility = nil
         logLines = []
         logsLoaded = false
         ictrlLog("Runner admin: disconnected")
@@ -140,6 +159,15 @@ final class RunnerAdmin: ObservableObject {
 
     private static let iso = ISO8601DateFormatter()
 
+    /// Actual exposure, not the switches: nearby counts only while it is
+    /// really advertised (it can be on yet waiting for Wi-Fi).
+    private static func parseVisibility(_ config: [String: Any]) -> Visibility? {
+        guard let remote = config["allow_remote_access"] as? Bool else { return nil }
+        guard remote else { return .local }
+        let nearby = config["nearby"] as? [String: Any]
+        return (nearby?["advertising"] as? Bool) == true ? .lanAndNearby : .lan
+    }
+
     private static func parseClients(_ value: Any?) -> [Client] {
         let rows = value as? [[String: Any]] ?? []
         return rows.compactMap { row in
@@ -147,7 +175,9 @@ final class RunnerAdmin: ObservableObject {
             return Client(id: id,
                           name: row["client_name"] as? String ?? id,
                           grantedAt: (row["granted_at"] as? String).flatMap(iso.date(from:)),
-                          lastActiveAt: (row["last_active_at"] as? String).flatMap(iso.date(from:)))
+                          lastActiveAt: (row["last_active_at"] as? String).flatMap(iso.date(from:)),
+                          lastAddress: row["last_address"] as? String,
+                          lastVia: row["last_via"] as? String)
         }
         .sorted { ($0.lastActiveAt ?? .distantPast) > ($1.lastActiveAt ?? .distantPast) }
     }

@@ -43,6 +43,29 @@ private struct NoticeText: View {
     }
 }
 
+/// "Visibility: 🟢 This device only · safe" and the like.
+struct RunnerVisibilityRow: View {
+    let visibility: RunnerAdmin.Visibility
+
+    var body: some View {
+        HStack {
+            Text(L10n.t(.visibilityLabel))
+            Spacer()
+            Text(Self.text(visibility))
+                .foregroundColor(.secondary)
+        }
+    }
+
+    /// 🟢 only for loopback; anything another device can reach is 🟡.
+    static func text(_ visibility: RunnerAdmin.Visibility) -> String {
+        switch visibility {
+        case .local: return L10n.t(.visibilityLocal)
+        case .lan: return L10n.t(.visibilityLAN)
+        case .lanAndNearby: return L10n.t(.visibilityLANNearby)
+        }
+    }
+}
+
 // MARK: - Authorized clients
 
 /// Every client holding a key to the runner, with revocation.
@@ -55,6 +78,11 @@ struct RunnerClientsView: View {
     var body: some View {
         List {
             if admin.isPaired {
+                if let visibility = admin.visibility {
+                    Section {
+                        RunnerVisibilityRow(visibility: visibility)
+                    }
+                }
                 clientsSection
                 actionsSection
             } else {
@@ -194,11 +222,62 @@ private struct ClientRow: View {
                         .foregroundColor(.accentColor)
                 }
             }
+            if let via = client.lastVia {
+                HStack(spacing: 6) {
+                    HStack(spacing: 3) {
+                        Image(systemName: Self.sourceIcon(via))
+                        Text(Self.sourceName(via))
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(Self.sourceColor(via))
+                    // Loopback says nothing useful ("127.0.0.1"); the source does.
+                    if let address = client.lastAddress, via != PeerSource.local.rawValue {
+                        Text(address)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
             Text(subtitle)
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
         .padding(.vertical, 2)
+    }
+
+    private static func sourceName(_ via: String) -> String {
+        switch PeerSource(rawValue: via) {
+        case .local: return L10n.t(.viaLocal)
+        case .lan: return L10n.t(.viaLAN)
+        case .nearby: return L10n.t(.viaNearby)
+        case .vpn: return L10n.t(.viaVPN)
+        case .cellular: return L10n.t(.viaCellular)
+        case .other, nil: return L10n.t(.viaOther)
+        }
+    }
+
+    private static func sourceIcon(_ via: String) -> String {
+        switch PeerSource(rawValue: via) {
+        case .local: return "iphone"
+        case .lan: return "wifi"
+        case .nearby: return "dot.radiowaves.left.and.right"
+        case .vpn: return "lock.shield"
+        case .cellular: return "antenna.radiowaves.left.and.right"
+        case .other, nil: return "network"
+        }
+    }
+
+    private static func sourceColor(_ via: String) -> Color {
+        switch PeerSource(rawValue: via) {
+        case .local: return .secondary
+        case .lan: return .blue
+        case .nearby: return .purple
+        case .vpn: return .orange
+        default: return .secondary
+        }
     }
 
     private var subtitle: String {

@@ -304,6 +304,9 @@ struct SettingsView: View {
                         }
                     }
                 }
+                if let visibility = runnerAdmin.visibility {
+                    RunnerVisibilityRow(visibility: visibility)
+                }
                 NavigationLink {
                     RunnerClientsView()
                 } label: {
@@ -316,9 +319,16 @@ struct SettingsView: View {
                         }
                     }
                 }
-                // Show the count without opening the list (only once paired:
-                // pairing itself is never started from here).
-                .task { if runnerAdmin.isPaired { await runnerAdmin.loadClients() } }
+                // Count and visibility without opening the list, kept current
+                // while this screen is shown (remote access and nearby can be
+                // switched from the runner's notification at any time). Only
+                // once paired: pairing itself is never started from here.
+                .task(id: runnerAdmin.isPaired) {
+                    while !Task.isCancelled && runnerAdmin.isPaired {
+                        await runnerAdmin.loadClients()
+                        try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    }
+                }
                 NavigationLink {
                     RunnerLogsView()
                 } label: {
