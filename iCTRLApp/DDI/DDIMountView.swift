@@ -70,7 +70,13 @@ struct DDIMountView: View {
             }
             .onReceive(NotificationCenter.default.publisher(
                 for: UIApplication.didBecomeActiveNotification)) { _ in refreshVPNState() }
-            .onOpenURL { _ in refreshVPNState() }   // LocalDevVPN bounced us back
+            .onOpenURL { url in
+                if !url.isFileURL { refreshVPNState() }   // LocalDevVPN bounced us back
+            }
+            .onReceive(NotificationCenter.default.publisher(for: PairingFileStore.didImport)) { _ in
+                hasPairingFile = true
+                pairingError = nil
+            }
             // LocalDevVPN bounces back a fixed second after it starts
             // connecting, often before the tunnel is up: keep checking until it is.
             .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in

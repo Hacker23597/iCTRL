@@ -69,7 +69,7 @@ enum L10n {
         case startLocalDevVPN, tunnelUpDetail, vpnInstalledDetail, vpnMissingDetail
         case openVPNAndConnect, getVPNFromAppStore, tunnelDetectedFooter, cannotStartVPNFooter
         case importPairingFile, choosePairingFile, replacePairingFile, removePairingFile
-        case pairingHint, pairingImported
+        case pairingHint, pairingImported, pairingReceivedTitle, pairingReceivedBody, pairingRejectedTitle
         case ddiComponentTitle, ddiDownloadHint, ddiDownloaded, downloadImageFiles, ddiSourceFooter
         case mountButton, mountedOK, mountFailed, mountNotPersistentFooter, firstMountNetworkFooter
         case finishStepsFirst, vpnNotConnected, vpnNotInstalled, noPairingFile, imagesNotDownloaded
@@ -266,10 +266,15 @@ enum L10n {
         .choosePairingFile: [.en: "Choose pairing file…", .zhHans: "选择配对文件…", .zhHant: "選擇配對檔案…"],
         .replacePairingFile: [.en: "Replace pairing file…", .zhHans: "更换配对文件…", .zhHant: "更換配對檔案…"],
         .removePairingFile: [.en: "Remove pairing file", .zhHans: "删除配对文件", .zhHant: "刪除配對檔案"],
-        .pairingHint: [.en: "Export it from iLoader on this device — no Mac needed. Otherwise generate it on a Mac with `idevicepair pair` and send it here (AirDrop, Files, iCloud).",
-                       .zhHans: "可直接用本机的 iLoader 导出，无需 Mac。也可以在 Mac 上用 `idevicepair pair` 生成后传过来（隔空投送、文件、iCloud）。",
-                       .zhHant: "可直接用本機的 iLoader 匯出，無需 Mac。也可以在 Mac 上用 `idevicepair pair` 產生後傳過來（AirDrop、檔案、iCloud）。"],
+        .pairingHint: [.en: "Export it from iLoader on this device — no Mac needed. Otherwise generate it on a Mac with `idevicepair pair` and send it here (AirDrop, Files, iCloud). If the picker can't reach the file, share it to iCTRL from the app that has it.",
+                       .zhHans: "可直接用本机的 iLoader 导出，无需 Mac。也可以在 Mac 上用 `idevicepair pair` 生成后传过来（隔空投送、文件、iCloud）。如果选择器找不到文件，可在文件所在的 App 里直接“分享”到 iCTRL。",
+                       .zhHant: "可直接用本機的 iLoader 匯出，無需 Mac。也可以在 Mac 上用 `idevicepair pair` 產生後傳過來（AirDrop、檔案、iCloud）。如果選擇器找不到檔案，可在檔案所在的 App 裡直接「分享」到 iCTRL。"],
         .pairingImported: [.en: "Imported", .zhHans: "已导入", .zhHant: "已匯入"],
+        .pairingReceivedTitle: [.en: "Pairing File Received", .zhHans: "已接收配对文件", .zhHant: "已接收配對檔案"],
+        .pairingReceivedBody: [.en: "“%@” has been stored. You can mount the Developer Disk Image now.",
+                               .zhHans: "已保存“%@”，现在可以挂载开发者磁盘镜像。",
+                               .zhHant: "已儲存「%@」，現在可以掛載開發者磁碟映像。"],
+        .pairingRejectedTitle: [.en: "Not a Usable Pairing File", .zhHans: "不是可用的配对文件", .zhHant: "不是可用的配對檔案"],
 
         .ddiComponentTitle: [.en: "Developer Disk Image", .zhHans: "开发者磁盘镜像", .zhHant: "開發者磁碟映像"],
         .ddiDownloadHint: [.en: "About 100 MB up to iOS 26.3, about 17 MB from iOS 26.4. Downloaded once and reused — only the mount has to be repeated after a reboot.",
