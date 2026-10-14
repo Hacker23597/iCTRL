@@ -51,8 +51,8 @@ class LogBuffer {
         self.capacity = capacity
     }
 
-    /// Record one action's execution time (ms) and log it.
-    func recordTiming(method: String, ms: Double, ok: Bool) {
+    /// Record one action's execution time (ms) and, unless `quiet`, log it.
+    func recordTiming(method: String, ms: Double, ok: Bool, quiet: Bool = false) {
         lock.lock()
         var s = stats[method] ?? Stat()
         s.count += 1
@@ -62,6 +62,8 @@ class LogBuffer {
         stats[method] = s
         lock.unlock()
 
+        // A failure is always worth a line, even for a quiet call.
+        guard !quiet || !ok else { return }
         let marker = ok ? "✓" : "✗"
         append(String(format: "⏱ %@ %@ %.0fms", marker, method, ms))
     }

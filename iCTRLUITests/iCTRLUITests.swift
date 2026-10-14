@@ -1188,6 +1188,11 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             // available while the serial UI queue is wedged.
             let isUIMethod = !Self.nonUIMethods.contains(method)
             let queue = isUIMethod ? self.rpcQueue : self.nonUIQueue
+            // Read-only polls (a log viewer pulling `logs`, a client list
+            // re-reading `config`) would otherwise fill the very log being
+            // read with their own request lines. They still count in timing
+            // stats, and a failure is still logged.
+            let quiet = method == "logs" || method == "recent_logs" || (method == "config" && (params ?? [:]).isEmpty)
 
             // Circuit breaker: once the UI channel has hung repeatedly, stop
             // adding to the backlog. Each queued call would wait out the stuck
@@ -1219,7 +1224,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 // call crashes/hangs the persisted log shows exactly what was
                 // invoked (e.g. which element tap_element targeted). Redaction in
                 // the log layer masks sensitive values.
-                Self.logBuffer.append("→ \(method) \(Self.summarizeParams(params))")
+                if !quiet { Self.logBuffer.append("→ \(method) \(Self.summarizeParams(params))") }
 
                 // XCUITest UI interactions (tap/swipe/type/…) MUST run on the main
                 // thread — calling them off-main throws an ObjC NSException that,
@@ -1254,7 +1259,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 }
 
                 let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000
-                Self.logBuffer.recordTiming(method: method, ms: ms, ok: result.1 == nil)
+                Self.logBuffer.recordTiming(method: method, ms: ms, ok: result.1 == nil, quiet: quiet)
                 // Completing at all proves the UI channel is alive, even if the
                 // action itself failed (element not found is a healthy answer).
                 if isUIMethod { self.setUIInFlight(nil); self.noteUISuccess() }
