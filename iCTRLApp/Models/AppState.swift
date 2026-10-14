@@ -116,9 +116,16 @@ class AppState: ObservableObject {
 }
 
 extension AppState: AuthManagerDelegate {
-    func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String, completion: @escaping (Bool) -> Void) {
+    func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String, nearby: Bool,
+                     completion: @escaping (Bool) -> Void) {
         DispatchQueue.main.async {
             self.pendingAuthRequest = PendingAuth(clientName: clientName, completion: completion)
+        }
+    }
+
+    func authManager(_ manager: AuthManager, didExpireAuthRequest clientName: String) {
+        DispatchQueue.main.async {
+            if self.pendingAuthRequest?.clientName == clientName { self.pendingAuthRequest = nil }
         }
     }
 }

@@ -8,6 +8,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private var app: XCUIApplication!
     private var actionHandler: ActionHandler?
     private var pendingAuthCompletions: [String: (Bool) -> Void] = [:]
+    /// Notification id of the pairing request awaiting an answer (at most one).
+    private var currentAuthRequestID: String?
     private let authLock = NSLock()
     /// Live per-connection video streamers, retained while streaming.
     private var videoStreamers: Set<VideoStreamer> = []
@@ -19,9 +21,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
     static let serverReadyCategoryID = "SERVER_READY"
     static let serverRemoteCategoryID = "SERVER_REMOTE"
+    static let serverNearbyCategoryID = "SERVER_NEARBY"
     static let serverStoppedCategoryID = "SERVER_STOPPED"
     static let enableRemoteActionID = "ENABLE_REMOTE"
     static let disableRemoteActionID = "DISABLE_REMOTE"
+    static let enableNearbyActionID = "ENABLE_NEARBY"
+    static let disableNearbyActionID = "DISABLE_NEARBY"
     static let stopServerActionID = "STOP_SERVER"
     static let copyLogsActionID = "COPY_LOGS"
 
@@ -40,6 +45,15 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         get { UserDefaults.standard.bool(forKey: allowRemoteAccessKey) }
         set { UserDefaults.standard.set(newValue, forKey: allowRemoteAccessKey) }
     }
+
+    /// Nearby discovery (peer-to-peer advertising). Only meaningful while
+    /// remote access is on; turning remote access off turns it off too.
+    static let nearbyDiscoveryKey = "nearbyDiscovery"
+    private static var persistedNearby: Bool {
+        get { UserDefaults.standard.bool(forKey: nearbyDiscoveryKey) }
+        set { UserDefaults.standard.set(newValue, forKey: nearbyDiscoveryKey) }
+    }
+    private var nearbyEnabled = false
 
     /// Persisted listen port. Absent key → 8200.
     private static var persistedPort: UInt16 {
@@ -389,8 +403,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         let port = Self.persistedPort
         server = JSONRPCServer(port: port, localOnly: !remoteAccessEnabled)
 
-        // Wire up auth: send notification instead of auto-approve
-        AuthManager.shared.setAutoApprove(false)
+        // Pairing is approved from a notification on the device.
         AuthManager.shared.delegate = self
 
         // Dev convenience: ICTRL_ALLOW_AUTH_ONCE=1 (set in the Xcode scheme's
@@ -423,16 +436,14 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         do {
             try server?.start()
             if remoteAccessEnabled {
+                nearbyEnabled = Self.persistedNearby
+                if nearbyEnabled { server?.startNearby() }
                 let address = getDeviceAddress()
                 announceRemoteReady(address: address)
             } else {
+                Self.persistedNearby = false
                 Self.logBuffer.append("🔒 Server started on 127.0.0.1:8200 (local only)")
-                sendNotification(
-                    title: L10n.t(.serverReadyTitle),
-                    body: L10n.t(.localOnlyBody) + "\n" + L10n.t(.longPressRemoteOrStop),
-                    category: Self.serverReadyCategoryID,
-                    identifier: Self.serverReadyNotifID
-                )
+                postStatusNotification(detail: L10n.t(.localOnlyBody))
             }
         } catch {
             Self.logBuffer.append("🔴 Failed to start server: \(error)")
@@ -788,9 +799,27 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             title: L10n.t(.disableRemote),
             options: [.authenticationRequired]
         )
+        let enableNearbyAction = UNNotificationAction(
+            identifier: Self.enableNearbyActionID,
+            title: L10n.t(.enableNearby),
+            options: [.authenticationRequired]
+        )
+        let disableNearbyAction = UNNotificationAction(
+            identifier: Self.disableNearbyActionID,
+            title: L10n.t(.disableNearby),
+            options: [.authenticationRequired]
+        )
+        // Remote access on, nearby off: offer to turn nearby on.
         let serverRemoteCategory = UNNotificationCategory(
             identifier: Self.serverRemoteCategoryID,
-            actions: [disableRemoteAction, stopServerAction],
+            actions: [disableRemoteAction, enableNearbyAction, stopServerAction],
+            intentIdentifiers: [],
+            options: []
+        )
+        // Remote access and nearby on.
+        let serverNearbyCategory = UNNotificationCategory(
+            identifier: Self.serverNearbyCategoryID,
+            actions: [disableRemoteAction, disableNearbyAction, stopServerAction],
             intentIdentifiers: [],
             options: []
         )
@@ -808,7 +837,15 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             options: []
         )
 
-        center.setNotificationCategories([authCategory, serverReadyCategory, serverRemoteCategory, serverStoppedCategory])
+        center.setNotificationCategories([authCategory, serverReadyCategory, serverRemoteCategory,
+                                          serverNearbyCategory, serverStoppedCategory])
+
+        // Whatever a previous run left in Notification Centre is stale: pairing
+        // prompts can no longer be answered (their requests died with that
+        // process) and old status entries offer menus for a state that no
+        // longer holds. This run posts its own status right after starting.
+        center.removeAllDeliveredNotifications()
+        center.removeAllPendingNotificationRequests()
 
         // Request permission
         let semaphore = DispatchSemaphore(value: 0)
@@ -854,6 +891,20 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             return
         }
 
+        // Handle "Enable / Disable Nearby Discovery"
+        if actionID == Self.enableNearbyActionID {
+            Self.logBuffer.append("📡 Nearby discovery enabled via notification")
+            setNearby(true)
+            completionHandler()
+            return
+        }
+        if actionID == Self.disableNearbyActionID {
+            Self.logBuffer.append("📴 Nearby discovery disabled via notification")
+            setNearby(false)
+            completionHandler()
+            return
+        }
+
         // Handle "Enable Remote Access" from server-ready notification
         if actionID == Self.enableRemoteActionID {
             Self.logBuffer.append("🌐 Remote access enabled via notification")
@@ -871,6 +922,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
         authLock.lock()
         let authCompletion = pendingAuthCompletions.removeValue(forKey: requestID)
+        if currentAuthRequestID == requestID { currentAuthRequestID = nil }
         authLock.unlock()
 
         switch actionID {
@@ -1102,6 +1154,15 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
     /// Wire RPC dispatch + public logs onto a server instance.
     private func configureServerCallbacks(_ srv: JSONRPCServer) {
+        // Advertising can start late (awdl0 appears once Wi-Fi is on), so the
+        // status notification follows the advertiser rather than the toggle.
+        srv.onNearbyStateChange = { [weak self, weak srv] advertising in
+            DispatchQueue.main.async {
+                guard let self = self, let srv = srv, self.server === srv else { return }
+                Self.logBuffer.append(advertising ? "📡 Nearby: advertising on" : "📡 Nearby: advertising off")
+                self.postStatusNotification(detail: self.addressLines(port: srv.port), silent: true)
+            }
+        }
         srv.onRPCRequest = { [weak self] method, params, completion in
             guard let self = self else {
                 completion(nil, .internalError)
@@ -1326,9 +1387,27 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             if remote != remoteAccessEnabled {
                 remoteAccessEnabled = remote
                 Self.persistedRemoteAccess = remote
+                if !remote {             // nearby needs remote access
+                    nearbyEnabled = false
+                    Self.persistedNearby = false
+                }
                 restartNeeded = true
             }
         }
+
+        // Name advertised to nearby clients; "" restores the default.
+        var nameError: JSONRPCError?
+        if let newName = params?["device_name"]?.stringValue {
+            if let applied = NearbyIdentity.setName(newName) {
+                Self.logBuffer.append("📡 Nearby name set to \"\(applied)\"")
+                server?.refreshNearbyName()
+            } else {
+                nameError = JSONRPCError(code: -32602,
+                                         message: "device_name must be at most \(NearbyIdentity.maxNameBytes) bytes of UTF-8",
+                                         data: nil)
+            }
+        }
+        if let nameError { return (nil, nameError) }
 
         if let portValue = params?["listen_port"]?.intValue {
             guard portValue > 0, portValue <= 65535 else {
@@ -1348,7 +1427,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             wireNewServer(newServer)
             do {
                 try newServer.start()
+                if remoteAccessEnabled && nearbyEnabled { newServer.startNearby() }
                 Self.logBuffer.append("⚙️ Config applied, server restarted on port \(newPort)")
+                let detail = remoteAccessEnabled ? addressLines(port: newPort) : L10n.t(.localOnlyBody)
+                DispatchQueue.main.async { self.postStatusNotification(detail: detail) }
             } catch {
                 Self.logBuffer.append("🔴 Config restart failed: \(error)")
                 return (nil, .serverError("Failed to restart server with new config: \(error.localizedDescription)"))
@@ -1379,6 +1461,13 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             "address": .string("\(address):\(newPort)"),
             "restarted": .bool(restartNeeded),
             "device_name": .string(UIDevice.current.name),
+            "nearby": .object([
+                "enabled": .bool(nearbyEnabled),
+                "advertising": .bool(server?.isNearbyAdvertising ?? false),
+                "name": .string(NearbyIdentity.name),
+                "device_id": .string(NearbyIdentity.deviceID),
+                "port": .int(Int(server?.nearbyPort ?? newPort + 1)),
+            ]),
             "active_sessions": .int(sessions.count),
             "sessions": .array(sessionList),
             "cleared_sessions": .int(clearedSessions),
@@ -1559,14 +1648,56 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         let addr = remoteAccessEnabled ? getDeviceAddress() : "127.0.0.1"
         let mins = Int(ProcessInfo.processInfo.systemUptime - Self.serverStartedAt) / 60
         let human = mins < 60 ? "\(mins)m" : "\(mins / 60)h\(mins % 60)m"
-        sendNotification(
-            title: L10n.t(.serverReadyTitle),
-            body: "\(addr):\(server?.port ?? 8200) · \(sessions) client\(sessions == 1 ? "" : "s") · up \(human)"
-                + "\n" + L10n.t(.longPressRemoteOrStop),
-            category: Self.serverReadyCategoryID,
-            identifier: Self.serverReadyNotifID,
+        postStatusNotification(
+            detail: "\(addr):\(server?.port ?? 8200) · \(sessions) client\(sessions == 1 ? "" : "s") · up \(human)",
             silent: true
         )
+    }
+
+    // MARK: - Status notification
+
+    /// The one reachability marker that applies right now. Mutually exclusive:
+    /// nearby implies LAN, LAN implies local, and the strongest one is shown.
+    private var statusMarker: String {
+        guard remoteAccessEnabled else { return L10n.t(.statusLocal) }
+        return (server?.isNearbyAdvertising ?? false) ? L10n.t(.statusNearby) : L10n.t(.statusLAN)
+    }
+
+    /// Category, and so the long-press menu, for the current state.
+    private var statusCategory: String {
+        guard remoteAccessEnabled else { return Self.serverReadyCategoryID }
+        return nearbyEnabled ? Self.serverNearbyCategoryID : Self.serverRemoteCategoryID
+    }
+
+    /// Post (or replace) the status notification: marker line, detail, menu hint.
+    /// While advertised nearby, the name nearby clients see is listed too.
+    private func postStatusNotification(title: String = L10n.t(.serverReadyTitle), detail: String,
+                                        silent: Bool = false) {
+        var lines = [statusMarker]
+        if remoteAccessEnabled, server?.isNearbyAdvertising ?? false {
+            lines.append("“\(NearbyIdentity.name)”")
+        }
+        lines.append(detail)
+        lines.append(L10n.t(remoteAccessEnabled ? .longPressNearbyOrStop : .longPressRemoteOrStop))
+        sendNotification(title: title, body: lines.joined(separator: "\n"), category: statusCategory,
+                         identifier: Self.serverReadyNotifID, silent: silent)
+    }
+
+    /// Turn nearby discovery on or off. Only possible while remote access is on.
+    private func setNearby(_ on: Bool) {
+        guard remoteAccessEnabled || !on else {
+            Self.logBuffer.append("📡 Nearby discovery needs remote access — ignored")
+            return
+        }
+        nearbyEnabled = on
+        Self.persistedNearby = on
+        if on { server?.startNearby() } else { server?.stopNearby() }
+        // Advertising normally confirms within a moment; the state callback
+        // posts again when it does. Refresh now so the menu flips immediately.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self else { return }
+            self.postStatusNotification(detail: self.addressLines(port: self.server?.port ?? 8200))
+        }
     }
 
     /// Remove the "Remote Access Failed" notification (pending + already-delivered).
@@ -1613,12 +1744,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             // Clear any stale failure notice from a previous Wi-Fi session.
             reportedRemoteFailure = false
             clearRemoteFailedNotification()
-            sendNotification(
-                title: L10n.t(.serverReadyTitle),
-                body: addressLines(port: server?.port ?? 8200) + " — "
-                      + L10n.t(.onDeviceOnlySuffix) + "\n" + L10n.t(.longPressDisableOrStop),
-                category: Self.serverRemoteCategoryID,
-                identifier: Self.serverReadyNotifID
+            postStatusNotification(
+                detail: addressLines(port: server?.port ?? 8200) + " — " + L10n.t(.onDeviceOnlySuffix)
             )
         }
     }
@@ -1626,9 +1753,11 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private func disableRemoteAccess() {
         guard remoteAccessEnabled else { return }
         server?.onStateChange = nil
-        server?.stop()
+        server?.stop()                      // also closes the nearby listener
         remoteAccessEnabled = false
         Self.persistedRemoteAccess = false  // remember for next launch
+        nearbyEnabled = false               // nearby needs remote access
+        Self.persistedNearby = false
 
         let newServer = JSONRPCServer(port: 8200, localOnly: true)
         wireNewServer(newServer)
@@ -1636,21 +1765,16 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         do {
             try newServer.start()
             Self.logBuffer.append("🔒 Remote access disabled, local only")
-            sendNotification(
-                title: L10n.t(.remoteDisabledTitle),
-                body: L10n.t(.remoteDisabledBody) + "\n" + L10n.t(.longPressRemoteOrStop),
-                category: Self.serverReadyCategoryID,
-                identifier: Self.serverReadyNotifID
-            )
+            postStatusNotification(title: L10n.t(.remoteDisabledTitle), detail: L10n.t(.remoteDisabledBody))
         } catch {
             Self.logBuffer.append("🔴 Failed to disable remote access: \(error)")
         }
     }
 
-    private func sendAuthNotification(clientName: String, requestID: String) {
+    private func sendAuthNotification(clientName: String, requestID: String, nearby: Bool) {
         let content = UNMutableNotificationContent()
         content.title = L10n.t(.authRequestTitle)
-        content.body = String(format: L10n.t(.authRequestBody), clientName)
+        content.body = String(format: L10n.t(nearby ? .authRequestNearbyBody : .authRequestBody), clientName)
         content.sound = .default
         content.categoryIdentifier = Self.authCategoryID
 
@@ -1807,12 +1931,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 self.selfWokeForCurrentOutage = false
                 self.clearRemoteFailedNotification()
                 if announceSuccess || recovering {
-                    self.sendNotification(
-                        title: L10n.t(.serverReadyTitle),
-                        body: self.addressLines(port: portNum) + "\n"
-                              + L10n.t(.longPressDisableOrStop),
-                        category: Self.serverRemoteCategoryID
-                    )
+                    self.postStatusNotification(detail: self.addressLines(port: portNum))
                 }
             } else {
                 Self.logBuffer.append("🔴 Remote reachability FAILED on \(address):\(portNum) — likely Local Network permission")
@@ -1864,15 +1983,30 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 // MARK: - AuthManagerDelegate
 
 extension iCTRLUITests: AuthManagerDelegate {
-    func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String, completion: @escaping (Bool) -> Void) {
+    func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String, nearby: Bool,
+                     completion: @escaping (Bool) -> Void) {
         let requestID = "auth-\(UUID().uuidString)"
 
         authLock.lock()
         pendingAuthCompletions[requestID] = completion
+        currentAuthRequestID = requestID
         authLock.unlock()
 
-        Self.logBuffer.append("🔐 Auth request from \"\(clientName)\"")
-        sendAuthNotification(clientName: clientName, requestID: requestID)
+        Self.logBuffer.append("🔐 Auth request from \"\(clientName)\"\(nearby ? " (nearby device)" : "")")
+        sendAuthNotification(clientName: clientName, requestID: requestID, nearby: nearby)
+    }
+
+    func authManager(_ manager: AuthManager, didExpireAuthRequest clientName: String) {
+        authLock.lock()
+        let requestID = currentAuthRequestID
+        currentAuthRequestID = nil
+        if let requestID { pendingAuthCompletions.removeValue(forKey: requestID) }
+        authLock.unlock()
+        Self.logBuffer.append("⌛ Auth request from \"\(clientName)\" expired without an answer")
+        guard let requestID else { return }
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [requestID])
+        center.removeDeliveredNotifications(withIdentifiers: [requestID])
     }
 }
 

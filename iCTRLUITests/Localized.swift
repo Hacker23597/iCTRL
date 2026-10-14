@@ -38,11 +38,15 @@ enum L10n {
         case serverReadyTitle, serverFailedTitle, serverStoppedTitle
         case remoteDisabledTitle, remoteFailedTitle, enableLocalNetworkTitle
         case authRequestTitle
-        case localOnlyBody, longPressRemoteOrStop, longPressDisableOrStop
+        case localOnlyBody, longPressRemoteOrStop
         case longPressCopyLogs, serverStoppedBody
         case remoteFailedBody, remoteDisabledBody
         case authRequestBody       // %@ = client name
+        case authRequestNearbyBody // %@ = client name; the request came over peer-to-peer Wi-Fi
         case onDeviceOnlySuffix
+        // Reachability marker shown on the status notification (one of three).
+        case statusNearby, statusLAN, statusLocal
+        case enableNearby, disableNearby, longPressNearbyOrStop
 
         // ── Host app UI ──
         //
@@ -111,8 +115,6 @@ enum L10n {
                          .ko: "127.0.0.1:8200 에서 실행 중(로컬 전용)", .es: "En ejecución en 127.0.0.1:8200 (solo local)", .de: "Läuft auf 127.0.0.1:8200 (nur lokal)", .ru: "Работает на 127.0.0.1:8200 (только локально)"],
         .longPressRemoteOrStop: [.en: "Long press for Remote Access or Stop Server", .zhHans: "长按可开启远程访问或停止服务", .zhHant: "長按可開啟遠端存取或停止服務", .ja: "長押しでリモート有効化／サーバー停止",
                                  .ko: "길게 눌러 원격 접속 또는 서버 중지", .es: "Mantén pulsado para acceso remoto o detener servidor", .de: "Lang drücken für Fernzugriff oder Server stoppen", .ru: "Удерживайте для удалённого доступа или остановки сервера"],
-        .longPressDisableOrStop: [.en: "Long press to Disable Remote or Stop Server", .zhHans: "长按可关闭远程访问或停止服务", .zhHant: "長按可關閉遠端存取或停止服務", .ja: "長押しでリモート無効化／サーバー停止",
-                                  .ko: "길게 눌러 원격 접속 끄기 또는 서버 중지", .es: "Mantén pulsado para desactivar remoto o detener servidor", .de: "Lang drücken zum Deaktivieren oder Server stoppen", .ru: "Удерживайте для отключения удалённого доступа или остановки"],
         .longPressCopyLogs: [.en: "Long press to Copy Logs", .zhHans: "长按可复制日志", .zhHant: "長按可複製日誌", .ja: "長押しでログをコピー",
                              .ko: "길게 눌러 로그 복사", .es: "Mantén pulsado para copiar registros", .de: "Lang drücken zum Kopieren der Logs", .ru: "Удерживайте, чтобы скопировать логи"],
         .serverStoppedBody: [.en: "The automation server has stopped.", .zhHans: "自动化服务已停止。", .zhHant: "自動化服務已停止。", .ja: "オートメーションサーバーが停止しました。",
@@ -135,6 +137,30 @@ enum L10n {
                            .es: "\"%@\" quiere controlar este dispositivo.\nMantén pulsado para permitir o denegar",
                            .de: "„%@“ möchte dieses Gerät steuern.\nLang drücken zum Zulassen oder Ablehnen",
                            .ru: "«%@» хочет управлять этим устройством.\nУдерживайте, чтобы разрешить или отклонить"],
+        .authRequestNearbyBody: [.en: "\"%@\" (nearby device) wants to control this device.\nLong press to Allow or Deny",
+                                 .zhHans: "“%@”（附近设备）请求控制此设备。\n长按以允许或拒绝",
+                                 .zhHant: "「%@」（附近裝置）請求控制此裝置。\n長按以允許或拒絕",
+                                 .ja: "「%@」（近くのデバイス）がこのデバイスの操作を要求しています。\n長押しで許可または拒否",
+                                 .ko: "\"%@\"(근처 기기)이(가) 이 기기의 제어를 요청합니다.\n길게 눌러 허용 또는 거부",
+                                 .es: "\"%@\" (dispositivo cercano) quiere controlar este dispositivo.\nMantén pulsado para permitir o denegar",
+                                 .de: "„%@“ (Gerät in der Nähe) möchte dieses Gerät steuern.\nLang drücken zum Zulassen oder Ablehnen",
+                                 .ru: "«%@» (устройство поблизости) хочет управлять этим устройством.\nУдерживайте, чтобы разрешить или отклонить"],
+        .statusNearby: [.en: "📡 Nearby discoverable", .zhHans: "📡 附近可发现", .zhHant: "📡 附近可發現", .ja: "📡 近くから検出可能",
+                        .ko: "📡 근처에서 검색 가능", .es: "📡 Visible cerca", .de: "📡 In der Nähe sichtbar", .ru: "📡 Виден поблизости"],
+        .statusLAN: [.en: "🌐 LAN reachable", .zhHans: "🌐 局域网可访问", .zhHant: "🌐 區域網路可存取", .ja: "🌐 LAN から接続可能",
+                     .ko: "🌐 LAN 접속 가능", .es: "🌐 Accesible en la LAN", .de: "🌐 Im LAN erreichbar", .ru: "🌐 Доступен в LAN"],
+        .statusLocal: [.en: "🔒 This device only", .zhHans: "🔒 仅本机", .zhHant: "🔒 僅本機", .ja: "🔒 この端末のみ",
+                       .ko: "🔒 이 기기만", .es: "🔒 Solo este dispositivo", .de: "🔒 Nur dieses Gerät", .ru: "🔒 Только это устройство"],
+        .enableNearby: [.en: "📡 Enable Nearby Discovery", .zhHans: "📡 开启近场发现", .zhHant: "📡 開啟近場探索", .ja: "📡 近距離検出を有効化",
+                        .ko: "📡 근거리 검색 켜기", .es: "📡 Activar detección cercana", .de: "📡 Nahbereichserkennung ein", .ru: "📡 Включить обнаружение поблизости"],
+        .disableNearby: [.en: "📴 Disable Nearby Discovery", .zhHans: "📴 关闭近场发现", .zhHant: "📴 關閉近場探索", .ja: "📴 近距離検出を無効化",
+                         .ko: "📴 근거리 검색 끄기", .es: "📴 Desactivar detección cercana", .de: "📴 Nahbereichserkennung aus", .ru: "📴 Выключить обнаружение поблизости"],
+        .longPressNearbyOrStop: [.en: "Long press for Nearby Discovery, Remote Access or Stop Server",
+                                 .zhHans: "长按可设置近场发现、远程访问或停止服务", .zhHant: "長按可設定近場探索、遠端存取或停止服務",
+                                 .ja: "長押しで近距離検出・リモート・サーバー停止", .ko: "길게 눌러 근거리 검색, 원격 접속 또는 서버 중지",
+                                 .es: "Mantén pulsado para detección cercana, acceso remoto o detener servidor",
+                                 .de: "Lang drücken für Nahbereich, Fernzugriff oder Server stoppen",
+                                 .ru: "Удерживайте для обнаружения поблизости, удалённого доступа или остановки"],
         .onDeviceOnlySuffix: [.en: "reachable on-device only; connect over Wi-Fi for LAN access",
                               .zhHans: "仅本机可访问;请连接 Wi-Fi 以支持局域网访问",
                               .zhHant: "僅本機可存取;請連接 Wi-Fi 以支援區域網路存取",

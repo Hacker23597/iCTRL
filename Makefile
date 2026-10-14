@@ -138,6 +138,13 @@ ipa: build
 	/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLName string com.openminis.ictrl" "$$PLIST"; \
 	/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "$$PLIST"; \
 	/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string ictrl" "$$PLIST"
+	@echo "📡 Declaring the nearby Bonjour service type..."
+	@# Advertising _ictrl._tcp (nearby discovery) fails with NoAuth unless the
+	@# app declares the type. Only the nearby listener depends on it.
+	@PLIST="$(BUILD_DIR)/$(RUNNER_APP)/Info.plist"; \
+	/usr/libexec/PlistBuddy -c "Delete :NSBonjourServices" "$$PLIST" 2>/dev/null || true; \
+	/usr/libexec/PlistBuddy -c "Add :NSBonjourServices array" "$$PLIST"; \
+	/usr/libexec/PlistBuddy -c "Add :NSBonjourServices:0 string _ictrl._tcp" "$$PLIST"
 	@echo "🏷  Aligning .xctest bundle id with the Runner..."
 	@# Rewrite the embedded .xctest CFBundleIdentifier to match the Runner app id,
 	@# so the plugin and its host share one identifier. Done BEFORE the re-sign so

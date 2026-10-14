@@ -8,6 +8,16 @@ class JSONRPCServer {
     /// Connections handed off to a long-lived streamer (video) — the base receive
     /// loop must not cancel these.
     private var handedOff: Set<ObjectIdentifier> = []
+    /// Connections accepted by the nearby (peer-to-peer) listener.
+    private var nearbyConnections: Set<ObjectIdentifier> = []
+    private var nearbyListener: NWListener?
+    private var nearbyAdvertiser: NearbyAdvertiser?
+    /// Port of the nearby listener: one above the main port.
+    var nearbyPort: UInt16 { port &+ 1 }
+    /// True while the nearby service is advertised over AWDL.
+    var isNearbyAdvertising: Bool { nearbyAdvertiser?.isAdvertising ?? false }
+    /// Called (on the server queue) when nearby advertising starts or stops.
+    var onNearbyStateChange: ((Bool) -> Void)?
     let port: UInt16
     private let localOnly: Bool
     private let queue = DispatchQueue(label: "com.openminis.ictrl.server")
@@ -93,7 +103,16 @@ class JSONRPCServer {
         }
 
         listener.newConnectionHandler = { [weak self] conn in
-            self?.handleConnection(conn)
+            guard let self = self else { return }
+            // Peer-to-peer peers belong to the nearby listener, which is only
+            // open while the user has turned nearby discovery on. Without this
+            // check, any AWDL link the device happens to have would reach 8200.
+            if Self.isPeerToPeer(conn) {
+                self.log("🚫 Refused \(conn.endpoint) on port \(self.port): peer-to-peer connections use the nearby listener")
+                conn.cancel()
+                return
+            }
+            self.handleConnection(conn)
         }
 
         listener.start(queue: queue)
@@ -102,12 +121,98 @@ class JSONRPCServer {
 
     func stop() {
         log("🔻 JSONRPCServer.stop called")
+        stopNearbyOnQueue()
         connections.forEach { $0.cancel() }
         connections.removeAll()
         listener?.cancel()
         listener = nil
         isRunning = false
         log("🔴 iCTRL server stopped")
+    }
+
+    // MARK: - Nearby (peer-to-peer) listener
+
+    /// Open the nearby listener and advertise it over AWDL.
+    ///
+    /// A separate listener so it can be switched on and off on its own and
+    /// accept peer-to-peer connections only; anything arriving over another
+    /// interface is refused. Not available while the server is local-only.
+    func startNearby() {
+        queue.async { self.startNearbyOnQueue() }
+    }
+
+    func stopNearby() {
+        queue.async { self.stopNearbyOnQueue() }
+    }
+
+    /// Re-advertise under the current `NearbyIdentity.name`.
+    func refreshNearbyName() {
+        nearbyAdvertiser?.refreshName()
+    }
+
+    private func startNearbyOnQueue() {
+        guard !localOnly, nearbyListener == nil, let nwPort = NWEndpoint.Port(rawValue: nearbyPort) else { return }
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        params.includePeerToPeer = true
+        guard let l = try? NWListener(using: params, on: nwPort) else {
+            log("📡 Nearby: could not open port \(nearbyPort)")
+            return
+        }
+        l.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                self.log("📡 Nearby listener ready on port \(self.nearbyPort) (peer-to-peer only)")
+            case .failed(let error):
+                self.log("📡 Nearby listener failed: \(error)")
+                self.stopNearbyOnQueue()
+            default:
+                break
+            }
+        }
+        l.newConnectionHandler = { [weak self] conn in
+            guard let self = self else { return }
+            guard Self.isPeerToPeer(conn) else {
+                self.log("🚫 Refused \(conn.endpoint) on nearby port \(self.nearbyPort): not a peer-to-peer connection")
+                conn.cancel()
+                return
+            }
+            self.log("📡 Nearby connection from \(conn.endpoint)")
+            self.nearbyConnections.insert(ObjectIdentifier(conn))
+            self.handleConnection(conn)
+        }
+        l.start(queue: queue)
+        nearbyListener = l
+
+        let advertiser = NearbyAdvertiser(port: nearbyPort, queue: queue) { [weak self] in self?.log($0) }
+        advertiser.onChange = { [weak self] on in self?.onNearbyStateChange?(on) }
+        nearbyAdvertiser = advertiser
+        advertiser.start()
+    }
+
+    private func stopNearbyOnQueue() {
+        guard nearbyListener != nil || nearbyAdvertiser != nil else { return }
+        nearbyAdvertiser?.stop()
+        nearbyAdvertiser = nil
+        nearbyListener?.cancel()
+        nearbyListener = nil
+        for conn in connections where nearbyConnections.contains(ObjectIdentifier(conn)) { conn.cancel() }
+        nearbyConnections.removeAll()
+        log("📡 Nearby discovery stopped")
+    }
+
+    /// Whether a connection arrived over peer-to-peer Wi-Fi (AWDL / low-latency
+    /// WLAN). Those peers always use IPv6 link-local addresses scoped to the
+    /// interface, so the endpoint alone answers it — no newer path API needed.
+    private static func isPeerToPeer(_ connection: NWConnection) -> Bool {
+        guard case let .hostPort(host, _) = connection.endpoint, case let .ipv6(addr) = host,
+              let name = addr.interface?.name else { return false }
+        return name.hasPrefix("awdl") || name.hasPrefix("llw")
+    }
+
+    private func isNearby(_ connection: NWConnection) -> Bool {
+        nearbyConnections.contains(ObjectIdentifier(connection))
     }
 
     // MARK: - Connection Handling
@@ -315,7 +420,8 @@ class JSONRPCServer {
             handleLogs(connection: connection)
 
         case ("POST", "/pair"):
-            handlePair(body: body, connection: connection, isLoopback: isLoopback(connection))
+            handlePair(body: body, connection: connection, isLoopback: isLoopback(connection),
+                       nearby: isNearby(connection))
 
         case ("POST", "/rpc"):
             handleRPC(headers: headers, body: body, connection: connection)
@@ -525,7 +631,7 @@ class JSONRPCServer {
     ///     an ephemeral device key, so it is safe over the LAN.
     ///
     /// Blocks until the user taps Allow (or the alert times out).
-    private func handlePair(body: Data?, connection: NWConnection, isLoopback: Bool) {
+    private func handlePair(body: Data?, connection: NWConnection, isLoopback: Bool, nearby: Bool) {
         guard let body = body,
               let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
               let clientName = obj["client_name"] as? String, !clientName.isEmpty else {
@@ -551,11 +657,30 @@ class JSONRPCServer {
             return
         }
 
-        AuthManager.shared.requestAuth(clientName: clientName) { [weak self] session in
+        AuthManager.shared.requestAuth(clientName: clientName, nearby: nearby) { [weak self] outcome in
             guard let self = self else { return }
-            guard let session = session, let key = session.key else {
+            let session: AuthSession
+            switch outcome {
+            case .approved(let s):
+                session = s
+            case .denied:
                 self.sendPairError(connection, status: 403, code: "pair_denied",
                                    message: "User rejected or approval timed out")
+                return
+            case .busy(let retryAfter):
+                self.sendPairError(connection, status: 429, code: "pair_busy",
+                                   message: "Another pairing request is waiting for approval on the device",
+                                   retryAfter: retryAfter)
+                return
+            case .coolingDown(let retryAfter):
+                self.sendPairError(connection, status: 429, code: "pair_cooldown",
+                                   message: "A pairing request was just refused; try again in \(retryAfter)s",
+                                   retryAfter: retryAfter)
+                return
+            }
+            guard let key = session.key else {
+                self.sendPairError(connection, status: 500, code: "internal",
+                                   message: "Session has no key")
                 return
             }
 
@@ -598,13 +723,18 @@ class JSONRPCServer {
         }
     }
 
-    private func sendPairError(_ connection: NWConnection, status: Int, code: String, message: String) {
-        let payload: [String: Any] = [
-            "error": ["code": code, "message": message,
-                      "server_ts": Int(Date().timeIntervalSince1970)],
-        ]
-        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
-        sendHTTPResponse(connection: connection, status: status, contentType: "application/json",
+    private func sendPairError(_ connection: NWConnection, status: Int, code: String, message: String,
+                               retryAfter: Int? = nil) {
+        var error: [String: Any] = ["code": code, "message": message,
+                                    "server_ts": Int(Date().timeIntervalSince1970)]
+        var headers: [String: String] = [:]
+        if let retryAfter {
+            error["retry_after"] = retryAfter
+            headers["Retry-After"] = String(retryAfter)
+        }
+        let data = (try? JSONSerialization.data(withJSONObject: ["error": error])) ?? Data("{}".utf8)
+        sendHTTPResponse(connection: connection, status: status, headers: headers,
+                         contentType: "application/json",
                          body: String(data: data, encoding: .utf8) ?? "{}")
     }
 
@@ -887,6 +1017,7 @@ class JSONRPCServer {
         case 401: statusText = "Unauthorized"
         case 403: statusText = "Forbidden"
         case 404: statusText = "Not Found"
+        case 429: statusText = "Too Many Requests"
         case 500: statusText = "Internal Server Error"
         default: statusText = "Unknown"
         }
@@ -914,6 +1045,7 @@ class JSONRPCServer {
 
     private func removeConnection(_ connection: NWConnection) {
         connections.removeAll { $0 === connection }
+        nearbyConnections.remove(ObjectIdentifier(connection))
     }
 
     deinit {

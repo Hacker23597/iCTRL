@@ -2,7 +2,25 @@ import CryptoKit
 import Foundation
 
 protocol AuthManagerDelegate: AnyObject {
-    func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String, completion: @escaping (Bool) -> Void)
+    /// Ask the user to approve a pairing. `nearby` is true when the request
+    /// arrived over peer-to-peer Wi-Fi, so the prompt can say so. Call
+    /// `completion` exactly once; a request left unanswered is refused after
+    /// `AuthManager.approvalTimeout` regardless.
+    func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String,
+                     nearby: Bool, completion: @escaping (Bool) -> Void)
+    /// The request timed out before the user answered; withdraw its prompt.
+    func authManager(_ manager: AuthManager, didExpireAuthRequest clientName: String)
+}
+
+/// Outcome of a pairing request.
+enum PairOutcome {
+    case approved(AuthSession)
+    /// The user declined, or did not answer in time.
+    case denied
+    /// Another request is already waiting for the user.
+    case busy(retryAfter: Int)
+    /// A request was just refused; new ones are held off for a while.
+    case coolingDown(retryAfter: Int)
 }
 
 /// Pairing + encrypted-envelope authentication (protocol v1).
@@ -27,8 +45,11 @@ class AuthManager {
     /// (see `seenNonces`), so this only needs to exceed the number of requests
     /// one client can make inside the timestamp window.
     private static let nonceCapacityPerSession = 20_000
-    /// Re-pair from the same client within this window skips the approval alert.
-    private static let trustTTL: TimeInterval = 600
+    /// How long a pairing request waits for the user before it is refused.
+    static let approvalTimeout: TimeInterval = 60
+    /// After a request is refused or times out, new requests are turned away
+    /// for this long, so a client cannot keep the approval prompt on screen.
+    static let pairCooldown: TimeInterval = 15
     /// How often a sliding `lastActiveAt` is flushed to disk.
     private static let persistUseInterval: TimeInterval = 3600
     /// Stream tickets are single-use and die quickly.
@@ -38,9 +59,11 @@ class AuthManager {
 
     private var sessions: [String: AuthSession] = [:]
     private let lock = NSLock()
-    private var autoApprove = false
     /// One-shot pairing bypass (see `armSingleAutoApproval`). Never persisted.
     private var autoApproveOnce = false
+    /// Pairing state: at most one request waits for the user at a time.
+    private var pairPending = false
+    private var pairCooldownUntil = Date.distantPast
 
     /// Replay cache, per session: nonce -> the request timestamp it arrived with.
     ///
@@ -54,7 +77,6 @@ class AuthManager {
     /// keystream.
     private var seenNonces: [String: [String: Int]] = [:]
     private var lastPersistedUse: [String: Date] = [:]
-    private var trustWindow: [String: Date] = [:]
     /// ticket -> (session id, expiry). Consumed on first use.
     private var streamTickets: [String: (sessionId: String, expires: Date)] = [:]
 
@@ -68,10 +90,6 @@ class AuthManager {
         lock.lock()
         defer { lock.unlock() }
         return Array(sessions.values).sorted { $0.grantedAt > $1.grantedAt }
-    }
-
-    func setAutoApprove(_ enabled: Bool) {
-        autoApprove = enabled
     }
 
     /// Arm a ONE-SHOT auto-approval for the next pairing request.
@@ -102,27 +120,70 @@ class AuthManager {
     // MARK: - Pairing
 
     /// Ask the user to approve a new client, then mint a 32-byte key.
-    /// Auto-approves if the same client paired within the trust window.
-    func requestAuth(clientName: String, completion: @escaping (AuthSession?) -> Void) {
+    ///
+    /// Every pairing needs the user's tap on the device; a client that already
+    /// holds a key never pairs again, so nothing is lost by not remembering
+    /// earlier approvals. (A name-based shortcut would be worse than useless:
+    /// `clientName` is whatever the requester claims.) The only exception is
+    /// the developer's one-shot `ICTRL_ALLOW_AUTH_ONCE`, and never for a
+    /// request from a nearby device.
+    ///
+    /// One request may wait for the user at a time, and a refused or expired
+    /// request holds off new ones for `pairCooldown`.
+    func requestAuth(clientName: String, nearby: Bool, completion: @escaping (PairOutcome) -> Void) {
         lock.lock()
-        let trusted = trustWindow[clientName].map { Date().timeIntervalSince($0) < Self.trustTTL } ?? false
+        let now = Date()
+        if pairPending {
+            lock.unlock()
+            completion(.busy(retryAfter: Int(Self.approvalTimeout)))
+            return
+        }
+        if now < pairCooldownUntil {
+            let wait = Int(pairCooldownUntil.timeIntervalSince(now).rounded(.up))
+            lock.unlock()
+            completion(.coolingDown(retryAfter: max(wait, 1)))
+            return
+        }
+        pairPending = true
         lock.unlock()
 
-        if autoApprove || trusted || takeSingleAutoApproval() {
-            completion(createSession(clientName: clientName))
+        if !nearby && takeSingleAutoApproval() {
+            finishPairing(clientName: clientName, approved: true, completion: completion)
             return
         }
         guard let delegate = delegate else {
-            completion(createSession(clientName: clientName))
+            // Nobody to ask means nobody approved.
+            finishPairing(clientName: clientName, approved: false, completion: completion)
             return
         }
-        delegate.authManager(self, didReceiveAuthRequest: clientName) { [weak self] approved in
-            guard approved, let self = self else {
-                completion(nil)
-                return
-            }
-            completion(self.createSession(clientName: clientName))
+
+        // Exactly one of: the user's answer, or the timeout.
+        let answered = NSLock()
+        var done = false
+        let claim: () -> Bool = {
+            answered.lock(); defer { answered.unlock() }
+            if done { return false }
+            done = true
+            return true
         }
+        delegate.authManager(self, didReceiveAuthRequest: clientName, nearby: nearby) { [weak self] approved in
+            guard let self = self, claim() else { return }
+            self.finishPairing(clientName: clientName, approved: approved, completion: completion)
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + Self.approvalTimeout) { [weak self] in
+            guard let self = self, claim() else { return }
+            self.delegate?.authManager(self, didExpireAuthRequest: clientName)
+            self.finishPairing(clientName: clientName, approved: false, completion: completion)
+        }
+    }
+
+    private func finishPairing(clientName: String, approved: Bool, completion: (PairOutcome) -> Void) {
+        let session = approved ? createSession(clientName: clientName) : nil
+        lock.lock()
+        pairPending = false
+        if session == nil { pairCooldownUntil = Date().addingTimeInterval(Self.pairCooldown) }
+        lock.unlock()
+        completion(session.map { .approved($0) } ?? .denied)
     }
 
     private func createSession(clientName: String) -> AuthSession? {
@@ -137,7 +198,6 @@ class AuthManager {
         )
         lock.lock()
         sessions[session.id] = session
-        trustWindow[clientName] = now
         lock.unlock()
         persist()
         return session
@@ -268,7 +328,6 @@ class AuthManager {
         lock.lock()
         sessions.removeAll()
         seenNonces.removeAll()
-        trustWindow.removeAll()
         streamTickets.removeAll()
         lock.unlock()
         persist()

@@ -24,9 +24,10 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "listen_port", type: "number", required: false, description: "TCP port to listen on (1..65535, default 8200)"),
                 RPCParamDef(name: "revoke_session_id", type: "string", required: false, description: "session_id of a single authorization to revoke"),
                 RPCParamDef(name: "clear_sessions", type: "boolean", required: false, description: "true = revoke all authorized tokens immediately"),
+                RPCParamDef(name: "device_name", type: "string", required: false, description: "Name advertised to nearby (peer-to-peer) clients, at most 63 bytes; \"\" restores the default (model plus a short device id)"),
                 RPCParamDef(name: "stop_server", type: "boolean", required: false, description: "true = stop the service (stops listening ~1s after replying). Re-launch the runner to restart; tokens persist."),
             ],
-            returns: "{allow_remote_access, listen_port, address, restarted, device_name, active_sessions, sessions:[{session_id, client_name, tok, granted_at, last_active_at, expires_at}], cleared_sessions}"
+            returns: "{allow_remote_access, listen_port, address, restarted, device_name, nearby:{enabled, advertising, name, device_id, port}, active_sessions, sessions:[{session_id, client_name, tok, granted_at, last_active_at, expires_at}], cleared_sessions}"
         ),
         RPCMethodDef(
             name: "stream_ticket",
@@ -373,7 +374,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.97.1"
+    static let serverVersion = "1.98.0"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///
@@ -415,6 +416,7 @@ struct RPCMethodRegistry {
         "system_metrics",      // device_info.system — thermal/cpu/memory/disk/battery/screen_locked/foreground_app
         "screen_text",         // Vision OCR fallback when the AX tree has no on-screen rows
         "cli_binary",          // GET /skill/clients/cli — static aarch64-musl client
+        "nearby_discovery",    // Bonjour over peer-to-peer Wi-Fi (AWDL) on port+1, when turned on
     ]
 
     static func generateSchemaDocument() -> [String: Any] {
