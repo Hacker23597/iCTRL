@@ -6,10 +6,12 @@ protocol AuthManagerDelegate: AnyObject {
     /// arrived over peer-to-peer Wi-Fi, so the prompt can say so. Call
     /// `completion` exactly once; a request left unanswered is refused after
     /// `AuthManager.approvalTimeout` regardless.
+    ///
+    /// `requestID` names this request; a later expiry carries the same id.
     func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String,
-                     nearby: Bool, completion: @escaping (Bool) -> Void)
+                     requestID: String, nearby: Bool, completion: @escaping (Bool) -> Void)
     /// The request timed out before the user answered; withdraw its prompt.
-    func authManager(_ manager: AuthManager, didExpireAuthRequest clientName: String)
+    func authManager(_ manager: AuthManager, didExpireAuthRequest clientName: String, requestID: String)
 }
 
 /// Outcome of a pairing request.
@@ -62,8 +64,14 @@ class AuthManager {
     /// One-shot pairing bypass (see `armSingleAutoApproval`). Never persisted.
     private var autoApproveOnce = false
     /// Pairing state: at most one request waits for the user at a time.
-    private var pairPending = false
-    private var pairCooldownUntil = Date.distantPast
+    /// Pairing slots, one for requests from this device (loopback: the
+    /// iCTRL app, USB) and one for everyone else, so a remote caller holding
+    /// or exhausting its slot cannot lock out pairing from the device itself.
+    private struct PairSlot {
+        var pending = false
+        var cooldownUntil = Date.distantPast
+    }
+    private var pairSlots: [Bool: PairSlot] = [:]   // key: local
 
     /// Replay cache, per session: nonce -> the request timestamp it arrived with.
     ///
@@ -130,32 +138,38 @@ class AuthManager {
     ///
     /// One request may wait for the user at a time, and a refused or expired
     /// request holds off new ones for `pairCooldown`.
-    func requestAuth(clientName: String, nearby: Bool, completion: @escaping (PairOutcome) -> Void) {
+    /// `local`: the request came over loopback (this device or USB); it has
+    /// its own slot, see `pairSlots`.
+    func requestAuth(clientName: String, nearby: Bool, local: Bool = false,
+                     completion: @escaping (PairOutcome) -> Void) {
         lock.lock()
         let now = Date()
-        if pairPending {
+        var slot = pairSlots[local] ?? PairSlot()
+        if slot.pending {
             lock.unlock()
             completion(.busy(retryAfter: Int(Self.approvalTimeout)))
             return
         }
-        if now < pairCooldownUntil {
-            let wait = Int(pairCooldownUntil.timeIntervalSince(now).rounded(.up))
+        if now < slot.cooldownUntil {
+            let wait = Int(slot.cooldownUntil.timeIntervalSince(now).rounded(.up))
             lock.unlock()
             completion(.coolingDown(retryAfter: max(wait, 1)))
             return
         }
-        pairPending = true
+        slot.pending = true
+        pairSlots[local] = slot
         lock.unlock()
 
         if !nearby && takeSingleAutoApproval() {
-            finishPairing(clientName: clientName, approved: true, completion: completion)
+            finishPairing(clientName: clientName, approved: true, local: local, completion: completion)
             return
         }
         guard let delegate = delegate else {
             // Nobody to ask means nobody approved.
-            finishPairing(clientName: clientName, approved: false, completion: completion)
+            finishPairing(clientName: clientName, approved: false, local: local, completion: completion)
             return
         }
+        let requestID = "auth-\(UUID().uuidString)"
 
         // Exactly one of: the user's answer, or the timeout.
         let answered = NSLock()
@@ -166,22 +180,26 @@ class AuthManager {
             done = true
             return true
         }
-        delegate.authManager(self, didReceiveAuthRequest: clientName, nearby: nearby) { [weak self] approved in
+        delegate.authManager(self, didReceiveAuthRequest: clientName, requestID: requestID,
+                             nearby: nearby) { [weak self] approved in
             guard let self = self, claim() else { return }
-            self.finishPairing(clientName: clientName, approved: approved, completion: completion)
+            self.finishPairing(clientName: clientName, approved: approved, local: local, completion: completion)
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + Self.approvalTimeout) { [weak self] in
             guard let self = self, claim() else { return }
-            self.delegate?.authManager(self, didExpireAuthRequest: clientName)
-            self.finishPairing(clientName: clientName, approved: false, completion: completion)
+            self.delegate?.authManager(self, didExpireAuthRequest: clientName, requestID: requestID)
+            self.finishPairing(clientName: clientName, approved: false, local: local, completion: completion)
         }
     }
 
-    private func finishPairing(clientName: String, approved: Bool, completion: (PairOutcome) -> Void) {
+    private func finishPairing(clientName: String, approved: Bool, local: Bool,
+                               completion: (PairOutcome) -> Void) {
         let session = approved ? createSession(clientName: clientName) : nil
         lock.lock()
-        pairPending = false
-        if session == nil { pairCooldownUntil = Date().addingTimeInterval(Self.pairCooldown) }
+        var slot = pairSlots[local] ?? PairSlot()
+        slot.pending = false
+        if session == nil { slot.cooldownUntil = Date().addingTimeInterval(Self.pairCooldown) }
+        pairSlots[local] = slot
         lock.unlock()
         completion(session.map { .approved($0) } ?? .denied)
     }

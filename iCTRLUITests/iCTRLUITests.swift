@@ -1201,7 +1201,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             // re-reading `config`) would otherwise fill the very log being
             // read with their own request lines. They still count in timing
             // stats, and a failure is still logged.
-            let quiet = method == "logs" || method == "recent_logs" || (method == "config" && (params ?? [:]).isEmpty)
+            let quiet = method == "logs" || method == "recent_logs"
+                || (method == "config" && (params ?? [:]).keys.allSatisfy { $0 == JSONRPCServer.peerSourceParam })
 
             // Circuit breaker: once the UI channel has hung repeatedly, stop
             // adding to the backlog. Each queued call would wait out the stuck
@@ -1359,7 +1360,43 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// Read (no params) or update basic settings.
     /// Params: {allow_remote_access?: bool, listen_port?: int}
     /// Returns current effective config. Changing settings restarts the server.
+    /// `config` runs on the concurrent non-UI lane; two at once would race on
+    /// the settings below.
+    private let configLock = NSLock()
+
     private func handleConfig(_ params: [String: JSONValue]?) -> ([String: JSONValue]?, JSONRPCError?) {
+        configLock.lock()
+        defer { configLock.unlock() }
+        return applyConfig(params)
+    }
+
+    private func applyConfig(_ params: [String: JSONValue]?) -> ([String: JSONValue]?, JSONRPCError?) {
+        // Validate everything before changing anything: a request refused
+        // half-way must not leave some settings applied and others not.
+        let remoteTarget = params?["allow_remote_access"]?.boolValue ?? remoteAccessEnabled
+        if params?["nearby_discovery"]?.boolValue == true && !nearbyEnabled {
+            // Switching it ON widens who can reach the device, so it is
+            // accepted only from a caller on this device — the iCTRL app or a
+            // computer over USB — like the toggle on the device's notification.
+            guard remoteTarget else {
+                return (nil, JSONRPCError(code: -32602, message: "nearby_discovery needs allow_remote_access:true", data: nil))
+            }
+            guard params?[JSONRPCServer.peerSourceParam]?.stringValue == PeerSource.local.rawValue else {
+                return (nil, JSONRPCError(code: -32602,
+                                          message: "nearby_discovery can be switched on only from this device: the iCTRL app, a computer over USB, or the iCTRL notification",
+                                          data: nil))
+            }
+        }
+        if let newName = params?["device_name"]?.stringValue,
+           newName.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count > NearbyIdentity.maxNameBytes {
+            return (nil, JSONRPCError(code: -32602,
+                                      message: "device_name must be at most \(NearbyIdentity.maxNameBytes) bytes of UTF-8",
+                                      data: nil))
+        }
+        if let portValue = params?["listen_port"]?.intValue, !(1...65535).contains(portValue) {
+            return (nil, JSONRPCError(code: -32602, message: "listen_port must be 1..65535", data: nil))
+        }
+
         var restartNeeded = false
         var newPort = UInt16(server?.port ?? 8200)
         var clearedSessions = 0
@@ -1410,43 +1447,20 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             }
         }
 
-        // Nearby discovery. Switching it ON widens who can reach the device, so
-        // it is accepted only from a caller on this device — the iCTRL app or a
-        // computer over USB — like the toggle on the device's own notification.
-        // Switching it off is accepted from anyone.
+        // Nearby discovery (switching it on was checked above; off: anyone).
         var nearbyChange: Bool?
         if let nearby = params?["nearby_discovery"]?.boolValue, nearby != nearbyEnabled {
-            if nearby {
-                guard remoteAccessEnabled else {
-                    return (nil, JSONRPCError(code: -32602, message: "nearby_discovery needs allow_remote_access:true", data: nil))
-                }
-                guard params?[JSONRPCServer.peerSourceParam]?.stringValue == PeerSource.local.rawValue else {
-                    return (nil, JSONRPCError(code: -32602,
-                                              message: "nearby_discovery can be switched on only from this device: the iCTRL app, a computer over USB, or the iCTRL notification",
-                                              data: nil))
-                }
-            }
-            nearbyChange = nearby
+            nearbyChange = nearby            // validated above
         }
 
         // Name advertised to nearby clients; "" restores the default.
-        var nameError: JSONRPCError?
-        if let newName = params?["device_name"]?.stringValue {
-            if let applied = NearbyIdentity.setName(newName) {
-                Self.logBuffer.append("📡 Nearby name set to \"\(applied)\"")
-                server?.refreshNearbyName()
-            } else {
-                nameError = JSONRPCError(code: -32602,
-                                         message: "device_name must be at most \(NearbyIdentity.maxNameBytes) bytes of UTF-8",
-                                         data: nil)
-            }
+        if let newName = params?["device_name"]?.stringValue,
+           let applied = NearbyIdentity.setName(newName) {     // length checked above
+            Self.logBuffer.append("📡 Nearby name set to \"\(applied)\"")
+            server?.refreshNearbyName()
         }
-        if let nameError { return (nil, nameError) }
 
-        if let portValue = params?["listen_port"]?.intValue {
-            guard portValue > 0, portValue <= 65535 else {
-                return (nil, JSONRPCError(code: -32602, message: "listen_port must be 1..65535", data: nil))
-            }
+        if let portValue = params?["listen_port"]?.intValue {    // range checked above
             if UInt16(portValue) != newPort {
                 newPort = UInt16(portValue)
                 UserDefaults.standard.set(portValue, forKey: "serverPort")
@@ -1609,7 +1623,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
     /// Local Network access as last observed: "granted", "denied" or
     /// "unknown" (not answered yet / not observable). Reported by `config`.
-    private static var localNetworkAccess = "unknown"
+    private static var localNetworkAccess: String {
+        get { localNetworkLock.lock(); defer { localNetworkLock.unlock() }; return localNetworkValue }
+        set { localNetworkLock.lock(); localNetworkValue = newValue; localNetworkLock.unlock() }
+    }
+    private static var localNetworkValue = "unknown"
+    private static let localNetworkLock = NSLock()
     private var launchBrowser: NWBrowser?
 
     /// Ask for Local Network access while the runner is in front, right after
@@ -2196,10 +2215,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 // MARK: - AuthManagerDelegate
 
 extension iCTRLUITests: AuthManagerDelegate {
-    func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String, nearby: Bool,
-                     completion: @escaping (Bool) -> Void) {
-        let requestID = "auth-\(UUID().uuidString)"
-
+    func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String, requestID: String,
+                     nearby: Bool, completion: @escaping (Bool) -> Void) {
         authLock.lock()
         pendingAuthCompletions[requestID] = completion
         currentAuthRequestID = requestID
@@ -2209,14 +2226,12 @@ extension iCTRLUITests: AuthManagerDelegate {
         sendAuthNotification(clientName: clientName, requestID: requestID, nearby: nearby)
     }
 
-    func authManager(_ manager: AuthManager, didExpireAuthRequest clientName: String) {
+    func authManager(_ manager: AuthManager, didExpireAuthRequest clientName: String, requestID: String) {
         authLock.lock()
-        let requestID = currentAuthRequestID
-        currentAuthRequestID = nil
-        if let requestID { pendingAuthCompletions.removeValue(forKey: requestID) }
+        if currentAuthRequestID == requestID { currentAuthRequestID = nil }
+        pendingAuthCompletions.removeValue(forKey: requestID)
         authLock.unlock()
         Self.logBuffer.append("⌛ Auth request from \"\(clientName)\" expired without an answer")
-        guard let requestID else { return }
         let center = UNUserNotificationCenter.current()
         center.removePendingNotificationRequests(withIdentifiers: [requestID])
         center.removeDeliveredNotifications(withIdentifiers: [requestID])

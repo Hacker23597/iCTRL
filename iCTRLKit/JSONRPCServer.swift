@@ -128,7 +128,16 @@ class JSONRPCServer {
 
     func stop() {
         log("🔻 JSONRPCServer.stop called")
-        stopNearbyOnQueue()
+        // Nearby teardown belongs on the server queue, where that state lives.
+        // Hand over the objects rather than self: stop() also runs from deinit.
+        let nearbyListener = self.nearbyListener, nearbyAdvertiser = self.nearbyAdvertiser
+        self.nearbyListener = nil
+        self.nearbyAdvertiser = nil
+        nearbyConnections.removeAll()
+        queue.async {
+            nearbyAdvertiser?.stop()
+            nearbyListener?.cancel()
+        }
         connections.forEach { $0.cancel() }
         connections.removeAll()
         listener?.cancel()
@@ -176,7 +185,13 @@ class JSONRPCServer {
     }
 
     private func startNearbyOnQueue() {
-        guard !localOnly, nearbyListener == nil, let nwPort = NWEndpoint.Port(rawValue: nearbyPort) else { return }
+        guard !localOnly, nearbyListener == nil else { return }
+        guard nearbyPort != 0, let nwPort = NWEndpoint.Port(rawValue: nearbyPort) else {
+            // listen_port 65535 leaves no port above it for the nearby listener.
+            log("📡 Nearby: no port above \(port) for the nearby listener")
+            setNearbyStatus(.failed)
+            return
+        }
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
         params.includePeerToPeer = true
@@ -231,54 +246,75 @@ class JSONRPCServer {
     }
 
     /// The remote address (no port, no zone) and how it arrived, for the
-    /// session list. Classified by the interface the connection uses.
+    /// session list.
+    ///
+    /// Built from `NWConnection.endpoint`, raw address bytes and getifaddrs
+    /// only — see `isLoopback(_:)` for why the newer Network properties
+    /// (`IPv4Address.isLoopback`, `currentPath`, …) must not be touched here:
+    /// on the oldest supported iOS their symbols are missing at load time.
     static func peer(of connection: NWConnection) -> (address: String, via: String)? {
         guard case let .hostPort(host, _) = connection.endpoint else { return nil }
+        var v4: [UInt8]?
+        var zone: String?
         var address: String
-        var isLoopback = false
         switch host {
         case .ipv4(let a):
-            address = "\(a)"
-            isLoopback = a.isLoopback
+            v4 = [UInt8](a.rawValue)
+            address = v4!.map(String.init).joined(separator: ".")
         case .ipv6(let a):
-            if let v4 = a.asIPv4 {
-                address = "\(v4)"
-                isLoopback = v4.isLoopback
+            let b = [UInt8](a.rawValue)
+            if b.count == 16, b[0..<10].allSatisfy({ $0 == 0 }), b[10] == 0xff, b[11] == 0xff {
+                v4 = Array(b[12..<16])                       // IPv4-mapped
+                address = v4!.map(String.init).joined(separator: ".")
             } else {
-                address = "\(a)"
-                isLoopback = a.isLoopback
+                var text = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                let ok = b.withUnsafeBytes { inet_ntop(AF_INET6, $0.baseAddress, &text, socklen_t(text.count)) } != nil
+                address = ok ? String(cString: text) : "\(a)"
+                if b.count == 16, b[0..<15].allSatisfy({ $0 == 0 }), b[15] == 1 { return (address, PeerSource.local.rawValue) }
+                zone = Self.zone(of: a)                        // link-local: the interface it came in on
             }
         case .name(let n, _):
             address = n
         @unknown default:
             return nil
         }
-        // Drop a zone suffix ("%awdl0"): the source already says which link.
         if let pct = address.firstIndex(of: "%") { address = String(address[..<pct]) }
+        if let v4, v4.first == 127 { return (address, PeerSource.local.rawValue) }
 
+        let name = zone ?? v4.flatMap(Self.interfaceName(containing:))
+        guard let name else { return (address, PeerSource.other.rawValue) }
         let via: PeerSource
-        if isLoopback {
-            via = .local
-        } else if isPeerToPeer(connection) {
-            via = .nearby
-        } else if let iface = connection.currentPath?.availableInterfaces.first {
-            let name = iface.name
-            if name.hasPrefix("awdl") || name.hasPrefix("llw") {
-                via = .nearby
-            } else if name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("ppp") {
-                via = .vpn
-            } else {
-                switch iface.type {
-                case .wifi, .wiredEthernet: via = .lan
-                case .cellular: via = .cellular
-                case .loopback: via = .local
-                default: via = name.hasPrefix("en") || name.hasPrefix("bridge") ? .lan : .other
-                }
-            }
-        } else {
-            via = .other
-        }
+        if name.hasPrefix("awdl") || name.hasPrefix("llw") { via = .nearby }
+        else if name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("ppp") { via = .vpn }
+        else if name.hasPrefix("pdp_ip") { via = .cellular }
+        else if name.hasPrefix("lo") { via = .local }
+        else if name.hasPrefix("en") || name.hasPrefix("bridge") { via = .lan }
+        else { via = .other }
         return (address, via.rawValue)
+    }
+
+    /// The local interface whose IPv4 subnet holds `addr` (point-to-point
+    /// links: whose peer address is `addr`), or nil.
+    private static func interfaceName(containing addr: [UInt8]) -> String? {
+        guard addr.count == 4 else { return nil }
+        let peer = UInt32(addr[0]) << 24 | UInt32(addr[1]) << 16 | UInt32(addr[2]) << 8 | UInt32(addr[3])
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        func v4(_ sa: UnsafeMutablePointer<sockaddr>?) -> UInt32? {
+            guard let sa, sa.pointee.sa_family == UInt8(AF_INET) else { return nil }
+            return sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
+        }
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let ifa = ptr.pointee
+            guard let mine = v4(ifa.ifa_addr) else { continue }
+            if ifa.ifa_flags & UInt32(IFF_POINTOPOINT) != 0 {
+                if v4(ifa.ifa_dstaddr) == peer { return String(cString: ifa.ifa_name) }
+            } else if let mask = v4(ifa.ifa_netmask), mask != 0, mine & mask == peer & mask {
+                return String(cString: ifa.ifa_name)
+            }
+        }
+        return nil
     }
 
     /// Whether a connection arrived over peer-to-peer Wi-Fi (AWDL / low-latency
@@ -286,8 +322,17 @@ class JSONRPCServer {
     /// interface, so the endpoint alone answers it — no newer path API needed.
     static func isPeerToPeer(_ connection: NWConnection) -> Bool {
         guard case let .hostPort(host, _) = connection.endpoint, case let .ipv6(addr) = host,
-              let name = addr.interface?.name else { return false }
+              let name = zone(of: addr) else { return false }
         return name.hasPrefix("awdl") || name.hasPrefix("llw")
+    }
+
+    /// The zone (interface name) of a scoped IPv6 address, from its text form
+    /// ("fe80::1%awdl0") — iOS 12-era API only, see `isLoopback(_:)`.
+    private static func zone(of addr: IPv6Address) -> String? {
+        let text = "\(addr)"
+        guard let pct = text.firstIndex(of: "%") else { return nil }
+        let name = String(text[text.index(after: pct)...])
+        return name.isEmpty ? nil : name
     }
 
     private func isNearby(_ connection: NWConnection) -> Bool {
@@ -749,7 +794,7 @@ class JSONRPCServer {
             return
         }
 
-        AuthManager.shared.requestAuth(clientName: clientName, nearby: nearby) { [weak self] outcome in
+        AuthManager.shared.requestAuth(clientName: clientName, nearby: nearby, local: isLoopback) { [weak self] outcome in
             guard let self = self else { return }
             let session: AuthSession
             switch outcome {
