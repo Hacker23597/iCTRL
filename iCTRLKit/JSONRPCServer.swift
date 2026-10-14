@@ -430,6 +430,19 @@ class JSONRPCServer {
         case ("GET", "/schema"):
             handleSchema(connection: connection)
 
+        // Which device this is, before any key is chosen: clients store one
+        // key per device and look it up by this id.
+        case ("GET", "/whoami"):
+            let info: [String: Any] = [
+                "device_id": NearbyIdentity.deviceID,
+                "name": NearbyIdentity.name,
+                "protocol_version": RPCMethodRegistry.protocolVersion,
+                "server_version": RPCMethodRegistry.serverVersion,
+            ]
+            let data = (try? JSONSerialization.data(withJSONObject: info, options: [.sortedKeys])) ?? Data("{}".utf8)
+            sendHTTPResponse(connection: connection, status: 200, contentType: "application/json",
+                             body: String(data: data, encoding: .utf8) ?? "{}")
+
         case ("GET", "/skill"), ("GET", "/skill.md"), ("GET", "/SKILL.md"):
             handleSkill(connection: connection)
 
@@ -1060,13 +1073,22 @@ class JSONRPCServer {
         }
     }
 
+    /// Headers on every response. `X-ICTRL-Device` names the device behind
+    /// this address, so a client can keep one key per device across USB, LAN
+    /// and nearby, and notice when a different device now answers at an
+    /// address it knows. The id is random per installation and is already
+    /// advertised to nearby devices.
     private func corsHeaders() -> [String: String] {
         [
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Expose-Headers": Self.deviceHeader,
+            Self.deviceHeader: NearbyIdentity.deviceID,
         ]
     }
+
+    static let deviceHeader = "X-ICTRL-Device"
 
     /// Send a response whose body is raw bytes.
     ///

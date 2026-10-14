@@ -1363,6 +1363,8 @@ class ActionHandler {
             // this server supports from a single device_info call (no /schema fetch
             // needed for feature detection).
             "server_version": .string(RPCMethodRegistry.serverVersion),
+            // Stable per installation; clients key their stored token by it.
+            "device_id": .string(NearbyIdentity.deviceID),
             // Build identity. Two installs can share a server_version (the bump
             // is manual), so this is what tells you whether the binary you just
             // deployed is the one answering.
