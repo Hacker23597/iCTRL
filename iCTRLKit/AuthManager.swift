@@ -212,7 +212,10 @@ class AuthManager {
     /// an unauthenticated caller can never perturb a legitimate client's state.
     /// Returns the VERIFIED token id so callers that mint credentials bind them
     /// to the identity this envelope actually proved, not to unverified input.
-    func openEnvelope(_ obj: [String: Any]) throws -> (tokId: String, plaintext: String, seal: (String) -> String) {
+    /// `peer` is where the request came from (address, `PeerSource` raw
+    /// value); it is recorded on the session for the client list.
+    func openEnvelope(_ obj: [String: Any], peer: (address: String, via: String)? = nil) throws
+        -> (tokId: String, plaintext: String, seal: (String) -> String) {
         let p = try SecureEnvelope.parse(obj)
 
         lock.lock()
@@ -268,10 +271,17 @@ class AuthManager {
         seen[p.nonceHex] = p.ts
         seenNonces[p.tokId] = seen
         session.lastActiveAt = now
+        // A new source is worth writing at once; the same one only on the
+        // usual hourly flush.
+        let peerChanged = peer.map { $0.address != session.lastAddress || $0.via != session.lastVia } ?? false
+        if let peer {
+            session.lastAddress = peer.address
+            session.lastVia = peer.via
+        }
         sessions[p.tokId] = session
-        let needsPersist = lastPersistedUse[p.tokId].map {
+        let needsPersist = peerChanged || (lastPersistedUse[p.tokId].map {
             now.timeIntervalSince($0) > Self.persistUseInterval
-        } ?? true
+        } ?? true)
         if needsPersist { lastPersistedUse[p.tokId] = now }
         lock.unlock()
         if needsPersist { persist() }
@@ -314,6 +324,19 @@ class AuthManager {
     }
 
     // MARK: - Management
+
+    /// Note where a session's client is connecting from (at pairing time,
+    /// before its first request).
+    func recordPeer(sessionID: String, peer: (address: String, via: String)?) {
+        guard let peer else { return }
+        lock.lock()
+        guard var session = sessions[sessionID] else { lock.unlock(); return }
+        session.lastAddress = peer.address
+        session.lastVia = peer.via
+        sessions[sessionID] = session
+        lock.unlock()
+        persist()
+    }
 
     func revokeSession(id: String) {
         lock.lock()

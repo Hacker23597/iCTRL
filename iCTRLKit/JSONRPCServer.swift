@@ -225,10 +225,61 @@ class JSONRPCServer {
         log("📡 Nearby discovery stopped")
     }
 
+    /// The remote address (no port, no zone) and how it arrived, for the
+    /// session list. Classified by the interface the connection uses.
+    static func peer(of connection: NWConnection) -> (address: String, via: String)? {
+        guard case let .hostPort(host, _) = connection.endpoint else { return nil }
+        var address: String
+        var isLoopback = false
+        switch host {
+        case .ipv4(let a):
+            address = "\(a)"
+            isLoopback = a.isLoopback
+        case .ipv6(let a):
+            if let v4 = a.asIPv4 {
+                address = "\(v4)"
+                isLoopback = v4.isLoopback
+            } else {
+                address = "\(a)"
+                isLoopback = a.isLoopback
+            }
+        case .name(let n, _):
+            address = n
+        @unknown default:
+            return nil
+        }
+        // Drop a zone suffix ("%awdl0"): the source already says which link.
+        if let pct = address.firstIndex(of: "%") { address = String(address[..<pct]) }
+
+        let via: PeerSource
+        if isLoopback {
+            via = .local
+        } else if isPeerToPeer(connection) {
+            via = .nearby
+        } else if let iface = connection.currentPath?.availableInterfaces.first {
+            let name = iface.name
+            if name.hasPrefix("awdl") || name.hasPrefix("llw") {
+                via = .nearby
+            } else if name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("ppp") {
+                via = .vpn
+            } else {
+                switch iface.type {
+                case .wifi, .wiredEthernet: via = .lan
+                case .cellular: via = .cellular
+                case .loopback: via = .local
+                default: via = name.hasPrefix("en") || name.hasPrefix("bridge") ? .lan : .other
+                }
+            }
+        } else {
+            via = .other
+        }
+        return (address, via.rawValue)
+    }
+
     /// Whether a connection arrived over peer-to-peer Wi-Fi (AWDL / low-latency
     /// WLAN). Those peers always use IPv6 link-local addresses scoped to the
     /// interface, so the endpoint alone answers it — no newer path API needed.
-    private static func isPeerToPeer(_ connection: NWConnection) -> Bool {
+    static func isPeerToPeer(_ connection: NWConnection) -> Bool {
         guard case let .hostPort(host, _) = connection.endpoint, case let .ipv6(addr) = host,
               let name = addr.interface?.name else { return false }
         return name.hasPrefix("awdl") || name.hasPrefix("llw")
@@ -686,6 +737,7 @@ class JSONRPCServer {
             switch outcome {
             case .approved(let s):
                 session = s
+                AuthManager.shared.recordPeer(sessionID: s.id, peer: Self.peer(of: connection))
             case .denied:
                 self.sendPairError(connection, status: 403, code: "pair_denied",
                                    message: "User rejected or approval timed out")
@@ -872,7 +924,7 @@ class JSONRPCServer {
 
         let opened: (tokId: String, plaintext: String, seal: (String) -> String)
         do {
-            opened = try AuthManager.shared.openEnvelope(obj)
+            opened = try AuthManager.shared.openEnvelope(obj, peer: Self.peer(of: connection))
         } catch let failure as SecureEnvelope.Failure {
             // 401 for anything token/auth related so clients know to re-pair;
             // 400 only for a structurally broken envelope.

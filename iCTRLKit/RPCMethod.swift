@@ -27,7 +27,7 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "device_name", type: "string", required: false, description: "Name advertised to nearby (peer-to-peer) clients, at most 63 bytes; \"\" restores the default (model plus a short device id)"),
                 RPCParamDef(name: "stop_server", type: "boolean", required: false, description: "true = stop the service (stops listening ~1s after replying). Re-launch the runner to restart; tokens persist."),
             ],
-            returns: "{allow_remote_access, listen_port, address, restarted, device_name, nearby:{enabled, advertising, name, device_id, port}, active_sessions, sessions:[{session_id, client_name, tok, granted_at, last_active_at, expires_at}], cleared_sessions}"
+            returns: "{allow_remote_access, listen_port, address, restarted, device_name, lan_addresses, ipv4_interfaces, nearby:{enabled, advertising, status, interface, name, device_id, port}, active_sessions, sessions:[{session_id, client_name, tok, granted_at, last_active_at, expires_at, last_address, last_via: local (this device or USB) | lan | nearby (AWDL) | vpn | cellular | other}], cleared_sessions}"
         ),
         RPCMethodDef(
             name: "stream_ticket",
@@ -374,7 +374,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.98.2"
+    static let serverVersion = "1.98.3"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///

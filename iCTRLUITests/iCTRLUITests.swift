@@ -1458,6 +1458,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 "granted_at": .string(iso.string(from: s.grantedAt)),
                 "last_active_at": .string(iso.string(from: s.lastActiveAt)),
                 "expires_at": .string(iso.string(from: s.expiresAt)),
+                "last_address": s.lastAddress.map(JSONValue.string) ?? .null,
+                "last_via": s.lastVia.map(JSONValue.string) ?? .null,
             ])
         }
 
