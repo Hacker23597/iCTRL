@@ -14,10 +14,17 @@ class JSONRPCServer {
     private var nearbyAdvertiser: NearbyAdvertiser?
     /// Port of the nearby listener: one above the main port.
     var nearbyPort: UInt16 { port &+ 1 }
-    /// True while the nearby service is advertised over AWDL.
-    var isNearbyAdvertising: Bool { nearbyAdvertiser?.isAdvertising ?? false }
-    /// Called (on the server queue) when nearby advertising starts or stops.
-    var onNearbyStateChange: ((Bool) -> Void)?
+    /// Nearby advertising state, readable from any thread. `.off` while nearby
+    /// discovery is not running.
+    var nearbyStatus: NearbyAdvertiser.Status {
+        nearbyStatusLock.lock(); defer { nearbyStatusLock.unlock() }
+        return nearbyStatusValue
+    }
+    var isNearbyAdvertising: Bool { nearbyStatus == .advertising }
+    private var nearbyStatusValue: NearbyAdvertiser.Status = .off
+    private let nearbyStatusLock = NSLock()
+    /// Called (on the server queue) whenever `nearbyStatus` changes.
+    var onNearbyStateChange: ((NearbyAdvertiser.Status) -> Void)?
     let port: UInt16
     private let localOnly: Bool
     private let queue = DispatchQueue(label: "com.openminis.ictrl.server")
@@ -147,7 +154,20 @@ class JSONRPCServer {
 
     /// Re-advertise under the current `NearbyIdentity.name`.
     func refreshNearbyName() {
-        nearbyAdvertiser?.refreshName()
+        queue.async { self.nearbyAdvertiser?.refreshName() }
+    }
+
+    /// Re-check the peer-to-peer interface now (call on network changes).
+    func recheckNearby() {
+        queue.async { self.nearbyAdvertiser?.recheck() }
+    }
+
+    private func setNearbyStatus(_ status: NearbyAdvertiser.Status) {
+        nearbyStatusLock.lock()
+        let changed = nearbyStatusValue != status
+        nearbyStatusValue = status
+        nearbyStatusLock.unlock()
+        if changed { onNearbyStateChange?(status) }
     }
 
     private func startNearbyOnQueue() {
@@ -157,6 +177,7 @@ class JSONRPCServer {
         params.includePeerToPeer = true
         guard let l = try? NWListener(using: params, on: nwPort) else {
             log("📡 Nearby: could not open port \(nearbyPort)")
+            setNearbyStatus(.failed)
             return
         }
         l.stateUpdateHandler = { [weak self] state in
@@ -167,6 +188,7 @@ class JSONRPCServer {
             case .failed(let error):
                 self.log("📡 Nearby listener failed: \(error)")
                 self.stopNearbyOnQueue()
+                self.setNearbyStatus(.failed)
             default:
                 break
             }
@@ -186,7 +208,7 @@ class JSONRPCServer {
         nearbyListener = l
 
         let advertiser = NearbyAdvertiser(port: nearbyPort, queue: queue) { [weak self] in self?.log($0) }
-        advertiser.onChange = { [weak self] on in self?.onNearbyStateChange?(on) }
+        advertiser.onChange = { [weak self] status in self?.setNearbyStatus(status) }
         nearbyAdvertiser = advertiser
         advertiser.start()
     }
@@ -199,6 +221,7 @@ class JSONRPCServer {
         nearbyListener = nil
         for conn in connections where nearbyConnections.contains(ObjectIdentifier(conn)) { conn.cancel() }
         nearbyConnections.removeAll()
+        setNearbyStatus(.off)
         log("📡 Nearby discovery stopped")
     }
 

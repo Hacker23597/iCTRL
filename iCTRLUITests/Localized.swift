@@ -45,7 +45,8 @@ enum L10n {
         case authRequestNearbyBody // %@ = client name; the request came over peer-to-peer Wi-Fi
         case onDeviceOnlySuffix
         // Reachability marker shown on the status notification (one of three).
-        case statusNearby, statusLAN, statusLocal
+        case statusNearby, statusLAN, statusLocal, statusNoLAN
+        case nearbyStarting, nearbyNeedsWiFi, nearbyNeedsPermission, nearbyNotReady
         case enableNearby, disableNearby, longPressNearbyOrStop
 
         // ── Host app UI ──
@@ -151,6 +152,16 @@ enum L10n {
                      .ko: "🌐 LAN 접속 가능", .es: "🌐 Accesible en la LAN", .de: "🌐 Im LAN erreichbar", .ru: "🌐 Доступен в LAN"],
         .statusLocal: [.en: "🔒 This device only", .zhHans: "🔒 仅本机", .zhHant: "🔒 僅本機", .ja: "🔒 この端末のみ",
                        .ko: "🔒 이 기기만", .es: "🔒 Solo este dispositivo", .de: "🔒 Nur dieses Gerät", .ru: "🔒 Только это устройство"],
+        .statusNoLAN: [.en: "🌐 No LAN · connect to Wi-Fi", .zhHans: "🌐 无局域网 · 需连接 Wi-Fi", .zhHant: "🌐 無區域網路 · 需連接 Wi-Fi", .ja: "🌐 LAN なし · Wi-Fi に接続",
+                       .ko: "🌐 LAN 없음 · Wi-Fi 연결 필요", .es: "🌐 Sin LAN · conéctate a Wi-Fi", .de: "🌐 Kein LAN · mit WLAN verbinden", .ru: "🌐 Нет LAN · подключитесь к Wi-Fi"],
+        .nearbyStarting: [.en: "📡 Nearby starting…", .zhHans: "📡 近场启动中…", .zhHant: "📡 近場啟動中…", .ja: "📡 近距離検出を開始中…",
+                          .ko: "📡 근거리 검색 시작 중…", .es: "📡 Iniciando detección cercana…", .de: "📡 Nahbereich startet…", .ru: "📡 Запуск обнаружения…"],
+        .nearbyNeedsWiFi: [.en: "📡 Nearby not ready · turn on Wi-Fi", .zhHans: "📡 近场未就绪 · 需打开 Wi-Fi", .zhHant: "📡 近場未就緒 · 需開啟 Wi-Fi", .ja: "📡 近距離検出は待機中 · Wi-Fi をオン",
+                           .ko: "📡 근거리 검색 대기 · Wi-Fi 켜기 필요", .es: "📡 Cercanía no lista · activa el Wi-Fi", .de: "📡 Nahbereich nicht bereit · WLAN einschalten", .ru: "📡 Поблизости не готово · включите Wi-Fi"],
+        .nearbyNeedsPermission: [.en: "📡 Nearby not ready · allow Local Network", .zhHans: "📡 近场未就绪 · 需允许本地网络", .zhHant: "📡 近場未就緒 · 需允許區域網路", .ja: "📡 近距離検出は待機中 · ローカルネットワークを許可",
+                                 .ko: "📡 근거리 검색 대기 · 로컬 네트워크 허용 필요", .es: "📡 Cercanía no lista · permite Red local", .de: "📡 Nahbereich nicht bereit · Lokales Netzwerk erlauben", .ru: "📡 Поблизости не готово · разрешите локальную сеть"],
+        .nearbyNotReady: [.en: "📡 Nearby not ready · retrying", .zhHans: "📡 近场未就绪 · 正在重试", .zhHant: "📡 近場未就緒 · 正在重試", .ja: "📡 近距離検出は待機中 · 再試行中",
+                          .ko: "📡 근거리 검색 대기 · 재시도 중", .es: "📡 Cercanía no lista · reintentando", .de: "📡 Nahbereich nicht bereit · neuer Versuch", .ru: "📡 Поблизости не готово · повтор"],
         .enableNearby: [.en: "📡 Enable Nearby Discovery", .zhHans: "📡 开启近场发现", .zhHant: "📡 開啟近場探索", .ja: "📡 近距離検出を有効化",
                         .ko: "📡 근거리 검색 켜기", .es: "📡 Activar detección cercana", .de: "📡 Nahbereichserkennung ein", .ru: "📡 Включить обнаружение поблизости"],
         .disableNearby: [.en: "📴 Disable Nearby Discovery", .zhHans: "📴 关闭近场发现", .zhHant: "📴 關閉近場探索", .ja: "📴 近距離検出を無効化",

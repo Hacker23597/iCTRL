@@ -455,6 +455,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
         keepRunning = true
         wireServerStateChange()
+        observeNetworkChanges()
 
         // When the app comes back to the foreground (e.g. the user opened it to
         // grant the Local Network permission), re-verify remote reachability — if
@@ -1156,10 +1157,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     private func configureServerCallbacks(_ srv: JSONRPCServer) {
         // Advertising can start late (awdl0 appears once Wi-Fi is on), so the
         // status notification follows the advertiser rather than the toggle.
-        srv.onNearbyStateChange = { [weak self, weak srv] advertising in
+        srv.onNearbyStateChange = { [weak self, weak srv] status in
             DispatchQueue.main.async {
                 guard let self = self, let srv = srv, self.server === srv else { return }
-                Self.logBuffer.append(advertising ? "📡 Nearby: advertising on" : "📡 Nearby: advertising off")
+                Self.logBuffer.append("📡 Nearby status: \(status.rawValue)")
                 self.postStatusNotification(detail: self.addressLines(port: srv.port), silent: true)
             }
         }
@@ -1459,11 +1460,19 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             "allow_remote_access": .bool(remoteAccessEnabled),
             "listen_port": .int(Int(newPort)),
             "address": .string("\(address):\(newPort)"),
+            "lan_addresses": .array(allReachableAddresses().map {
+                .object(["label": .string($0.label), "address": .string($0.address)])
+            }),
+            "ipv4_interfaces": .array(Self.activeIPv4Interfaces().map {
+                .object(["name": .string($0.name), "address": .string($0.address)])
+            }),
             "restarted": .bool(restartNeeded),
             "device_name": .string(UIDevice.current.name),
             "nearby": .object([
                 "enabled": .bool(nearbyEnabled),
                 "advertising": .bool(server?.isNearbyAdvertising ?? false),
+                "status": .string(nearbyEnabled ? (server?.nearbyStatus ?? .off).rawValue : "off"),
+                "interface": NearbyAdvertiser.linkState().json,
                 "name": .string(NearbyIdentity.name),
                 "device_id": .string(NearbyIdentity.deviceID),
                 "port": .int(Int(server?.nearbyPort ?? newPort + 1)),
@@ -1643,6 +1652,30 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// report how long it has been up.
     private static var serverStartedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
 
+    /// Marker + address last shown, so a network change reposts only when the
+    /// notification would actually read differently.
+    private var lastNetworkSignature = ""
+
+    /// Wi-Fi joining or leaving, a VPN starting or stopping: re-check nearby
+    /// discovery and update the status notification right away. (Wi-Fi being
+    /// switched off without a path change is caught by the advertiser's own
+    /// interface polling.)
+    private func observeNetworkChanges() {
+        NetworkTypeMonitor.shared.observe { [weak self] type in
+            DispatchQueue.main.async {
+                guard let self = self, self.remoteAccessEnabled else { return }
+                self.server?.recheckNearby()
+                let signature = self.statusMarker + "|" + (self.lanAddress() ?? "-")
+                guard signature != self.lastNetworkSignature else { return }
+                let first = self.lastNetworkSignature.isEmpty
+                self.lastNetworkSignature = signature
+                guard !first else { return }
+                Self.logBuffer.append("🌐 Network changed (\(type.rawValue)) — LAN \(self.lanAddress() ?? "none")")
+                self.refreshStatusNotification()
+            }
+        }
+    }
+
     private func refreshStatusNotification() {
         let sessions = AuthManager.shared.activeSessions.count
         let addr = remoteAccessEnabled ? getDeviceAddress() : "127.0.0.1"
@@ -1656,11 +1689,24 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
     // MARK: - Status notification
 
-    /// The one reachability marker that applies right now. Mutually exclusive:
-    /// nearby implies LAN, LAN implies local, and the strongest one is shown.
+    /// The one reachability marker that applies right now: local only; remote
+    /// with or without a LAN address; or, while nearby discovery is on, its
+    /// actual state (discoverable, starting, or what it is waiting for).
     private var statusMarker: String {
         guard remoteAccessEnabled else { return L10n.t(.statusLocal) }
-        return (server?.isNearbyAdvertising ?? false) ? L10n.t(.statusNearby) : L10n.t(.statusLAN)
+        // While nearby discovery is switched on, its marker says whether it
+        // actually works and, if not, what is missing — the menu already shows
+        // that it is on, so falling back to the LAN marker would contradict it.
+        if nearbyEnabled {
+            switch server?.nearbyStatus ?? .off {
+            case .advertising: return L10n.t(.statusNearby)
+            case .needsWiFi:   return L10n.t(.nearbyNeedsWiFi)
+            case .denied:      return L10n.t(.nearbyNeedsPermission)
+            case .failed:      return L10n.t(.nearbyNotReady)
+            case .starting, .off: return L10n.t(.nearbyStarting)
+            }
+        }
+        return lanAddress() != nil ? L10n.t(.statusLAN) : L10n.t(.statusNoLAN)
     }
 
     /// Category, and so the long-press menu, for the current state.
@@ -1735,7 +1781,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     ///   permission, and just tell the user it's on-device only. No error.
     private func announceRemoteReady(address: String) {
         let net = NetworkTypeMonitor.shared.current
-        if NetworkTypeMonitor.shared.isLANReachable {
+        if lanAddress() != nil {
             Self.logBuffer.append("🌐 Server started on \(address):8200 (remote, \(net.rawValue)) — verifying reachability")
             verifyRemoteReachableThenNotify(address: address)
         } else {
@@ -1789,48 +1835,36 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// How many addresses a notification will list before stopping.
     private static let maxAdvertisedAddresses = 3
 
-    /// Addresses a PEER can reach this device at, best first.
+    /// LAN addresses a peer can reach this device at, best first: Wi-Fi, then
+    /// the Personal Hotspot bridge, then wired adapters.
     ///
-    /// The listener binds all interfaces, so a client can connect over any of
-    /// these — Wi-Fi, cellular, hotspot, VPN. `getDeviceAddress()` picks a single
-    /// one for the places that need exactly one string; this is for telling the
-    /// user what their actual options are.
+    /// Only physical LAN interfaces count. Tunnels (`utun*`, `ipsec*`, `ppp*`)
+    /// belong to VPNs and proxy apps — a proxy's TUN interface typically holds
+    /// a placeholder such as 198.18.0.1 that nobody else can reach — and
+    /// cellular (`pdp_ip*`) is carrier NAT. Peer-to-peer (`awdl*`, `llw*`) and
+    /// USB host links (`anpi*`) are not a LAN either. Link-local and
+    /// benchmark-range (198.18.0.0/15) addresses are skipped on any interface.
     ///
     /// Returns `(label, address)` pairs so the notification can say which is
-    /// which rather than listing bare numbers.
+    /// which rather than listing bare numbers. Empty means no LAN at all.
     private func allReachableAddresses() -> [(label: String, address: String)] {
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return [] }
-        defer { freeifaddrs(ifaddr) }
-
         var found: [(rank: Int, label: String, address: String)] = []
-        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
-            let interface = ptr.pointee
-            guard interface.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
-            // Skip interfaces that are down or have no address assigned.
-            guard (interface.ifa_flags & UInt32(IFF_UP)) != 0 else { continue }
-
-            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                        &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
-            let addr = String(cString: hostname)
-            guard addr != "127.0.0.1", !addr.isEmpty else { continue }
-
-            let name = String(cString: interface.ifa_name)
-            // Rank so the most useful address leads. Cellular is listed but is
-            // usually CGNAT — reachable from the device itself, not from a peer.
-            // Cellular (pdp_ip*) is deliberately excluded: the address is
-            // public/CGNAT and reachable only from the device itself, so
-            // printing it as somewhere to connect would be misleading.
+        for (name, address, raw) in Self.activeIPv4Interfaces() {
             let (rank, label): (Int, String)
-            switch true {
-            case name == "en0":              (rank, label) = (0, "Wi-Fi")
-            case name.hasPrefix("bridge"):   (rank, label) = (1, "Hotspot")
-            case name.hasPrefix("utun"):     (rank, label) = (2, "VPN")
-            case name.hasPrefix("en"):       (rank, label) = (3, name)
-            default:                          continue
+            if name == "en0" {
+                (rank, label) = (0, "Wi-Fi")
+            } else if name.hasPrefix("bridge") {
+                (rank, label) = (1, "Hotspot")
+            } else if name.hasPrefix("en") {
+                (rank, label) = (2, name)
+            } else {
+                continue
             }
-            found.append((rank, label, addr))
+            guard raw != 0,
+                  raw & 0xFFFF_0000 != 0xA9FE_0000,   // 169.254.0.0/16 link-local
+                  raw & 0xFFFE_0000 != 0xC612_0000    // 198.18.0.0/15 placeholder range
+            else { continue }
+            found.append((rank, label, address))
         }
         // A notification has room for a few lines, not an interface dump.
         return found.sorted { $0.rank < $1.rank }
@@ -1838,15 +1872,45 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                     .map { ($0.label, $0.address) }
     }
 
+    /// Every up, running, non-loopback IPv4 interface: (name, dotted address,
+    /// address as a host-order integer). Unfiltered — also reported by
+    /// `config` so a wrong address choice can be diagnosed.
+    static func activeIPv4Interfaces() -> [(name: String, address: String, raw: UInt32)] {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return [] }
+        defer { freeifaddrs(ifaddr) }
+        var result: [(name: String, address: String, raw: UInt32)] = []
+        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let interface = ptr.pointee
+            guard let sa = interface.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let flags = interface.ifa_flags
+            guard flags & UInt32(IFF_UP) != 0, flags & UInt32(IFF_RUNNING) != 0,
+                  flags & UInt32(IFF_LOOPBACK) == 0 else { continue }
+            let raw = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
+            }
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &hostname, socklen_t(hostname.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            result.append((String(cString: interface.ifa_name), String(cString: hostname), raw))
+        }
+        return result
+    }
+
+    /// The best LAN address, or nil when the device has none (cellular only,
+    /// or only a VPN/proxy tunnel).
+    private func lanAddress() -> String? {
+        allReachableAddresses().first?.address
+    }
+
     /// Address lines for a notification body: one `http://host:port` per
     /// interface, labelled. Falls back to just the primary address when there is
     /// only one, so the common single-Wi-Fi case stays terse.
     private func addressLines(port: UInt16) -> String {
         let all = allReachableAddresses()
-        // Empty means no peer-reachable interface — cellular-only, say. Fall
-        // back to the primary address (which does include cellular): on-device
-        // clients can still use it, and it beats showing nothing.
-        guard !all.isEmpty else { return "\(getDeviceAddress()):\(port)" }
+        // No LAN: only this device (and a USB-connected computer) can connect.
+        // Never show a tunnel or cellular address in its place.
+        guard !all.isEmpty else { return "127.0.0.1:\(port)" }
         // One address needs no label; several do, so you can tell which network
         // each belongs to.
         if all.count == 1 { return "\(all[0].address):\(port)" }
@@ -1854,35 +1918,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             .joined(separator: "\n")
     }
 
+    /// The single address for places that need exactly one: the LAN address,
+    /// else loopback.
     private func getDeviceAddress() -> String {
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return "127.0.0.1" }
-        defer { freeifaddrs(ifaddr) }
-
-        // Prefer en0 (Wi-Fi), fall back to any non-loopback IPv4
-        var wifiAddr: String?
-        var fallbackAddr: String?
-
-        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
-            let interface = ptr.pointee
-            guard interface.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
-
-            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                        &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
-            let addr = String(cString: hostname)
-
-            guard addr != "127.0.0.1" else { continue }
-
-            let name = String(cString: interface.ifa_name)
-            if name == "en0" {
-                wifiAddr = addr
-            } else if name.hasPrefix("en") || name.hasPrefix("pdp_ip") || name.hasPrefix("bridge") {
-                fallbackAddr = fallbackAddr ?? addr
-            }
-        }
-
-        return wifiAddr ?? fallbackAddr ?? "127.0.0.1"
+        lanAddress() ?? "127.0.0.1"
     }
 
     /// After enabling remote access, confirm the LAN address is actually reachable
@@ -1910,7 +1949,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // Authoritative gate: only self-check on a LAN (Wi-Fi/wired). On cellular
         // the address is public/CGNAT and unreachable from outside — a check would
         // always "fail", so skip it and never post a failure there.
-        guard NetworkTypeMonitor.shared.isLANReachable else {
+        guard lanAddress() != nil else {
             Self.logBuffer.append("📶 not on LAN (\(NetworkTypeMonitor.shared.current.rawValue)) — skipping remote reachability check")
             return
         }
