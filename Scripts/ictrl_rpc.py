@@ -190,6 +190,8 @@ def save_token(host: str, record: dict) -> None:
 # short-lived cache spares the lookup on back-to-back calls.
 
 NEARBY_CACHE = os.path.expanduser("~/.ictrl/nearby_cache.json")
+NO_NEARBY_HINT = ("no nearby devices — on the phone, turn on Nearby Discovery (iCTRL notification) and "
+                  "keep Wi-Fi switched on; it need not be joined to a network")
 NEARBY_CACHE_TTL = 120          # seconds
 _DNSSD_FLAGS = 0x100000 | 0x20000   # kDNSServiceFlagsIncludeAWDL | IncludeP2P
 
@@ -212,7 +214,10 @@ def nearby_scan(wait: float = 3.0, want=None) -> list[dict]:
     if sys.platform != "darwin":
         raise SystemExit("nearby discovery needs macOS (Apple peer-to-peer Wi-Fi)")
     import ctypes
-    lib = ctypes.CDLL("/usr/lib/system/libsystem_dnssd.dylib")
+    try:
+        lib = ctypes.CDLL("/usr/lib/system/libsystem_dnssd.dylib")
+    except OSError as exc:
+        raise SystemExit(f"nearby discovery unavailable: cannot load dns_sd ({exc})")
     lib.DNSServiceRefSockFD.restype = ctypes.c_int
     awdl = socket.if_nametoindex("awdl0") if hasattr(socket, "if_nametoindex") else 0
     if not awdl:
@@ -309,8 +314,7 @@ def nearby_target(query: str, fresh: bool = False) -> tuple[str, str, str]:
     devices = nearby_scan(wait=6.0, want=lambda d: _matches(d, query))
     hits = [d for d in devices if _matches(d, query)]
     if not hits:
-        raise SystemExit(f"no nearby device matches {query!r} — run `scan`; "
-                         "is Nearby Discovery on (long-press the iCTRL notification)?")
+        raise SystemExit(f"no nearby device matches {query!r} — run `scan`. On" + NO_NEARBY_HINT.split(" — on", 1)[1])
     if len({d["id"] for d in hits}) > 1:
         raise SystemExit(f"{query!r} matches several devices; use the id: "
                          + ", ".join(f"{d['name']} ({d['id'][:8]})" for d in hits))
@@ -506,7 +510,7 @@ def main() -> int:
     if args.cmd == "scan":
         devices = nearby_scan(wait=args.wait)
         if not devices:
-            print("no nearby devices — turn on Nearby Discovery from the iCTRL notification")
+            print(NO_NEARBY_HINT)
         for d in devices:
             paired = "paired" if load_token(f"nearby:{d['id']}") else ""
             print(f"{d['name']:32s} id={d['id'][:8]}  {paired}")

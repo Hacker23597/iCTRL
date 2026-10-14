@@ -725,7 +725,8 @@ int main(int argc, char **argv) {
         int n = nearby_scan(devs, NEARBY_MAX, 3.0, NULL);
         if (n == -1) die("no awdl0 interface — is Wi-Fi turned on?");
         if (n < 0) die("nearby browse failed");
-        if (n == 0) printf("no nearby devices — turn on Nearby Discovery from the iCTRL notification\n");
+        if (n == 0) printf("no nearby devices — on the phone, turn on Nearby Discovery (iCTRL notification) "
+                           "and keep Wi-Fi switched on; it need not be joined to a network\n");
         for (int k = 0; k < n; k++) {
             char store[96];
             snprintf(store, sizeof store, "nearby:%s", devs[k].id);
@@ -747,7 +748,7 @@ int main(int argc, char **argv) {
                 die("\"%s\" matches several devices; use the id", nearby);
             hit = &devs[k];
         }
-        if (!hit) die("no nearby device matches \"%s\" — run: ictrl scan", nearby);
+        if (!hit) die("no nearby device matches \"%s\" — run: ictrl scan. On the phone, turn on Nearby Discovery and keep Wi-Fi switched on", nearby);
         snprintf(nearby_store, sizeof nearby_store, "nearby:%s", hit->id);
         snprintf(nearby_host, sizeof nearby_host, "%s", hit->host);
         g_store_key = nearby_store;
