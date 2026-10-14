@@ -83,8 +83,9 @@ final class RunnerClient {
         case 200: break
         case 403: throw Failure.pairDenied
         case 429:
-            let wait = body["retry_after"] as? Int ?? 15
-            let busy = (body["error"] as? [String: Any])?["code"] as? String == "pair_busy"
+            let error = body["error"] as? [String: Any]
+            let wait = error?["retry_after"] as? Int ?? body["retry_after"] as? Int ?? 15
+            let busy = error?["code"] as? String == "pair_busy"
             throw Failure.pairUnavailable(retryAfter: wait, busy: busy)
         default: throw Failure.server(Self.message(body, status: status))
         }

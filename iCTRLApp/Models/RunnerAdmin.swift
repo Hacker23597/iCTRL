@@ -25,6 +25,10 @@ final class RunnerAdmin: ObservableObject {
     @Published private(set) var clients: [Client] = []
     /// Who can reach the runner right now, from its `config`; nil until known.
     @Published private(set) var visibility: Visibility?
+    /// Nearby discovery is switched on but not advertising yet (waiting for
+    /// Wi-Fi or permission): `visibility` says what was chosen, this says it
+    /// is not in effect.
+    @Published private(set) var nearbyPending = false
     /// The runner reported that iOS refused it Local Network access.
     @Published private(set) var localNetworkDenied = false
 
@@ -78,6 +82,8 @@ final class RunnerAdmin: ObservableObject {
             let result = try await client.call("config")
             clients = Self.parseClients(result["sessions"])
             visibility = Self.parseVisibility(result)
+            let nearby = result["nearby"] as? [String: Any]
+            nearbyPending = (nearby?["enabled"] as? Bool) == true && (nearby?["advertising"] as? Bool) != true
             localNetworkDenied = (result["nearby"] as? [String: Any])?["local_network"] as? String == "denied"
             clientsLoaded = true
             notice = nil
@@ -192,13 +198,15 @@ final class RunnerAdmin: ObservableObject {
 
     private static let iso = ISO8601DateFormatter()
 
-    /// Actual exposure, not the switches: nearby counts only while it is
-    /// really advertised (it can be on yet waiting for Wi-Fi).
+    /// The chosen setting. Nearby counts as chosen while it is switched on,
+    /// advertised or not — otherwise "LAN" could not be picked to switch off
+    /// a nearby discovery that is still waiting for Wi-Fi; `nearbyPending`
+    /// tells the two apart for display.
     private static func parseVisibility(_ config: [String: Any]) -> Visibility? {
         guard let remote = config["allow_remote_access"] as? Bool else { return nil }
         guard remote else { return .local }
         let nearby = config["nearby"] as? [String: Any]
-        return (nearby?["advertising"] as? Bool) == true ? .lanAndNearby : .lan
+        return (nearby?["enabled"] as? Bool) == true ? .lanAndNearby : .lan
     }
 
     private static func parseClients(_ value: Any?) -> [Client] {

@@ -71,7 +71,8 @@ struct RunnerVisibilityRow: View {
                 if admin.changingVisibility {
                     ProgressView().controlSize(.small)
                 } else {
-                    Text(Self.text(visibility))
+                    Text(visibility == .lanAndNearby && admin.nearbyPending
+                         ? L10n.t(.visibilityNearbyPending) : Self.text(visibility))
                         .foregroundColor(.secondary)
                 }
                 Image(systemName: "chevron.up.chevron.down")
