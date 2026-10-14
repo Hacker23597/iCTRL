@@ -307,6 +307,13 @@ struct SettingsView: View {
                 if let visibility = runnerAdmin.visibility {
                     RunnerVisibilityRow(visibility: visibility)
                 }
+                if runnerAdmin.localNetworkDenied {
+                    // Remote clients connecting in still work without it, so
+                    // this is the only sign of why nearby discovery cannot.
+                    Text(L10n.t(.runnerLocalNetworkDenied))
+                        .font(.footnote)
+                        .foregroundColor(.orange)
+                }
                 NavigationLink {
                     RunnerClientsView()
                 } label: {

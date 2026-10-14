@@ -85,7 +85,7 @@ enum L10n {
         case noClients, pairedAt, lastActive, clientsFooter
         case liveLabel, pausedLabel, filterPlaceholder, noLogLines, copyButton, runnerLogsCaption, cancelButton
         case viaLocal, viaLAN, viaNearby, viaVPN, viaCellular, viaOther
-        case visibilityLabel, visibilityLocal, visibilityLAN, visibilityLANNearby
+        case visibilityLabel, visibilityLocal, visibilityLAN, visibilityLANNearby, runnerLocalNetworkDenied
     }
 
     // key → (lang → text). English is the required fallback for every key.
@@ -371,6 +371,9 @@ enum L10n {
         .viaCellular: [.en: "Cellular", .zhHans: "蜂窝网络", .zhHant: "行動網路"],
         .viaOther: [.en: "Other", .zhHans: "其他", .zhHant: "其他"],
         .visibilityLabel: [.en: "Visibility", .zhHans: "可见性", .zhHant: "可見性"],
+        .runnerLocalNetworkDenied: [.en: "⚠️ The runner has no Local Network access, so nearby discovery cannot work. Allow it in Settings › Privacy & Security › Local Network › iCTRLUITests-Runner.",
+                                    .zhHans: "⚠️ Runner 没有本地网络权限，近场发现无法使用。请在 设置 › 隐私与安全 › 本地网络 中打开 iCTRLUITests-Runner。",
+                                    .zhHant: "⚠️ Runner 沒有本地網路權限，近場探索無法使用。請在 設定 › 隱私權與安全性 › 本地網路 中開啟 iCTRLUITests-Runner。"],
         .visibilityLocal: [.en: "🟢 This device only · safe", .zhHans: "🟢 仅本机 · 安全", .zhHant: "🟢 僅本機 · 安全"],
         .visibilityLAN: [.en: "🟡 LAN", .zhHans: "🟡 局域网", .zhHant: "🟡 區域網路"],
         .visibilityLANNearby: [.en: "🟡 LAN + Nearby (AWDL)", .zhHans: "🟡 局域网 + 近场 (AWDL)", .zhHant: "🟡 區域網路 + 近場 (AWDL)"],

@@ -25,6 +25,8 @@ final class RunnerAdmin: ObservableObject {
     @Published private(set) var clients: [Client] = []
     /// Who can reach the runner right now, from its `config`; nil until known.
     @Published private(set) var visibility: Visibility?
+    /// The runner reported that iOS refused it Local Network access.
+    @Published private(set) var localNetworkDenied = false
 
     /// The runner's reach, widest first. Only local is safe from other devices.
     enum Visibility: Equatable {
@@ -76,6 +78,7 @@ final class RunnerAdmin: ObservableObject {
             let result = try await client.call("config")
             clients = Self.parseClients(result["sessions"])
             visibility = Self.parseVisibility(result)
+            localNetworkDenied = (result["nearby"] as? [String: Any])?["local_network"] as? String == "denied"
             clientsLoaded = true
             notice = nil
         } catch {
