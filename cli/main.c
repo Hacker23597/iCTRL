@@ -26,6 +26,10 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#ifdef __APPLE__
+#include <poll.h>
+#include <signal.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -103,6 +107,73 @@ static int ct_equal(const uint8_t *a, const uint8_t *b, size_t n) {
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
 
+#ifdef __APPLE__
+#define SO_RECV_ANYIF_OPT 0x1104   // <sys/socket.h> (private): accept input on a restricted interface
+#define NC_PATH "/usr/bin/nc"
+
+// Connect with a deadline: a peer whose reply is dropped would otherwise hold
+// a blocking connect for over a minute.
+static int connect_within(int fd, const struct sockaddr *sa, socklen_t len, int ms) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(fd, sa, len);
+    if (rc != 0 && errno == EINPROGRESS) {
+        struct pollfd pfd = { fd, POLLOUT, 0 };
+        rc = poll(&pfd, 1, ms);
+        if (rc == 0) { errno = ETIMEDOUT; rc = -1; }
+        else if (rc > 0) {
+            int err = 0;
+            socklen_t el = sizeof err;
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+            if (err) { errno = err; rc = -1; } else rc = 0;
+        }
+    }
+    fcntl(fd, F_SETFL, flags);
+    return rc;
+}
+
+// Reach a zoned link-local peer through Apple's /usr/bin/nc with
+// SO_RECV_ANYIF (-A). macOS Local Network privacy can refuse this process
+// outright (an instant EHOSTUNREACH, e.g. for a locally built binary run
+// from a context never granted access); the platform nc is not subject to
+// it. Returns one end of a socketpair wired to nc's stdin and stdout.
+static int nc_relay(const char *host, const char *port) {
+    int sv[2], errp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0 || pipe(errp) != 0) return -1;
+    signal(SIGCHLD, SIG_IGN);   // nc outlives the call; let the kernel reap it
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        dup2(sv[1], 0);
+        dup2(sv[1], 1);
+        dup2(errp[1], 2);
+        close(sv[0]); close(sv[1]); close(errp[0]); close(errp[1]);
+        // -G: connect timeout; -w: idle timeout; -v: report "succeeded!".
+        execl(NC_PATH, "nc", "-6", "-A", "-v", "-G", "10", "-w", "30", host, port, (char *)NULL);
+        _exit(127);
+    }
+    close(sv[1]);
+    close(errp[1]);
+    char line[512];
+    size_t n = 0;
+    struct pollfd pfd = { errp[0], POLLIN, 0 };
+    while (n < sizeof line - 1 && !memchr(line, '\n', n) && poll(&pfd, 1, 12000) > 0) {
+        ssize_t r = read(errp[0], line + n, sizeof line - 1 - n);
+        if (r <= 0) break;
+        n += (size_t)r;
+    }
+    line[n] = 0;
+    close(errp[0]);
+    if (!strstr(line, "succeeded")) {
+        close(sv[0]);
+        kill(pid, SIGKILL);
+        errno = EHOSTUNREACH;
+        return -1;
+    }
+    return sv[0];
+}
+#endif
+
 static int tcp_connect(const char *host, const char *port) {
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof hints);
@@ -117,10 +188,20 @@ static int tcp_connect(const char *host, const char *port) {
         if (fd < 0) continue;
 #ifdef __APPLE__
         // A zoned link-local peer (fe80::…%awdl0) is reachable only with the
-        // socket bound to that interface.
-        if (rp->ai_family == AF_INET6) {
-            unsigned int idx = ((struct sockaddr_in6 *)rp->ai_addr)->sin6_scope_id;
-            if (idx) setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof idx);
+        // socket bound to that interface; SO_RECV_ANYIF also lets its reply in
+        // through the restricted interface. Refused or silent: relay via nc.
+        unsigned int idx = rp->ai_family == AF_INET6 ? ((struct sockaddr_in6 *)rp->ai_addr)->sin6_scope_id : 0;
+        if (idx) {
+            int one = 1;
+            setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof idx);
+            setsockopt(fd, SOL_SOCKET, SO_RECV_ANYIF_OPT, &one, sizeof one);
+            if (connect_within(fd, rp->ai_addr, rp->ai_addrlen, 4000) == 0) break;
+            int saved = errno;
+            close(fd);
+            fd = access(NC_PATH, X_OK) == 0 ? nc_relay(host, port) : -1;
+            if (fd >= 0) { freeaddrinfo(res); return fd; }
+            errno = saved;
+            continue;
         }
 #endif
         if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
@@ -128,7 +209,15 @@ static int tcp_connect(const char *host, const char *port) {
         fd = -1;
     }
     freeaddrinfo(res);
-    if (fd < 0) die("cannot connect to %s:%s (%s)", host, port, strerror(errno));
+    if (fd < 0) {
+#ifdef __APPLE__
+        if (errno == EHOSTUNREACH && strchr(host, '%'))
+            die("cannot connect to %s:%s (%s) — allow Local Network access for the app running "
+                "this client (System Settings › Privacy & Security › Local Network)",
+                host, port, strerror(errno));
+#endif
+        die("cannot connect to %s:%s (%s)", host, port, strerror(errno));
+    }
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     return fd;

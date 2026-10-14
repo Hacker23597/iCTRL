@@ -43,6 +43,7 @@ import os
 import secrets
 import select
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -97,22 +98,116 @@ def _keystream_xor(key: bytes, nonce: bytes, data: bytes) -> bytes:
     return (int.from_bytes(data, "big") ^ int.from_bytes(bytes(out[:n]), "big")).to_bytes(n, "big")
 
 
+class _NcSocket:
+    """The parts of a socket http.client uses, over nc's stdin/stdout. Two
+    separate pipes: with one socketpair for both directions, nc's half-close
+    of one side cuts a longer reply short."""
+
+    def __init__(self, proc):
+        self._proc = proc
+
+    def sendall(self, data):
+        self._proc.stdin.write(data)
+        self._proc.stdin.flush()
+
+    def makefile(self, mode, *args, **kwargs):
+        # A descriptor of its own: urllib closes the connection once the
+        # headers are in, and the response goes on reading from this copy.
+        return os.fdopen(os.dup(self._proc.stdout.fileno()), "rb")
+
+    def settimeout(self, timeout):
+        pass
+
+    def close(self):
+        pass
+
+
 class _ZonedHTTPConnection(http.client.HTTPConnection):
-    """Dial a zoned link-local IPv6 host ("fe80::1%awdl0") with the socket bound
-    to that interface; macOS does not route to a peer-to-peer (AWDL) peer
-    otherwise. Every other host connects as usual."""
+    """Dial a zoned link-local IPv6 host ("fe80::1%awdl0"); every other host
+    connects as usual.
+
+    Directly first: the socket bound to the interface (macOS routes to an
+    AWDL peer only then, and a bound socket also accepts the reply arriving on
+    that restricted interface) plus SO_RECV_ANYIF for good measure. macOS
+    Local Network privacy can still refuse the process outright — an instant
+    EHOSTUNREACH, typically for an interpreter run from a context that was
+    never granted access. Apple's own /usr/bin/nc is not subject to it, so
+    the connection then goes through `nc -A` instead, for the rest of this
+    run."""
+
+    _via_nc = False             # set once a direct connection was refused
+    _DIRECT_TIMEOUT = 4.0       # a refusal is instant; a dropped SYN-ACK is not
 
     def connect(self):
         host = self.host.strip("[]")
         if "%" not in host:
             return super().connect()
+        timeout = self.timeout if isinstance(self.timeout, (int, float)) else 30.0
+        if not _ZonedHTTPConnection._via_nc:
+            try:
+                self.sock = self._direct(host, min(timeout, self._DIRECT_TIMEOUT))
+                return
+            except OSError as exc:
+                if not os.access(_NC, os.X_OK):
+                    raise OSError(f"cannot reach {host}: {exc}. If 'No route to host', allow Local "
+                                  "Network access for the app running this client (System Settings "
+                                  "› Privacy & Security › Local Network)") from exc
+                _ZonedHTTPConnection._via_nc = True
+        self._nc = self._relay(host, timeout)
+        self.sock = _NcSocket(self._nc)
+
+    def _direct(self, host, timeout):
         addr, zone = host.split("%", 1)
         index = socket.if_nametoindex(zone)
         sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        sock.setsockopt(socket.IPPROTO_IPV6, _IPV6_BOUND_IF, index)
-        sock.settimeout(self.timeout)
-        sock.connect((addr, self.port, 0, index))
-        self.sock = sock
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, _IPV6_BOUND_IF, index)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, _SO_RECV_ANYIF, 1)
+            except OSError:
+                pass
+            sock.settimeout(timeout)
+            sock.connect((addr, self.port, 0, index))
+            sock.settimeout(self.timeout)
+            return sock
+        except OSError:
+            sock.close()
+            raise
+
+    def _relay(self, host, timeout):
+        secs = str(max(1, int(timeout)))
+        # -A: SO_RECV_ANYIF. -G: connect timeout; -w: idle timeout, so a silent
+        # peer ends the read. -v reports "... succeeded!" once connected.
+        proc = subprocess.Popen([_NC, "-6", "-A", "-v", "-G", secs, "-w", secs, host, str(self.port)],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        line = b""
+        deadline = time.time() + timeout
+        while b"\n" not in line:
+            left = deadline - time.time()
+            if left <= 0 or not select.select([proc.stderr], [], [], left)[0]:
+                break
+            chunk = os.read(proc.stderr.fileno(), 512)
+            if not chunk:
+                break
+            line += chunk
+        if b"succeeded" not in line:
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+            if proc.poll() is None:
+                proc.kill()
+            msg = line.decode("utf-8", "replace").strip() or "no answer"
+            raise OSError(f"AWDL connection to {host} port {self.port} failed: {msg}")
+        return proc
+
+    def close(self):
+        # nc is left to finish: it exits once the peer closes (the server
+        # answers with Connection: close) or after its idle timeout. Stopping
+        # it here would cut off a response that is still being read.
+        super().close()
+        self._nc = None
 
 
 class _ZonedHandler(urllib.request.HTTPHandler):
@@ -121,7 +216,12 @@ class _ZonedHandler(urllib.request.HTTPHandler):
 
 
 _IPV6_BOUND_IF = 125            # <netinet6/in6.h>, macOS
-_opener = urllib.request.build_opener(_ZonedHandler)
+_SO_RECV_ANYIF = 0x1104         # <sys/socket.h> (private), macOS: accept input on a restricted interface
+_NC = "/usr/bin/nc"
+# No proxy, ever: every iCTRL host is loopback, on the LAN or link-local, and
+# a proxy taken from http_proxy cannot reach any of them (a link-local
+# address not even in principle).
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _ZonedHandler)
 
 
 def _post(url: str, obj: dict, timeout: float) -> tuple[int, dict]:

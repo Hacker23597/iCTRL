@@ -374,7 +374,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.98.5"
+    static let serverVersion = "1.98.6"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///
