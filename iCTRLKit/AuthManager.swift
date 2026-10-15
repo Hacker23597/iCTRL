@@ -8,8 +8,12 @@ protocol AuthManagerDelegate: AnyObject {
     /// `AuthManager.approvalTimeout` regardless.
     ///
     /// `requestID` names this request; a later expiry carries the same id.
+    /// `fingerprint`: 8 hex characters the client also prints (SHA-256 of its
+    /// X25519 public key, first 4 bytes), so the user can tell that the prompt
+    /// belongs to their computer; nil for a plain loopback grant.
     func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String,
-                     requestID: String, nearby: Bool, completion: @escaping (Bool) -> Void)
+                     requestID: String, nearby: Bool, fingerprint: String?,
+                     completion: @escaping (Bool) -> Void)
     /// The request timed out before the user answered; withdraw its prompt.
     func authManager(_ manager: AuthManager, didExpireAuthRequest clientName: String, requestID: String)
 }
@@ -140,7 +144,7 @@ class AuthManager {
     /// request holds off new ones for `pairCooldown`.
     /// `local`: the request came over loopback (this device or USB); it has
     /// its own slot, see `pairSlots`.
-    func requestAuth(clientName: String, nearby: Bool, local: Bool = false,
+    func requestAuth(clientName: String, nearby: Bool, local: Bool = false, fingerprint: String? = nil,
                      completion: @escaping (PairOutcome) -> Void) {
         lock.lock()
         let now = Date()
@@ -181,7 +185,7 @@ class AuthManager {
             return true
         }
         delegate.authManager(self, didReceiveAuthRequest: clientName, requestID: requestID,
-                             nearby: nearby) { [weak self] approved in
+                             nearby: nearby, fingerprint: fingerprint) { [weak self] approved in
             guard let self = self, claim() else { return }
             self.finishPairing(clientName: clientName, approved: approved, local: local, completion: completion)
         }

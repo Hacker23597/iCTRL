@@ -2010,10 +2010,17 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         }
     }
 
-    private func sendAuthNotification(clientName: String, requestID: String, nearby: Bool) {
+    private func sendAuthNotification(clientName: String, requestID: String, nearby: Bool, fingerprint: String?) {
         let content = UNMutableNotificationContent()
         content.title = L10n.t(.authRequestTitle)
-        content.body = String(format: L10n.t(nearby ? .authRequestNearbyBody : .authRequestBody), clientName)
+        var lines = String(format: L10n.t(nearby ? .authRequestNearbyBody : .authRequestBody), clientName)
+            .components(separatedBy: "\n")
+        // Second line, ahead of the long-press hint: a banner shows only the
+        // first few lines, and the key is what to check before allowing.
+        if let fingerprint {
+            lines.insert(String(format: L10n.t(.authKeyLine), fingerprint), at: min(1, lines.count))
+        }
+        content.body = lines.joined(separator: "\n")
         content.sound = .default
         content.categoryIdentifier = Self.authCategoryID
 
@@ -2216,14 +2223,14 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
 
 extension iCTRLUITests: AuthManagerDelegate {
     func authManager(_ manager: AuthManager, didReceiveAuthRequest clientName: String, requestID: String,
-                     nearby: Bool, completion: @escaping (Bool) -> Void) {
+                     nearby: Bool, fingerprint: String?, completion: @escaping (Bool) -> Void) {
         authLock.lock()
         pendingAuthCompletions[requestID] = completion
         currentAuthRequestID = requestID
         authLock.unlock()
 
         Self.logBuffer.append("🔐 Auth request from \"\(clientName)\"\(nearby ? " (nearby device)" : "")")
-        sendAuthNotification(clientName: clientName, requestID: requestID, nearby: nearby)
+        sendAuthNotification(clientName: clientName, requestID: requestID, nearby: nearby, fingerprint: fingerprint)
     }
 
     func authManager(_ manager: AuthManager, didExpireAuthRequest clientName: String, requestID: String) {

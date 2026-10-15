@@ -43,6 +43,7 @@ enum L10n {
         case remoteFailedBody, remoteDisabledBody
         case authRequestBody       // %@ = client name
         case authRequestNearbyBody // %@ = client name; the request came over peer-to-peer Wi-Fi
+        case authKeyLine           // %@ = key fingerprint the client also prints
         case onDeviceOnlySuffix
         // Reachability marker shown on the status notification (one of three).
         case statusNearby, statusLAN, statusLocal, statusNoLAN
@@ -139,6 +140,14 @@ enum L10n {
                             .es: "iCTRL está escuchando pero no se puede acceder a %@ — probablemente el permiso de Red local. Abre la app iCTRL, permite la Red local y vuelve a conectar. (localhost sigue funcionando)",
                             .de: "iCTRL lauscht, aber %@ ist nicht erreichbar — vermutlich die Berechtigung „Lokales Netzwerk“. Öffne die iCTRL-App, erlaube das lokale Netzwerk und verbinde dich neu. (localhost funktioniert weiterhin)",
                             .ru: "iCTRL слушает, но %@ недоступен — вероятно, нет разрешения на локальную сеть. Откройте приложение iCTRL, разрешите локальную сеть и переподключитесь. (localhost по-прежнему работает)"],
+        .authKeyLine: [.en: "Key %@ — allow only if your computer shows the same",
+                       .zhHans: "密钥 %@ — 与电脑上显示的一致才允许",
+                       .zhHant: "金鑰 %@ — 與電腦上顯示的一致才允許",
+                       .ja: "キー %@ — コンピュータの表示と一致する場合のみ許可",
+                       .ko: "키 %@ — 컴퓨터에 표시된 것과 같을 때만 허용",
+                       .es: "Clave %@ — permite solo si tu ordenador muestra la misma",
+                       .de: "Schlüssel %@ — nur erlauben, wenn dein Computer denselben zeigt",
+                       .ru: "Ключ %@ — разрешайте, только если компьютер показывает такой же"],
         .authRequestBody: [.en: "\"%@\" wants to control this device.\nLong press to Allow or Deny",
                            .zhHans: "“%@” 请求控制此设备。\n长按以允许或拒绝",
                            .zhHant: "「%@」請求控制此裝置。\n長按以允許或拒絕",

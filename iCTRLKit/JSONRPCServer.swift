@@ -517,8 +517,10 @@ class JSONRPCServer {
                 "server_version": RPCMethodRegistry.serverVersion,
             ]
             let data = (try? JSONSerialization.data(withJSONObject: info, options: [.sortedKeys])) ?? Data("{}".utf8)
+            // Same-origin only: any web page the phone (or a LAN browser)
+            // opens could otherwise read the device id and name.
             sendHTTPResponse(connection: connection, status: 200, contentType: "application/json",
-                             body: String(data: data, encoding: .utf8) ?? "{}")
+                             body: String(data: data, encoding: .utf8) ?? "{}", cors: false)
 
         case ("GET", "/skill"), ("GET", "/skill.md"), ("GET", "/SKILL.md"):
             handleSkill(connection: connection)
@@ -826,7 +828,11 @@ class JSONRPCServer {
             return
         }
 
-        AuthManager.shared.requestAuth(clientName: clientName, nearby: nearby, local: isLoopback) { [weak self] outcome in
+        // Shown on the prompt and printed by the client, so a request from an
+        // impostor on the network can be told apart from the user's own.
+        let fingerprint = clientPub.map { Data(SHA256.hash(data: $0).prefix(4)).hexString }
+        AuthManager.shared.requestAuth(clientName: clientName, nearby: nearby, local: isLoopback,
+                                       fingerprint: fingerprint) { [weak self] outcome in
             guard let self = self else { return }
             let session: AuthSession
             switch outcome {
@@ -1169,13 +1175,16 @@ class JSONRPCServer {
         [
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            "Access-Control-Expose-Headers": Self.deviceHeader,
+            "Access-Control-Allow-Headers": Self.corsAllowHeaders,
+            // Not listed in Access-Control-Expose-Headers: a web page must not
+            // be able to read a stable device id cross-origin. Clients that
+            // need it are not browsers.
             Self.deviceHeader: NearbyIdentity.deviceID,
         ]
     }
 
     static let deviceHeader = "X-ICTRL-Device"
+    private static let corsAllowHeaders = "Content-Type, Authorization"
     /// Parameter the server adds to `config`: the request's `PeerSource`.
     static let peerSourceParam = "_peer_source"
 
@@ -1200,7 +1209,8 @@ class JSONRPCServer {
         })
     }
 
-    private func sendHTTPResponse(connection: NWConnection, status: Int, headers: [String: String] = [:], contentType: String = "text/plain", body: String) {
+    private func sendHTTPResponse(connection: NWConnection, status: Int, headers: [String: String] = [:],
+                                  contentType: String = "text/plain", body: String, cors: Bool = true) {
         let statusText: String
         switch status {
         case 200: statusText = "OK"
@@ -1216,6 +1226,11 @@ class JSONRPCServer {
         let bodyData = body.data(using: .utf8) ?? Data()
 
         var allHeaders = corsHeaders()
+        if !cors {
+            for key in ["Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers"] {
+                allHeaders.removeValue(forKey: key)
+            }
+        }
         allHeaders["Content-Type"] = contentType
         allHeaders["Content-Length"] = "\(bodyData.count)"
         allHeaders["Connection"] = "close"
