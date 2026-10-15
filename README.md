@@ -59,7 +59,7 @@ flowchart LR
   subgraph phone["iPhone"]
     direction TB
     R["iCTRL runner :8200<br/>127.0.0.1 only by default"]
-    N["🔔 Runner notifications<br/>✅ Allow pairing · 🌐 Remote Access · 🛑 Stop"]
+    N["🔔 Runner notifications<br/>✅ Allow pairing · 🌐 Remote Access · 📡 Nearby · 🛑 Stop"]
     N -. "🌐 Remote Access opens it to the LAN" .-> R
   end
 
@@ -149,7 +149,8 @@ three-app limit, installing StikDebug *or* the iCTRL app is enough.
   authenticated: X25519 key exchange, a per-request HMAC-SHA256 envelope, and
   replay and clock-skew protection.
 - **Local only until you say otherwise.** Remote access is off by default, and
-  an unused key expires after 30 days.
+  an unused key expires after 30 days. Nearby discovery is a separate, explicit
+  step, and only this device can switch it on.
 
 **No Mac required**
 - Install with a **free Apple ID** through SideStore, and mount the Developer
@@ -158,6 +159,9 @@ three-app limit, installing StikDebug *or* the iCTRL app is enough.
   pairing, toggle remote access or stop the server.
 - **Clients come from the device:** a Python client and a pure-C static CLI for
   agents in on-device sandboxes such as Minis.
+- **No address to type:** with nearby discovery on, clients find the phone on
+  the LAN, or from a Mac over Apple peer-to-peer Wi-Fi with no shared network
+  at all. One key per device works over USB, the LAN and nearby.
 
 **Also included:**
 - live H.264 screen stream (`GET /stream`) and a browser control page (`GET /remote`)
@@ -433,8 +437,11 @@ iCTRL app.
    notifications are how you control it (below). If you deny this, you can't
    approve a pairing request. Fix it later under **Settings → Notifications →
    iCTRLUITests-Runner**.
-3. **Local Network → Allow.** Without it, other machines can't reach the
-   server.
+3. **Local Network → Allow.** The runner asks right after it starts. Without
+   it the self-check and nearby discovery fail (clients connecting in over the
+   LAN may still work, which hides the problem). If you denied it, switch on
+   **iCTRLUITests-Runner** under **Settings → Privacy & Security → Local
+   Network**; the iCTRL app warns when it is missing.
 
 ### Controlling iCTRL from its notification
 
@@ -445,7 +452,7 @@ to get its menu:
 
 | Notification | Menu |
 |---|---|
-| **🟢 iCTRL Server Ready** — always present while the server runs; refreshes silently every 5 minutes | **🌐 Enable Remote Access** / **🔒 Disable Remote Access**, **🛑 Stop Server** |
+| **🟢 iCTRL Server Ready** — always present while the server runs; refreshes silently every 5 minutes. Its first line says who can reach the phone: **🔒 This device only**, **🌐 LAN reachable**, **📡 Nearby discoverable**, or why nearby isn't ready yet (e.g. *turn on Wi-Fi*, *allow Local Network*) | **🌐 Enable Remote Access** / **🔒 Disable Remote Access**, **📡 Enable Nearby Discovery** / **📴 Disable Nearby Discovery** (with remote access on), **🛑 Stop Server** |
 | **Pairing request** from a client | **✅ Allow** / **⛔️ Deny** |
 | **⏹️ iCTRL Server Stopped** | **📋 Copy Logs** |
 
@@ -456,6 +463,41 @@ to get its menu:
   unlocked. iOS asks for Face ID / the passcode if it isn't.
 - To start again after **Stop Server**, open the runner (or tap **Start
   Server** in the iCTRL app) again.
+- The iCTRL app shows the same switch as a **Visibility** menu.
+
+### Who can reach it: visibility
+
+| Setting | Reachable from | Announced (Bonjour) |
+|---|---|---|
+| 🔒 **This device only** (default) | apps on the phone, a computer over USB | nowhere |
+| 🌐 **LAN** (remote access on) | anyone on the same network who knows the address | nowhere |
+| 📡 **LAN + nearby** (nearby discovery on) | the above, plus nearby Apple devices over peer-to-peer Wi-Fi (AWDL) | on the LAN and over AWDL |
+
+Every client still needs a key approved on the phone; visibility only decides
+who can ask. Nearby discovery can be switched **on** only from the phone itself
+(its notification, the iCTRL app, or a computer over USB); anyone with a key
+can switch it off.
+
+### Finding the device: nearby discovery
+
+With **📡 Nearby discovery** on, a client needs no address:
+
+```bash
+python3 ictrl_rpc.py scan                        # lists the phone: LAN and/or nearby (AWDL)
+python3 ictrl_rpc.py --nearby "iPhone 15 (7f3a)" call device_info   # or an id prefix: --nearby 7f3a
+```
+
+- **On the LAN** from any OS (macOS uses Bonjour; elsewhere the Python client
+  sends its own mDNS query).
+- **Over AWDL** from a Mac, with no shared network: the phone only needs Wi-Fi
+  switched **on**, not joined to anything. This needs macOS (the Python client,
+  or the C CLI built on macOS).
+- The phone is advertised as its model plus a short id, e.g. *iPhone 15
+  (7f3a)*; a paired client can rename it with `config{device_name}`. On the LAN
+  iOS also announces the phone's own host name, which often contains its
+  owner's name.
+- A phone whose screen is off may stop being discoverable over AWDL, as with
+  AirDrop. Wake it if it disappears.
 
 ### Check that it's up
 
@@ -491,13 +533,18 @@ hand-roll the crypto — download a client from the device itself:
 curl -o ictrl_rpc.py http://<device-ip>:8200/skill/clients/python
 
 # Pair once — long-press the pairing notification on the phone → ✅ Allow
-# (blocks up to 60s). LAN pairing needs: pip install cryptography
+# (blocks up to 60s). Standard library only, no packages to install.
 python3 ictrl_rpc.py --host <device-ip>:8200 pair
 
 # Drive it
 python3 ictrl_rpc.py --host <device-ip>:8200 call device_info
 python3 ictrl_rpc.py --host <device-ip>:8200 call tap '{"x":100,"y":200}'
 ```
+
+No address at hand? Turn on nearby discovery and use `scan` / `--nearby`
+([above](#finding-the-device-nearby-discovery)). Keys are stored per device in
+`~/.ictrl/token.json`, so a phone paired once works over USB, the LAN and nearby
+without pairing again.
 
 There is also a static aarch64-musl CLI at `/skill/clients/cli` for sandboxes
 with no Python.
@@ -518,7 +565,7 @@ All methods are JSON-RPC 2.0 (`POST /rpc`). Highlights:
 | **Read** | `screenshot`, `page_source`, `find_element`, `screen_text` (Vision OCR) |
 | **Apps** | `launch_app`, `activate_app`, `terminate_app`, `list_apps`, `resolve_app`, `open_url` |
 | **Device** | `device_info`, `home`, `lock`, `unlock`, `is_locked`, `wait` |
-| **Server** | `config` (settings, sessions, `stop_server`), `reset`, `stream_ticket` |
+| **Server** | `config` (remote access, `nearby_discovery`, `device_name`, sessions and revocation, `stop_server`), `reset`, `stream_ticket` |
 
 Notable behaviour:
 
@@ -536,6 +583,9 @@ Notable behaviour:
 
 `GET /`, `GET /remote` (browser control page), `GET /stream` (live H.264),
 `GET /logs`, and `GET /logs/history?date=` expose docs, a UI and redacted logs.
+`GET /whoami` (unauthenticated) returns the device id, name and versions, and
+every response carries the id in an `X-ICTRL-Device` header, so clients can keep
+one key per device.
 
 ## Auth & sessions
 
@@ -548,6 +598,21 @@ Notable behaviour:
 
 Each request is then sealed with HMAC-SHA256 keys derived from `K` and a fresh
 16-byte nonce; replays and clock skew beyond ±120s are rejected.
+
+Pairing rules:
+- **Every pairing is approved on the phone**; there is no "trusted for a while"
+  shortcut. An unanswered request is refused after 60 s and its prompt removed.
+- **Check the key before allowing.** The prompt shows a key fingerprint and the
+  client prints the same one (`key fingerprint: …`). Discovery can be answered
+  by anyone on the network under your phone's name, so allow only a request
+  whose fingerprint matches your computer's — and if the client says it is
+  pairing but the phone shows no prompt, something else answered.
+- **One request waits at a time**, with a 15 s cooldown after a refusal. Requests
+  from the phone itself (the iCTRL app, USB) have their own slot, so a remote
+  caller can't lock them out.
+- Requests that arrive over AWDL are labelled *nearby device* in the prompt.
+- `config` lists each client with where it last connected from (this device /
+  USB, LAN, nearby, VPN) and can revoke it, as can the iCTRL app.
 
 Keys live in a sandbox file (not the Keychain), so OTA re-signing doesn't
 invalidate them. **A key is dropped after 30 days with no successful call** —
@@ -613,6 +678,10 @@ Makefile         build + sign + package
 ## Notes & limitations
 
 - The **runner** must be running — the host app alone does nothing.
+- **Nearby discovery** over AWDL needs macOS on the client side and Wi-Fi
+  switched on at both ends. Endpoints that need no key (`/schema`, `/skill`,
+  `/remote`, `/whoami`, `/pair`) answer over it too, and the screen stream is
+  not encrypted on any channel.
 - Uses several private XCTest / `LSApplicationWorkspace` APIs — **not** App Store
   safe; intended for automation on your own devices.
 - `unlock` only wakes the screen. It cannot enter a passcode, and it is not a way
