@@ -407,10 +407,14 @@ four steps on that screen:
 
 1. **Start LocalDevVPN.** Tap *Open LocalDevVPN & connect*. The app sends you
    there and brings you back.
-2. **Import a pairing file.** Use the one iLoader produces, or create one on a
-   Mac with `idevicepair pair` (libimobiledevice) and send it over AirDrop,
-   Files or iCloud. If the picker can't reach the file, share it to iCTRL from
-   the app that has it; iCTRL confirms once it is stored.
+2. **Import a RemotePairing file.** StikDebug's `pairingFile.plist` works as
+   is. iLoader, or [idevice_pair](https://github.com/jkcoxson/idevice_pair) on
+   a computer (choose *Remote pairing*), can also create one. Send it over
+   AirDrop, Files or iCloud. If the picker can't reach the file, share it to
+   iCTRL from the app that has it; iCTRL confirms once it is stored. A
+   lockdown pairing file (from `idevicepair pair`, or SideStore's
+   `ALTPairingFile.mobiledevicepairing`) is refused: it cannot open the
+   tunnel the mount uses.
 3. **Download image files.** About 100 MB, downloaded once and reused.
 4. **Mount Developer Disk Image.**
 
