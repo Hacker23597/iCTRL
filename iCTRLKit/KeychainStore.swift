@@ -1,13 +1,14 @@
 import Foundation
 import Security
 
-/// Minimal Keychain-backed store for persisting auth sessions across launches.
-/// Stored as a single JSON blob under one generic-password item.
+/// Minimal Keychain-backed store: one JSON blob per generic-password item.
+/// The default item holds the server's auth sessions; other callers name
+/// their own `account`.
 enum KeychainStore {
     private static let service = "com.openminis.ictrl.auth"
-    private static let account = "sessions"
+    static let sessionsAccount = "sessions"
 
-    static func save(_ data: Data) {
+    static func save(_ data: Data, account: String = sessionsAccount) {
         // Delete existing, then add fresh.
         let deleteQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -27,7 +28,7 @@ enum KeychainStore {
         SecItemAdd(addQuery as CFDictionary, nil)
     }
 
-    static func load() -> Data? {
+    static func load(account: String = sessionsAccount) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -41,7 +42,7 @@ enum KeychainStore {
         return result as? Data
     }
 
-    static func clear() {
+    static func clear(account: String = sessionsAccount) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

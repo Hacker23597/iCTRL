@@ -43,4 +43,28 @@ the binary arrives without an exec bit. The wrapper runs under `sh` (which needs
 none) and fixes the mode on first use.
 
 Keys live in `~/.ictrl/token.json` — the same file and format the Python client
-uses, so the two are interchangeable.
+uses, so the two are interchangeable. They are stored per device
+(`device:<id>`, the id from the device's `GET /whoami`), so a phone paired once
+is reachable over USB, the LAN and nearby without pairing again; keys an older
+client stored under an address are picked up and moved on first use.
+
+## Nearby devices (macOS)
+
+On a Mac the same source builds natively and gains nearby discovery: reaching a
+phone over Apple peer-to-peer Wi-Fi when the two are not on the same network.
+The phone must have *Nearby Discovery* turned on (its notification or the iCTRL
+app; it needs Remote Access) and Wi-Fi switched on, though not joined to a
+network. The C CLI lists AWDL devices only; the Python client's `scan` also
+finds the phone on the LAN.
+
+```sh
+cc -O2 -std=c11 -o ictrl main.c sha256.c x25519.c util.c nearby.c
+./ictrl scan                                  # nearby devices: name and id
+./ictrl --nearby "iPhone 15 (7f3a)" call device_info
+./ictrl --nearby 7f3a shot screen.jpg         # an id prefix works too
+```
+
+The first call to a device pairs with it (approve the prompt on the phone once).
+If macOS Local Network privacy refuses the connection, the CLI relays it through
+the system's `/usr/bin/nc -A`. `nearby.c` uses the system dns_sd API and is not
+part of the Linux build.

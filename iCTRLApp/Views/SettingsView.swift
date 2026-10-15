@@ -17,6 +17,7 @@ struct SettingsView: View {
     @State private var launchFailed = false
     @State private var showMountSheet = false
     @StateObject private var runner = RunnerStatus(port: 8200)
+    @EnvironmentObject private var runnerAdmin: RunnerAdmin
     @State private var logCount = AppLog.allFiles().count
 
 
@@ -302,6 +303,43 @@ struct SettingsView: View {
                                 .foregroundColor(.secondary)
                         }
                     }
+                }
+                if let visibility = runnerAdmin.visibility {
+                    RunnerVisibilityRow(visibility: visibility)
+                }
+                if runnerAdmin.localNetworkDenied {
+                    // Remote clients connecting in still work without it, so
+                    // this is the only sign of why nearby discovery cannot.
+                    Text(L10n.t(.runnerLocalNetworkDenied))
+                        .font(.footnote)
+                        .foregroundColor(.orange)
+                }
+                NavigationLink {
+                    RunnerClientsView()
+                } label: {
+                    HStack {
+                        Text(L10n.t(.authorizedClients))
+                        Spacer()
+                        if runnerAdmin.clientsLoaded {
+                            Text(verbatim: "\(runnerAdmin.clients.count)")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                // Count and visibility without opening the list, kept current
+                // while this screen is shown (remote access and nearby can be
+                // switched from the runner's notification at any time). Only
+                // once paired: pairing itself is never started from here.
+                .task(id: runnerAdmin.isPaired) {
+                    while !Task.isCancelled && runnerAdmin.isPaired {
+                        await runnerAdmin.loadClients()
+                        try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    }
+                }
+                NavigationLink {
+                    RunnerLogsView()
+                } label: {
+                    Text(L10n.t(.runnerLogs))
                 }
                 Button(role: .destructive) {
                     stopRunner()

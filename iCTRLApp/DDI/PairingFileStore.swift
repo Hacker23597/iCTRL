@@ -104,6 +104,23 @@ enum PairingFileStore {
         ictrlLog("Pairing file imported (\(data.count)B)")
     }
 
+    /// Posted after a pairing file is stored, so a screen showing the old
+    /// state can refresh.
+    static let didImport = Notification.Name("PairingFileStore.didImport")
+
+    /// Store a file shared to the app ("Open in iCTRL"). iOS hands over a copy
+    /// in an inbox folder of ours (Documents/Inbox, or tmp/<bundle id>-Inbox
+    /// on newer systems), which is removed afterwards whatever the outcome.
+    static func importShared(from url: URL) throws {
+        defer {
+            if url.deletingLastPathComponent().lastPathComponent.hasSuffix("Inbox") {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try importFile(from: url)
+        NotificationCenter.default.post(name: didImport, object: nil)
+    }
+
     static func remove() {
         try? FileManager.default.removeItem(at: storedURL)
     }

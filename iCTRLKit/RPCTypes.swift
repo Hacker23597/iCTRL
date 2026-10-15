@@ -161,6 +161,11 @@ struct AuthSession: Identifiable, Codable {
     let clientName: String
     let grantedAt: Date
     var lastActiveAt: Date
+    /// Where the last authenticated request came from: the peer address
+    /// (no port) and how it arrived — see `PeerSource`. Nil for sessions not
+    /// used since this was recorded.
+    var lastAddress: String?
+    var lastVia: String?
 
     /// The 32-byte key, or nil if the stored record is corrupt.
     var key: Data? { Data(hexString: keyHex) }
@@ -176,5 +181,22 @@ struct AuthSession: Identifiable, Codable {
         case clientName = "client_name"
         case grantedAt = "granted_at"
         case lastActiveAt = "last_active_at"
+        case lastAddress = "last_address"
+        case lastVia = "last_via"
     }
+}
+
+/// How a request reached the server, judged by the interface it arrived on.
+enum PeerSource: String {
+    /// Loopback: an app on this device, or a computer over USB (usbmuxd
+    /// forwards to the device's loopback, so the two look the same).
+    case local
+    /// Wi-Fi, Ethernet or the Personal Hotspot bridge.
+    case lan
+    /// Apple peer-to-peer Wi-Fi (AWDL): nearby discovery.
+    case nearby
+    /// A VPN or proxy tunnel (utun, ipsec, ppp).
+    case vpn
+    case cellular
+    case other
 }

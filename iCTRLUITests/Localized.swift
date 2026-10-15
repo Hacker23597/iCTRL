@@ -38,11 +38,17 @@ enum L10n {
         case serverReadyTitle, serverFailedTitle, serverStoppedTitle
         case remoteDisabledTitle, remoteFailedTitle, enableLocalNetworkTitle
         case authRequestTitle
-        case localOnlyBody, longPressRemoteOrStop, longPressDisableOrStop
+        case localOnlyBody, longPressRemoteOrStop
         case longPressCopyLogs, serverStoppedBody
         case remoteFailedBody, remoteDisabledBody
         case authRequestBody       // %@ = client name
+        case authRequestNearbyBody // %@ = client name; the request came over peer-to-peer Wi-Fi
+        case authKeyLine           // %@ = key fingerprint the client also prints
         case onDeviceOnlySuffix
+        // Reachability marker shown on the status notification (one of three).
+        case statusNearby, statusLAN, statusLocal, statusNoLAN
+        case nearbyStarting, nearbyNeedsWiFi, nearbyNeedsPermission, nearbyNotReady
+        case enableNearby, disableNearby, longPressNearbyOrStop
 
         // ── Host app UI ──
         //
@@ -64,7 +70,7 @@ enum L10n {
         case startLocalDevVPN, tunnelUpDetail, vpnInstalledDetail, vpnMissingDetail
         case openVPNAndConnect, getVPNFromAppStore, tunnelDetectedFooter, cannotStartVPNFooter
         case importPairingFile, choosePairingFile, replacePairingFile, removePairingFile
-        case pairingHint, pairingImported
+        case pairingHint, pairingImported, pairingReceivedTitle, pairingReceivedBody, pairingRejectedTitle
         case ddiComponentTitle, ddiDownloadHint, ddiDownloaded, downloadImageFiles, ddiSourceFooter
         case mountButton, mountedOK, mountFailed, mountNotPersistentFooter, firstMountNetworkFooter
         case finishStepsFirst, vpnNotConnected, vpnNotInstalled, noPairingFile, imagesNotDownloaded
@@ -72,6 +78,15 @@ enum L10n {
         case networkPermissionTitle, networkPermissionBody, networkDataPermission, localNetworkPermission, laterButton
         case wifiRequired, wifiConnected, wifiMissing, wifiFooter, notOnWiFi
         case mountIntro, uploadingImage
+        case authorizedClients, runnerLogs, appLogsSection, runnerSection
+        case connectRunnerTitle, connectRunnerBody, connectButton, waitingApproval
+        case runnerNotRunningHint, keyRejectedHint, pairDeniedHint, retryInSeconds
+        case thisApp, revokeButton, revokeOthers, revokeConfirmTitle, revokeConfirmBody
+        case revokeOthersConfirm, disconnectThisApp, disconnectConfirmBody
+        case noClients, pairedAt, lastActive, clientsFooter
+        case liveLabel, pausedLabel, filterPlaceholder, noLogLines, copyButton, runnerLogsCaption, cancelButton
+        case viaLocal, viaLAN, viaNearby, viaVPN, viaCellular, viaOther
+        case visibilityLabel, visibilityLocal, visibilityLAN, visibilityLANNearby, visibilityNearbyPending, runnerLocalNetworkDenied
     }
 
     // key → (lang → text). English is the required fallback for every key.
@@ -111,8 +126,6 @@ enum L10n {
                          .ko: "127.0.0.1:8200 에서 실행 중(로컬 전용)", .es: "En ejecución en 127.0.0.1:8200 (solo local)", .de: "Läuft auf 127.0.0.1:8200 (nur lokal)", .ru: "Работает на 127.0.0.1:8200 (только локально)"],
         .longPressRemoteOrStop: [.en: "Long press for Remote Access or Stop Server", .zhHans: "长按可开启远程访问或停止服务", .zhHant: "長按可開啟遠端存取或停止服務", .ja: "長押しでリモート有効化／サーバー停止",
                                  .ko: "길게 눌러 원격 접속 또는 서버 중지", .es: "Mantén pulsado para acceso remoto o detener servidor", .de: "Lang drücken für Fernzugriff oder Server stoppen", .ru: "Удерживайте для удалённого доступа или остановки сервера"],
-        .longPressDisableOrStop: [.en: "Long press to Disable Remote or Stop Server", .zhHans: "长按可关闭远程访问或停止服务", .zhHant: "長按可關閉遠端存取或停止服務", .ja: "長押しでリモート無効化／サーバー停止",
-                                  .ko: "길게 눌러 원격 접속 끄기 또는 서버 중지", .es: "Mantén pulsado para desactivar remoto o detener servidor", .de: "Lang drücken zum Deaktivieren oder Server stoppen", .ru: "Удерживайте для отключения удалённого доступа или остановки"],
         .longPressCopyLogs: [.en: "Long press to Copy Logs", .zhHans: "长按可复制日志", .zhHant: "長按可複製日誌", .ja: "長押しでログをコピー",
                              .ko: "길게 눌러 로그 복사", .es: "Mantén pulsado para copiar registros", .de: "Lang drücken zum Kopieren der Logs", .ru: "Удерживайте, чтобы скопировать логи"],
         .serverStoppedBody: [.en: "The automation server has stopped.", .zhHans: "自动化服务已停止。", .zhHant: "自動化服務已停止。", .ja: "オートメーションサーバーが停止しました。",
@@ -127,6 +140,14 @@ enum L10n {
                             .es: "iCTRL está escuchando pero no se puede acceder a %@ — probablemente el permiso de Red local. Abre la app iCTRL, permite la Red local y vuelve a conectar. (localhost sigue funcionando)",
                             .de: "iCTRL lauscht, aber %@ ist nicht erreichbar — vermutlich die Berechtigung „Lokales Netzwerk“. Öffne die iCTRL-App, erlaube das lokale Netzwerk und verbinde dich neu. (localhost funktioniert weiterhin)",
                             .ru: "iCTRL слушает, но %@ недоступен — вероятно, нет разрешения на локальную сеть. Откройте приложение iCTRL, разрешите локальную сеть и переподключитесь. (localhost по-прежнему работает)"],
+        .authKeyLine: [.en: "Key %@ — allow only if your computer shows the same",
+                       .zhHans: "密钥 %@ — 与电脑上显示的一致才允许",
+                       .zhHant: "金鑰 %@ — 與電腦上顯示的一致才允許",
+                       .ja: "キー %@ — コンピュータの表示と一致する場合のみ許可",
+                       .ko: "키 %@ — 컴퓨터에 표시된 것과 같을 때만 허용",
+                       .es: "Clave %@ — permite solo si tu ordenador muestra la misma",
+                       .de: "Schlüssel %@ — nur erlauben, wenn dein Computer denselben zeigt",
+                       .ru: "Ключ %@ — разрешайте, только если компьютер показывает такой же"],
         .authRequestBody: [.en: "\"%@\" wants to control this device.\nLong press to Allow or Deny",
                            .zhHans: "“%@” 请求控制此设备。\n长按以允许或拒绝",
                            .zhHant: "「%@」請求控制此裝置。\n長按以允許或拒絕",
@@ -135,6 +156,40 @@ enum L10n {
                            .es: "\"%@\" quiere controlar este dispositivo.\nMantén pulsado para permitir o denegar",
                            .de: "„%@“ möchte dieses Gerät steuern.\nLang drücken zum Zulassen oder Ablehnen",
                            .ru: "«%@» хочет управлять этим устройством.\nУдерживайте, чтобы разрешить или отклонить"],
+        .authRequestNearbyBody: [.en: "\"%@\" (nearby device) wants to control this device.\nLong press to Allow or Deny",
+                                 .zhHans: "“%@”（附近设备）请求控制此设备。\n长按以允许或拒绝",
+                                 .zhHant: "「%@」（附近裝置）請求控制此裝置。\n長按以允許或拒絕",
+                                 .ja: "「%@」（近くのデバイス）がこのデバイスの操作を要求しています。\n長押しで許可または拒否",
+                                 .ko: "\"%@\"(근처 기기)이(가) 이 기기의 제어를 요청합니다.\n길게 눌러 허용 또는 거부",
+                                 .es: "\"%@\" (dispositivo cercano) quiere controlar este dispositivo.\nMantén pulsado para permitir o denegar",
+                                 .de: "„%@“ (Gerät in der Nähe) möchte dieses Gerät steuern.\nLang drücken zum Zulassen oder Ablehnen",
+                                 .ru: "«%@» (устройство поблизости) хочет управлять этим устройством.\nУдерживайте, чтобы разрешить или отклонить"],
+        .statusNearby: [.en: "📡 Nearby discoverable", .zhHans: "📡 附近可发现", .zhHant: "📡 附近可發現", .ja: "📡 近くから検出可能",
+                        .ko: "📡 근처에서 검색 가능", .es: "📡 Visible cerca", .de: "📡 In der Nähe sichtbar", .ru: "📡 Виден поблизости"],
+        .statusLAN: [.en: "🌐 LAN reachable", .zhHans: "🌐 局域网可访问", .zhHant: "🌐 區域網路可存取", .ja: "🌐 LAN から接続可能",
+                     .ko: "🌐 LAN 접속 가능", .es: "🌐 Accesible en la LAN", .de: "🌐 Im LAN erreichbar", .ru: "🌐 Доступен в LAN"],
+        .statusLocal: [.en: "🔒 This device only", .zhHans: "🔒 仅本机", .zhHant: "🔒 僅本機", .ja: "🔒 この端末のみ",
+                       .ko: "🔒 이 기기만", .es: "🔒 Solo este dispositivo", .de: "🔒 Nur dieses Gerät", .ru: "🔒 Только это устройство"],
+        .statusNoLAN: [.en: "🌐 No LAN · connect to Wi-Fi", .zhHans: "🌐 无局域网 · 需连接 Wi-Fi", .zhHant: "🌐 無區域網路 · 需連接 Wi-Fi", .ja: "🌐 LAN なし · Wi-Fi に接続",
+                       .ko: "🌐 LAN 없음 · Wi-Fi 연결 필요", .es: "🌐 Sin LAN · conéctate a Wi-Fi", .de: "🌐 Kein LAN · mit WLAN verbinden", .ru: "🌐 Нет LAN · подключитесь к Wi-Fi"],
+        .nearbyStarting: [.en: "📡 Nearby starting…", .zhHans: "📡 近场启动中…", .zhHant: "📡 近場啟動中…", .ja: "📡 近距離検出を開始中…",
+                          .ko: "📡 근거리 검색 시작 중…", .es: "📡 Iniciando detección cercana…", .de: "📡 Nahbereich startet…", .ru: "📡 Запуск обнаружения…"],
+        .nearbyNeedsWiFi: [.en: "📡 Nearby not ready · turn on Wi-Fi", .zhHans: "📡 近场未就绪 · 需打开 Wi-Fi", .zhHant: "📡 近場未就緒 · 需開啟 Wi-Fi", .ja: "📡 近距離検出は待機中 · Wi-Fi をオン",
+                           .ko: "📡 근거리 검색 대기 · Wi-Fi 켜기 필요", .es: "📡 Cercanía no lista · activa el Wi-Fi", .de: "📡 Nahbereich nicht bereit · WLAN einschalten", .ru: "📡 Поблизости не готово · включите Wi-Fi"],
+        .nearbyNeedsPermission: [.en: "📡 Nearby not ready · allow Local Network", .zhHans: "📡 近场未就绪 · 需允许本地网络", .zhHant: "📡 近場未就緒 · 需允許區域網路", .ja: "📡 近距離検出は待機中 · ローカルネットワークを許可",
+                                 .ko: "📡 근거리 검색 대기 · 로컬 네트워크 허용 필요", .es: "📡 Cercanía no lista · permite Red local", .de: "📡 Nahbereich nicht bereit · Lokales Netzwerk erlauben", .ru: "📡 Поблизости не готово · разрешите локальную сеть"],
+        .nearbyNotReady: [.en: "📡 Nearby not ready · retrying", .zhHans: "📡 近场未就绪 · 正在重试", .zhHant: "📡 近場未就緒 · 正在重試", .ja: "📡 近距離検出は待機中 · 再試行中",
+                          .ko: "📡 근거리 검색 대기 · 재시도 중", .es: "📡 Cercanía no lista · reintentando", .de: "📡 Nahbereich nicht bereit · neuer Versuch", .ru: "📡 Поблизости не готово · повтор"],
+        .enableNearby: [.en: "📡 Enable Nearby Discovery", .zhHans: "📡 开启近场发现", .zhHant: "📡 開啟近場探索", .ja: "📡 近距離検出を有効化",
+                        .ko: "📡 근거리 검색 켜기", .es: "📡 Activar detección cercana", .de: "📡 Nahbereichserkennung ein", .ru: "📡 Включить обнаружение поблизости"],
+        .disableNearby: [.en: "📴 Disable Nearby Discovery", .zhHans: "📴 关闭近场发现", .zhHant: "📴 關閉近場探索", .ja: "📴 近距離検出を無効化",
+                         .ko: "📴 근거리 검색 끄기", .es: "📴 Desactivar detección cercana", .de: "📴 Nahbereichserkennung aus", .ru: "📴 Выключить обнаружение поблизости"],
+        .longPressNearbyOrStop: [.en: "Long press for Nearby Discovery, Remote Access or Stop Server",
+                                 .zhHans: "长按可设置近场发现、远程访问或停止服务", .zhHant: "長按可設定近場探索、遠端存取或停止服務",
+                                 .ja: "長押しで近距離検出・リモート・サーバー停止", .ko: "길게 눌러 근거리 검색, 원격 접속 또는 서버 중지",
+                                 .es: "Mantén pulsado para detección cercana, acceso remoto o detener servidor",
+                                 .de: "Lang drücken für Nahbereich, Fernzugriff oder Server stoppen",
+                                 .ru: "Удерживайте для обнаружения поблизости, удалённого доступа или остановки"],
         .onDeviceOnlySuffix: [.en: "reachable on-device only; connect over Wi-Fi for LAN access",
                               .zhHans: "仅本机可访问;请连接 Wi-Fi 以支持局域网访问",
                               .zhHant: "僅本機可存取;請連接 Wi-Fi 以支援區域網路存取",
@@ -220,10 +275,15 @@ enum L10n {
         .choosePairingFile: [.en: "Choose pairing file…", .zhHans: "选择配对文件…", .zhHant: "選擇配對檔案…"],
         .replacePairingFile: [.en: "Replace pairing file…", .zhHans: "更换配对文件…", .zhHant: "更換配對檔案…"],
         .removePairingFile: [.en: "Remove pairing file", .zhHans: "删除配对文件", .zhHant: "刪除配對檔案"],
-        .pairingHint: [.en: "Export it from iLoader on this device — no Mac needed. Otherwise generate it on a Mac with `idevicepair pair` and send it here (AirDrop, Files, iCloud).",
-                       .zhHans: "可直接用本机的 iLoader 导出，无需 Mac。也可以在 Mac 上用 `idevicepair pair` 生成后传过来（隔空投送、文件、iCloud）。",
-                       .zhHant: "可直接用本機的 iLoader 匯出，無需 Mac。也可以在 Mac 上用 `idevicepair pair` 產生後傳過來（AirDrop、檔案、iCloud）。"],
+        .pairingHint: [.en: "Export it from iLoader on this device — no Mac needed. Otherwise generate it on a Mac with `idevicepair pair` and send it here (AirDrop, Files, iCloud). If the picker can't reach the file, share it to iCTRL from the app that has it.",
+                       .zhHans: "可直接用本机的 iLoader 导出，无需 Mac。也可以在 Mac 上用 `idevicepair pair` 生成后传过来（隔空投送、文件、iCloud）。如果选择器找不到文件，可在文件所在的 App 里直接“分享”到 iCTRL。",
+                       .zhHant: "可直接用本機的 iLoader 匯出，無需 Mac。也可以在 Mac 上用 `idevicepair pair` 產生後傳過來（AirDrop、檔案、iCloud）。如果選擇器找不到檔案，可在檔案所在的 App 裡直接「分享」到 iCTRL。"],
         .pairingImported: [.en: "Imported", .zhHans: "已导入", .zhHant: "已匯入"],
+        .pairingReceivedTitle: [.en: "Pairing File Received", .zhHans: "已接收配对文件", .zhHant: "已接收配對檔案"],
+        .pairingReceivedBody: [.en: "“%@” has been stored. You can mount the Developer Disk Image now.",
+                               .zhHans: "已保存“%@”，现在可以挂载开发者磁盘镜像。",
+                               .zhHant: "已儲存「%@」，現在可以掛載開發者磁碟映像。"],
+        .pairingRejectedTitle: [.en: "Not a Usable Pairing File", .zhHans: "不是可用的配对文件", .zhHant: "不是可用的配對檔案"],
 
         .ddiComponentTitle: [.en: "Developer Disk Image", .zhHans: "开发者磁盘镜像", .zhHant: "開發者磁碟映像"],
         .ddiDownloadHint: [.en: "About 100 MB up to iOS 26.3, about 17 MB from iOS 26.4. Downloaded once and reused — only the mount has to be repeated after a reboot.",
@@ -275,5 +335,62 @@ enum L10n {
         .networkDataPermission: [.en: "Wireless Data", .zhHans: "无线数据", .zhHant: "無線資料"],
         .localNetworkPermission: [.en: "Local Network", .zhHans: "本地网络", .zhHant: "區域網路"],
         .laterButton: [.en: "Later", .zhHans: "稍后", .zhHant: "稍後"],
+        .authorizedClients: [.en: "Authorized Clients", .zhHans: "已授权客户端", .zhHant: "已授權用戶端"],
+        .runnerLogs: [.en: "Runner Logs", .zhHans: "Runner 日志", .zhHant: "Runner 日誌"],
+        .appLogsSection: [.en: "This App", .zhHans: "本 App", .zhHant: "本 App"],
+        .runnerSection: [.en: "Runner", .zhHans: "Runner", .zhHant: "Runner"],
+        .connectRunnerTitle: [.en: "Connect to the Runner", .zhHans: "连接 Runner", .zhHant: "連接 Runner"],
+        .connectRunnerBody: [.en: "Managing clients and reading the runner's log need its approval once. Tap Connect, then long-press the iCTRL notification and choose Allow.",
+                             .zhHans: "管理客户端和查看 Runner 日志需要 Runner 授权一次。点击“连接”，然后长按 iCTRL 通知并选择“允许”。",
+                             .zhHant: "管理用戶端和查看 Runner 日誌需要 Runner 授權一次。點擊「連接」，然後長按 iCTRL 通知並選擇「允許」。"],
+        .connectButton: [.en: "Connect", .zhHans: "连接", .zhHant: "連接"],
+        .waitingApproval: [.en: "Waiting for Allow in the iCTRL notification…", .zhHans: "等待在 iCTRL 通知中允许…", .zhHant: "等待在 iCTRL 通知中允許…"],
+        .runnerNotRunningHint: [.en: "The runner is not running. Start the server first.", .zhHans: "Runner 未运行，请先启动服务。", .zhHant: "Runner 未運行，請先啟動服務。"],
+        .keyRejectedHint: [.en: "The runner no longer accepts this app (revoked or expired). Connect again.",
+                           .zhHans: "Runner 已不再接受本 App（已吊销或过期），请重新连接。",
+                           .zhHant: "Runner 已不再接受本 App（已撤銷或過期），請重新連接。"],
+        .pairDeniedHint: [.en: "Not allowed, or no answer within 60 seconds.", .zhHans: "未被允许，或 60 秒内未响应。", .zhHant: "未被允許，或 60 秒內未回應。"],
+        .retryInSeconds: [.en: "Try again in %d s.", .zhHans: "请 %d 秒后重试。", .zhHant: "請 %d 秒後重試。"],
+        .thisApp: [.en: "This app", .zhHans: "本 App", .zhHant: "本 App"],
+        .revokeButton: [.en: "Revoke", .zhHans: "吊销", .zhHant: "撤銷"],
+        .revokeOthers: [.en: "Revoke All Others", .zhHans: "吊销其他全部", .zhHant: "撤銷其他全部"],
+        .revokeConfirmTitle: [.en: "Revoke “%@”?", .zhHans: "吊销“%@”？", .zhHant: "撤銷「%@」？"],
+        .revokeConfirmBody: [.en: "Its key stops working at once. To come back it must pair again, approved on this device.",
+                             .zhHans: "其密钥立即失效。如需再次使用，必须重新配对并在本机允许。",
+                             .zhHant: "其金鑰立即失效。如需再次使用，必須重新配對並在本機允許。"],
+        .revokeOthersConfirm: [.en: "Revoke %d clients?", .zhHans: "吊销 %d 个客户端？", .zhHant: "撤銷 %d 個用戶端？"],
+        .disconnectThisApp: [.en: "Disconnect This App", .zhHans: "断开本 App", .zhHant: "中斷本 App"],
+        .disconnectConfirmBody: [.en: "This app's key is revoked. Viewing clients and logs again needs a new approval.",
+                                 .zhHans: "本 App 的密钥将被吊销，再次查看客户端和日志需要重新允许。",
+                                 .zhHant: "本 App 的金鑰將被撤銷，再次查看用戶端和日誌需要重新允許。"],
+        .noClients: [.en: "No authorized clients.", .zhHans: "没有已授权的客户端。", .zhHant: "沒有已授權的用戶端。"],
+        .pairedAt: [.en: "Paired %@", .zhHans: "授权于 %@", .zhHant: "授權於 %@"],
+        .lastActive: [.en: "active %@", .zhHans: "最近活动 %@", .zhHant: "最近活動 %@"],
+        .clientsFooter: [.en: "Computers, agents and browsers holding a key to this runner. Revoking takes effect immediately.",
+                         .zhHans: "持有本 Runner 密钥的电脑、Agent 和浏览器。吊销立即生效。",
+                         .zhHant: "持有本 Runner 金鑰的電腦、Agent 和瀏覽器。撤銷立即生效。"],
+        .liveLabel: [.en: "Live", .zhHans: "实时", .zhHant: "即時"],
+        .pausedLabel: [.en: "Paused", .zhHans: "已暂停", .zhHant: "已暫停"],
+        .filterPlaceholder: [.en: "Filter", .zhHans: "筛选", .zhHant: "篩選"],
+        .noLogLines: [.en: "No log lines.", .zhHans: "没有日志。", .zhHant: "沒有日誌。"],
+        .copyButton: [.en: "Copy", .zhHans: "复制", .zhHant: "拷貝"],
+        .runnerLogsCaption: [.en: "The runner's most recent 500 log lines, refreshed every 2 seconds while this screen is open.",
+                            .zhHans: "Runner 最近 500 行日志，停留在本页时每 2 秒刷新一次。",
+                            .zhHant: "Runner 最近 500 行日誌，停留在本頁時每 2 秒重新整理一次。"],
+        .cancelButton: [.en: "Cancel", .zhHans: "取消", .zhHant: "取消"],
+        .viaLocal: [.en: "This device / USB", .zhHans: "本机 / USB", .zhHant: "本機 / USB"],
+        .viaLAN: [.en: "LAN", .zhHans: "局域网", .zhHant: "區域網路"],
+        .viaNearby: [.en: "Nearby (AWDL)", .zhHans: "近场 (AWDL)", .zhHant: "近場 (AWDL)"],
+        .viaVPN: [.en: "VPN", .zhHans: "VPN", .zhHant: "VPN"],
+        .viaCellular: [.en: "Cellular", .zhHans: "蜂窝网络", .zhHant: "行動網路"],
+        .viaOther: [.en: "Other", .zhHans: "其他", .zhHant: "其他"],
+        .visibilityLabel: [.en: "Visibility", .zhHans: "可见性", .zhHant: "可見性"],
+        .visibilityNearbyPending: [.en: "🟡 LAN · nearby not ready", .zhHans: "🟡 局域网 · 近场未就绪", .zhHant: "🟡 區域網路 · 近場未就緒"],
+        .runnerLocalNetworkDenied: [.en: "⚠️ The runner has no Local Network access, so nearby discovery cannot work. Allow it in Settings › Privacy & Security › Local Network › iCTRLUITests-Runner.",
+                                    .zhHans: "⚠️ Runner 没有本地网络权限，近场发现无法使用。请在 设置 › 隐私与安全 › 本地网络 中打开 iCTRLUITests-Runner。",
+                                    .zhHant: "⚠️ Runner 沒有本地網路權限，近場探索無法使用。請在 設定 › 隱私權與安全性 › 本地網路 中開啟 iCTRLUITests-Runner。"],
+        .visibilityLocal: [.en: "🟢 This device only · safe", .zhHans: "🟢 仅本机 · 安全", .zhHant: "🟢 僅本機 · 安全"],
+        .visibilityLAN: [.en: "🟡 LAN", .zhHans: "🟡 局域网", .zhHant: "🟡 區域網路"],
+        .visibilityLANNearby: [.en: "🟡 LAN + Nearby (AWDL)", .zhHans: "🟡 局域网 + 近场 (AWDL)", .zhHant: "🟡 區域網路 + 近場 (AWDL)"],
     ]
 }

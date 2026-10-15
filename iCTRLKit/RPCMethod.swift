@@ -24,9 +24,11 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "listen_port", type: "number", required: false, description: "TCP port to listen on (1..65535, default 8200)"),
                 RPCParamDef(name: "revoke_session_id", type: "string", required: false, description: "session_id of a single authorization to revoke"),
                 RPCParamDef(name: "clear_sessions", type: "boolean", required: false, description: "true = revoke all authorized tokens immediately"),
+                RPCParamDef(name: "nearby_discovery", type: "boolean", required: false, description: "Advertise to nearby Apple devices over peer-to-peer Wi-Fi (needs allow_remote_access). Switching it on is accepted only from this device (the iCTRL app or USB); switching it off from anyone"),
+                RPCParamDef(name: "device_name", type: "string", required: false, description: "Name advertised to nearby (peer-to-peer) clients, at most 63 bytes; \"\" restores the default (model plus a short device id)"),
                 RPCParamDef(name: "stop_server", type: "boolean", required: false, description: "true = stop the service (stops listening ~1s after replying). Re-launch the runner to restart; tokens persist."),
             ],
-            returns: "{allow_remote_access, listen_port, address, restarted, device_name, active_sessions, sessions:[{session_id, client_name, tok, granted_at, last_active_at, expires_at}], cleared_sessions}"
+            returns: "{allow_remote_access, listen_port, address, restarted, device_name, lan_addresses, ipv4_interfaces, nearby:{enabled, advertising, status, interface, name, device_id, port}, active_sessions, sessions:[{session_id, client_name, tok, granted_at, last_active_at, expires_at, last_address, last_via: local (this device or USB) | lan | nearby (AWDL) | vpn | cellular | other}], cleared_sessions}"
         ),
         RPCMethodDef(
             name: "stream_ticket",
@@ -373,7 +375,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.97.1"
+    static let serverVersion = "1.98.12"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///
@@ -415,6 +417,7 @@ struct RPCMethodRegistry {
         "system_metrics",      // device_info.system — thermal/cpu/memory/disk/battery/screen_locked/foreground_app
         "screen_text",         // Vision OCR fallback when the AX tree has no on-screen rows
         "cli_binary",          // GET /skill/clients/cli — static aarch64-musl client
+        "nearby_discovery",    // Bonjour over peer-to-peer Wi-Fi (AWDL) on port+1, when turned on
     ]
 
     static func generateSchemaDocument() -> [String: Any] {
@@ -435,6 +438,7 @@ struct RPCMethodRegistry {
                 "rpc": "POST /rpc   an ENCRYPTED v1 envelope (no plaintext path, no Bearer header): {v:1, tok, ts, nonce:<32 hex>, ct:<b64>, tag:<64 hex>} wrapping the JSON-RPC body. See guidance.authorization for the construction.",
                 "stream": "GET /stream[.ts]?ticket=<t>  live H.264 screen video (default 5 fps, ?fps=N in 0.5-30 to change). Screen capture is the limit, not encoding: where XCTest can capture straight to JPEG the full 30 is reachable on a cool device and somewhat less on a hot one; where it can't, capture caps the rate near 7. A byte pipe can't carry a per-request envelope, so it takes a SINGLE-USE ~60s ticket minted over the encrypted channel by the `stream_ticket` RPC. One shared encoder fans out to all clients; encoding stops when the last client disconnects.",
                 "remote": "GET /remote  browser control page (shadcn-styled): plays the stream via MSE and drives the device with tap/swipe/scroll/keyboard + a side panel of buttons. Paste the 64-hex pairing key once; the page does the v1 crypto in-browser (WebCrypto) and keeps K in localStorage — it is never sent.",
+                "whoami": "GET /whoami   unauthenticated {device_id, name, protocol_version, server_version}. device_id is stable per installation: store one key per device under it and use that key over every channel (USB, LAN, nearby). Every response also carries it as the X-ICTRL-Device header",
                 "logs": "GET /logs?ticket=<t>   plain-text recent logs (current process, in-memory). Browser-issued GET, so it uses the same single-use ticket as /stream. Sensitive values are redacted",
                 "logs_files": "GET /logs/files?ticket=<t>   list persisted daily log files (survive crashes/restarts)",
                 "logs_history": "GET /logs/history?date=YYYY-MM-DD&ticket=<t>   dump a persisted day's log (redacted). Use this to recover logs from BEFORE a crash — /logs only holds the current process's memory",

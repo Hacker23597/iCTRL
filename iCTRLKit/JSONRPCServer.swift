@@ -8,6 +8,23 @@ class JSONRPCServer {
     /// Connections handed off to a long-lived streamer (video) — the base receive
     /// loop must not cancel these.
     private var handedOff: Set<ObjectIdentifier> = []
+    /// Connections accepted by the nearby (peer-to-peer) listener.
+    private var nearbyConnections: Set<ObjectIdentifier> = []
+    private var nearbyListener: NWListener?
+    private var nearbyAdvertiser: NearbyAdvertiser?
+    /// Port of the nearby listener: one above the main port.
+    var nearbyPort: UInt16 { port &+ 1 }
+    /// Nearby advertising state, readable from any thread. `.off` while nearby
+    /// discovery is not running.
+    var nearbyStatus: NearbyAdvertiser.Status {
+        nearbyStatusLock.lock(); defer { nearbyStatusLock.unlock() }
+        return nearbyStatusValue
+    }
+    var isNearbyAdvertising: Bool { nearbyStatus == .advertising }
+    private var nearbyStatusValue: NearbyAdvertiser.Status = .off
+    private let nearbyStatusLock = NSLock()
+    /// Called (on the server queue) whenever `nearbyStatus` changes.
+    var onNearbyStateChange: ((NearbyAdvertiser.Status) -> Void)?
     let port: UInt16
     private let localOnly: Bool
     private let queue = DispatchQueue(label: "com.openminis.ictrl.server")
@@ -93,7 +110,16 @@ class JSONRPCServer {
         }
 
         listener.newConnectionHandler = { [weak self] conn in
-            self?.handleConnection(conn)
+            guard let self = self else { return }
+            // Peer-to-peer peers belong to the nearby listener, which is only
+            // open while the user has turned nearby discovery on. Without this
+            // check, any AWDL link the device happens to have would reach 8200.
+            if Self.isPeerToPeer(conn) {
+                self.log("🚫 Refused \(conn.endpoint) on port \(self.port): peer-to-peer connections use the nearby listener")
+                conn.cancel()
+                return
+            }
+            self.handleConnection(conn)
         }
 
         listener.start(queue: queue)
@@ -102,12 +128,247 @@ class JSONRPCServer {
 
     func stop() {
         log("🔻 JSONRPCServer.stop called")
+        // Nearby teardown belongs on the server queue, where that state lives.
+        // Hand over the objects rather than self: stop() also runs from deinit.
+        let nearbyListener = self.nearbyListener, nearbyAdvertiser = self.nearbyAdvertiser
+        queue.async { [weak self] in self?.nearbyWanted = false }
+        self.nearbyListener = nil
+        self.nearbyAdvertiser = nil
+        nearbyConnections.removeAll()
+        queue.async {
+            nearbyAdvertiser?.stop()
+            nearbyListener?.cancel()
+        }
         connections.forEach { $0.cancel() }
         connections.removeAll()
         listener?.cancel()
         listener = nil
         isRunning = false
         log("🔴 iCTRL server stopped")
+    }
+
+    // MARK: - Nearby (peer-to-peer) listener
+
+    /// Open the nearby listener and advertise it over AWDL.
+    ///
+    /// A separate listener so it can be switched on and off on its own and
+    /// accept peer-to-peer connections only; anything arriving over another
+    /// interface is refused. Not available while the server is local-only.
+    func startNearby() {
+        queue.async {
+            self.nearbyWanted = true
+            self.nearbyRetryDelay = 5
+            self.startNearbyOnQueue()
+        }
+    }
+
+    func stopNearby() {
+        queue.async {
+            self.nearbyWanted = false
+            self.stopNearbyOnQueue()
+        }
+    }
+
+    /// Nearby discovery should be running (on `queue`): a failed listener is
+    /// rebuilt while this holds, instead of leaving discovery dead until it
+    /// is switched off and on again.
+    private var nearbyWanted = false
+    /// Back-off for rebuilding a failed nearby listener; reset once it is ready.
+    private var nearbyRetryDelay: TimeInterval = 5
+
+    private func scheduleNearbyRebuild() {
+        let delay = nearbyRetryDelay
+        nearbyRetryDelay = min(nearbyRetryDelay * 2, 30)
+        log("📡 Nearby: rebuilding the listener in \(Int(delay))s")
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self, self.nearbyWanted, self.nearbyListener == nil else { return }
+            self.startNearbyOnQueue()
+        }
+    }
+
+    /// Re-advertise under the current `NearbyIdentity.name`.
+    func refreshNearbyName() {
+        queue.async { self.nearbyAdvertiser?.refreshName() }
+    }
+
+    /// Re-check the peer-to-peer interface now (call on network changes).
+    func recheckNearby() {
+        queue.async { self.nearbyAdvertiser?.recheck() }
+    }
+
+    /// Retry a refused nearby registration without waiting for the back-off.
+    func retryNearbyNow() {
+        queue.async { self.nearbyAdvertiser?.retryNow() }
+    }
+
+    private func setNearbyStatus(_ status: NearbyAdvertiser.Status) {
+        nearbyStatusLock.lock()
+        let changed = nearbyStatusValue != status
+        nearbyStatusValue = status
+        nearbyStatusLock.unlock()
+        if changed { onNearbyStateChange?(status) }
+    }
+
+    private func startNearbyOnQueue() {
+        guard !localOnly, nearbyListener == nil else { return }
+        guard nearbyPort != 0, let nwPort = NWEndpoint.Port(rawValue: nearbyPort) else {
+            // listen_port 65535 leaves no port above it for the nearby listener.
+            log("📡 Nearby: no port above \(port) for the nearby listener")
+            setNearbyStatus(.failed)
+            return
+        }
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        params.includePeerToPeer = true
+        guard let l = try? NWListener(using: params, on: nwPort) else {
+            log("📡 Nearby: could not open port \(nearbyPort)")
+            setNearbyStatus(.failed)
+            if nearbyWanted { scheduleNearbyRebuild() }
+            return
+        }
+        l.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                self.log("📡 Nearby listener ready on port \(self.nearbyPort) (peer-to-peer only)")
+                self.nearbyRetryDelay = 5
+            case .failed(let error):
+                // Advertising a listener that is gone would only mislead
+                // clients: take both down, then rebuild while still wanted.
+                self.log("📡 Nearby listener failed: \(error)")
+                self.stopNearbyOnQueue()
+                self.setNearbyStatus(.failed)
+                if self.nearbyWanted { self.scheduleNearbyRebuild() }
+            case .waiting(let error):
+                self.log("📡 Nearby listener waiting: \(error)")
+            default:
+                break
+            }
+        }
+        l.newConnectionHandler = { [weak self] conn in
+            guard let self = self else { return }
+            guard Self.isPeerToPeer(conn) else {
+                self.log("🚫 Refused \(conn.endpoint) on nearby port \(self.nearbyPort): not a peer-to-peer connection")
+                conn.cancel()
+                return
+            }
+            self.log("📡 Nearby connection from \(conn.endpoint)")
+            self.nearbyConnections.insert(ObjectIdentifier(conn))
+            self.handleConnection(conn)
+        }
+        l.start(queue: queue)
+        nearbyListener = l
+
+        let advertiser = NearbyAdvertiser(port: nearbyPort, lanPort: port, queue: queue) { [weak self] in self?.log($0) }
+        advertiser.onChange = { [weak self] status in self?.setNearbyStatus(status) }
+        nearbyAdvertiser = advertiser
+        advertiser.start()
+    }
+
+    private func stopNearbyOnQueue() {
+        guard nearbyListener != nil || nearbyAdvertiser != nil else { return }
+        nearbyAdvertiser?.stop()
+        nearbyAdvertiser = nil
+        nearbyListener?.cancel()
+        nearbyListener = nil
+        for conn in connections where nearbyConnections.contains(ObjectIdentifier(conn)) { conn.cancel() }
+        nearbyConnections.removeAll()
+        setNearbyStatus(.off)
+        log("📡 Nearby discovery stopped")
+    }
+
+    /// The remote address (no port, no zone) and how it arrived, for the
+    /// session list.
+    ///
+    /// Built from `NWConnection.endpoint`, raw address bytes and getifaddrs
+    /// only — see `isLoopback(_:)` for why the newer Network properties
+    /// (`IPv4Address.isLoopback`, `currentPath`, …) must not be touched here:
+    /// on the oldest supported iOS their symbols are missing at load time.
+    static func peer(of connection: NWConnection) -> (address: String, via: String)? {
+        guard case let .hostPort(host, _) = connection.endpoint else { return nil }
+        var v4: [UInt8]?
+        var zone: String?
+        var address: String
+        switch host {
+        case .ipv4(let a):
+            v4 = [UInt8](a.rawValue)
+            address = v4!.map(String.init).joined(separator: ".")
+        case .ipv6(let a):
+            let b = [UInt8](a.rawValue)
+            if b.count == 16, b[0..<10].allSatisfy({ $0 == 0 }), b[10] == 0xff, b[11] == 0xff {
+                v4 = Array(b[12..<16])                       // IPv4-mapped
+                address = v4!.map(String.init).joined(separator: ".")
+            } else {
+                var text = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                let ok = b.withUnsafeBytes { inet_ntop(AF_INET6, $0.baseAddress, &text, socklen_t(text.count)) } != nil
+                address = ok ? String(cString: text) : "\(a)"
+                if b.count == 16, b[0..<15].allSatisfy({ $0 == 0 }), b[15] == 1 { return (address, PeerSource.local.rawValue) }
+                zone = Self.zone(of: a)                        // link-local: the interface it came in on
+            }
+        case .name(let n, _):
+            address = n
+        @unknown default:
+            return nil
+        }
+        if let pct = address.firstIndex(of: "%") { address = String(address[..<pct]) }
+        if let v4, v4.first == 127 { return (address, PeerSource.local.rawValue) }
+
+        let name = zone ?? v4.flatMap(Self.interfaceName(containing:))
+        guard let name else { return (address, PeerSource.other.rawValue) }
+        let via: PeerSource
+        if name.hasPrefix("awdl") || name.hasPrefix("llw") { via = .nearby }
+        else if name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("ppp") { via = .vpn }
+        else if name.hasPrefix("pdp_ip") { via = .cellular }
+        else if name.hasPrefix("lo") { via = .local }
+        else if name.hasPrefix("en") || name.hasPrefix("bridge") { via = .lan }
+        else { via = .other }
+        return (address, via.rawValue)
+    }
+
+    /// The local interface whose IPv4 subnet holds `addr` (point-to-point
+    /// links: whose peer address is `addr`), or nil.
+    private static func interfaceName(containing addr: [UInt8]) -> String? {
+        guard addr.count == 4 else { return nil }
+        let peer = UInt32(addr[0]) << 24 | UInt32(addr[1]) << 16 | UInt32(addr[2]) << 8 | UInt32(addr[3])
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        func v4(_ sa: UnsafeMutablePointer<sockaddr>?) -> UInt32? {
+            guard let sa, sa.pointee.sa_family == UInt8(AF_INET) else { return nil }
+            return sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
+        }
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let ifa = ptr.pointee
+            guard let mine = v4(ifa.ifa_addr) else { continue }
+            if ifa.ifa_flags & UInt32(IFF_POINTOPOINT) != 0 {
+                if v4(ifa.ifa_dstaddr) == peer { return String(cString: ifa.ifa_name) }
+            } else if let mask = v4(ifa.ifa_netmask), mask != 0, mine & mask == peer & mask {
+                return String(cString: ifa.ifa_name)
+            }
+        }
+        return nil
+    }
+
+    /// Whether a connection arrived over peer-to-peer Wi-Fi (AWDL / low-latency
+    /// WLAN). Those peers always use IPv6 link-local addresses scoped to the
+    /// interface, so the endpoint alone answers it — no newer path API needed.
+    static func isPeerToPeer(_ connection: NWConnection) -> Bool {
+        guard case let .hostPort(host, _) = connection.endpoint, case let .ipv6(addr) = host,
+              let name = zone(of: addr) else { return false }
+        return name.hasPrefix("awdl") || name.hasPrefix("llw")
+    }
+
+    /// The zone (interface name) of a scoped IPv6 address, from its text form
+    /// ("fe80::1%awdl0") — iOS 12-era API only, see `isLoopback(_:)`.
+    private static func zone(of addr: IPv6Address) -> String? {
+        let text = "\(addr)"
+        guard let pct = text.firstIndex(of: "%") else { return nil }
+        let name = String(text[text.index(after: pct)...])
+        return name.isEmpty ? nil : name
+    }
+
+    private func isNearby(_ connection: NWConnection) -> Bool {
+        nearbyConnections.contains(ObjectIdentifier(connection))
     }
 
     // MARK: - Connection Handling
@@ -246,6 +507,21 @@ class JSONRPCServer {
         case ("GET", "/schema"):
             handleSchema(connection: connection)
 
+        // Which device this is, before any key is chosen: clients store one
+        // key per device and look it up by this id.
+        case ("GET", "/whoami"):
+            let info: [String: Any] = [
+                "device_id": NearbyIdentity.deviceID,
+                "name": NearbyIdentity.name,
+                "protocol_version": RPCMethodRegistry.protocolVersion,
+                "server_version": RPCMethodRegistry.serverVersion,
+            ]
+            let data = (try? JSONSerialization.data(withJSONObject: info, options: [.sortedKeys])) ?? Data("{}".utf8)
+            // Same-origin only: any web page the phone (or a LAN browser)
+            // opens could otherwise read the device id and name.
+            sendHTTPResponse(connection: connection, status: 200, contentType: "application/json",
+                             body: String(data: data, encoding: .utf8) ?? "{}", cors: false)
+
         case ("GET", "/skill"), ("GET", "/skill.md"), ("GET", "/SKILL.md"):
             handleSkill(connection: connection)
 
@@ -315,7 +591,8 @@ class JSONRPCServer {
             handleLogs(connection: connection)
 
         case ("POST", "/pair"):
-            handlePair(body: body, connection: connection, isLoopback: isLoopback(connection))
+            handlePair(body: body, connection: connection, isLoopback: isLoopback(connection),
+                       nearby: isNearby(connection))
 
         case ("POST", "/rpc"):
             handleRPC(headers: headers, body: body, connection: connection)
@@ -525,7 +802,7 @@ class JSONRPCServer {
     ///     an ephemeral device key, so it is safe over the LAN.
     ///
     /// Blocks until the user taps Allow (or the alert times out).
-    private func handlePair(body: Data?, connection: NWConnection, isLoopback: Bool) {
+    private func handlePair(body: Data?, connection: NWConnection, isLoopback: Bool, nearby: Bool) {
         guard let body = body,
               let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
               let clientName = obj["client_name"] as? String, !clientName.isEmpty else {
@@ -551,11 +828,35 @@ class JSONRPCServer {
             return
         }
 
-        AuthManager.shared.requestAuth(clientName: clientName) { [weak self] session in
+        // Shown on the prompt and printed by the client, so a request from an
+        // impostor on the network can be told apart from the user's own.
+        let fingerprint = clientPub.map { Data(SHA256.hash(data: $0).prefix(4)).hexString }
+        AuthManager.shared.requestAuth(clientName: clientName, nearby: nearby, local: isLoopback,
+                                       fingerprint: fingerprint) { [weak self] outcome in
             guard let self = self else { return }
-            guard let session = session, let key = session.key else {
+            let session: AuthSession
+            switch outcome {
+            case .approved(let s):
+                session = s
+                AuthManager.shared.recordPeer(sessionID: s.id, peer: Self.peer(of: connection))
+            case .denied:
                 self.sendPairError(connection, status: 403, code: "pair_denied",
                                    message: "User rejected or approval timed out")
+                return
+            case .busy(let retryAfter):
+                self.sendPairError(connection, status: 429, code: "pair_busy",
+                                   message: "Another pairing request is waiting for approval on the device",
+                                   retryAfter: retryAfter)
+                return
+            case .coolingDown(let retryAfter):
+                self.sendPairError(connection, status: 429, code: "pair_cooldown",
+                                   message: "A pairing request was just refused; try again in \(retryAfter)s",
+                                   retryAfter: retryAfter)
+                return
+            }
+            guard let key = session.key else {
+                self.sendPairError(connection, status: 500, code: "internal",
+                                   message: "Session has no key")
                 return
             }
 
@@ -598,13 +899,18 @@ class JSONRPCServer {
         }
     }
 
-    private func sendPairError(_ connection: NWConnection, status: Int, code: String, message: String) {
-        let payload: [String: Any] = [
-            "error": ["code": code, "message": message,
-                      "server_ts": Int(Date().timeIntervalSince1970)],
-        ]
-        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
-        sendHTTPResponse(connection: connection, status: status, contentType: "application/json",
+    private func sendPairError(_ connection: NWConnection, status: Int, code: String, message: String,
+                               retryAfter: Int? = nil) {
+        var error: [String: Any] = ["code": code, "message": message,
+                                    "server_ts": Int(Date().timeIntervalSince1970)]
+        var headers: [String: String] = [:]
+        if let retryAfter {
+            error["retry_after"] = retryAfter
+            headers["Retry-After"] = String(retryAfter)
+        }
+        let data = (try? JSONSerialization.data(withJSONObject: ["error": error])) ?? Data("{}".utf8)
+        sendHTTPResponse(connection: connection, status: status, headers: headers,
+                         contentType: "application/json",
                          body: String(data: data, encoding: .utf8) ?? "{}")
     }
 
@@ -719,7 +1025,7 @@ class JSONRPCServer {
 
         let opened: (tokId: String, plaintext: String, seal: (String) -> String)
         do {
-            opened = try AuthManager.shared.openEnvelope(obj)
+            opened = try AuthManager.shared.openEnvelope(obj, peer: Self.peer(of: connection))
         } catch let failure as SecureEnvelope.Failure {
             // 401 for anything token/auth related so clients know to re-pair;
             // 400 only for a structurally broken envelope.
@@ -769,7 +1075,17 @@ class JSONRPCServer {
         }
 
         let method = rpcRequest.method
-        handler(method, rpcRequest.params) { [weak self] result, error in
+        var params = rpcRequest.params
+        // `config` may widen who can reach the device (nearby discovery), which
+        // only a caller on this device may do. Tell it where this request came
+        // from; set here, after authentication, and overwriting any value the
+        // caller sent, so it cannot be claimed.
+        if method == "config" {
+            var p = params ?? [:]
+            p[Self.peerSourceParam] = .string(Self.peer(of: connection)?.via ?? PeerSource.other.rawValue)
+            params = p
+        }
+        handler(method, params) { [weak self] result, error in
             let json = error.map { Self.errorJSON(rpcRequest.id, $0) }
                 ?? Self.resultJSON(rpcRequest.id, result ?? [:])
             self?.sendSealed(connection, seal: seal, json: json)
@@ -850,13 +1166,27 @@ class JSONRPCServer {
         }
     }
 
+    /// Headers on every response. `X-ICTRL-Device` names the device behind
+    /// this address, so a client can keep one key per device across USB, LAN
+    /// and nearby, and notice when a different device now answers at an
+    /// address it knows. The id is random per installation and is already
+    /// advertised to nearby devices.
     private func corsHeaders() -> [String: String] {
         [
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Allow-Headers": Self.corsAllowHeaders,
+            // Not listed in Access-Control-Expose-Headers: a web page must not
+            // be able to read a stable device id cross-origin. Clients that
+            // need it are not browsers.
+            Self.deviceHeader: NearbyIdentity.deviceID,
         ]
     }
+
+    static let deviceHeader = "X-ICTRL-Device"
+    private static let corsAllowHeaders = "Content-Type, Authorization"
+    /// Parameter the server adds to `config`: the request's `PeerSource`.
+    static let peerSourceParam = "_peer_source"
 
     /// Send a response whose body is raw bytes.
     ///
@@ -879,7 +1209,8 @@ class JSONRPCServer {
         })
     }
 
-    private func sendHTTPResponse(connection: NWConnection, status: Int, headers: [String: String] = [:], contentType: String = "text/plain", body: String) {
+    private func sendHTTPResponse(connection: NWConnection, status: Int, headers: [String: String] = [:],
+                                  contentType: String = "text/plain", body: String, cors: Bool = true) {
         let statusText: String
         switch status {
         case 200: statusText = "OK"
@@ -887,6 +1218,7 @@ class JSONRPCServer {
         case 401: statusText = "Unauthorized"
         case 403: statusText = "Forbidden"
         case 404: statusText = "Not Found"
+        case 429: statusText = "Too Many Requests"
         case 500: statusText = "Internal Server Error"
         default: statusText = "Unknown"
         }
@@ -894,6 +1226,11 @@ class JSONRPCServer {
         let bodyData = body.data(using: .utf8) ?? Data()
 
         var allHeaders = corsHeaders()
+        if !cors {
+            for key in ["Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers"] {
+                allHeaders.removeValue(forKey: key)
+            }
+        }
         allHeaders["Content-Type"] = contentType
         allHeaders["Content-Length"] = "\(bodyData.count)"
         allHeaders["Connection"] = "close"
@@ -914,6 +1251,7 @@ class JSONRPCServer {
 
     private func removeConnection(_ connection: NWConnection) {
         connections.removeAll { $0 === connection }
+        nearbyConnections.remove(ObjectIdentifier(connection))
     }
 
     deinit {
