@@ -44,6 +44,7 @@ enum L10n {
         case authRequestBody       // %@ = client name
         case authRequestNearbyBody // %@ = client name; the request came over peer-to-peer Wi-Fi
         case authKeyLine           // %@ = key fingerprint the client also prints
+        case stopConfirmTitle, stopConfirmBody
         case onDeviceOnlySuffix
         // Reachability marker shown on the status notification (one of three).
         case statusNearby, statusLAN, statusLocal, statusNoLAN
@@ -140,6 +141,16 @@ enum L10n {
                             .es: "iCTRL está escuchando pero no se puede acceder a %@ — probablemente el permiso de Red local. Abre la app iCTRL, permite la Red local y vuelve a conectar. (localhost sigue funcionando)",
                             .de: "iCTRL lauscht, aber %@ ist nicht erreichbar — vermutlich die Berechtigung „Lokales Netzwerk“. Öffne die iCTRL-App, erlaube das lokale Netzwerk und verbinde dich neu. (localhost funktioniert weiterhin)",
                             .ru: "iCTRL слушает, но %@ недоступен — вероятно, нет разрешения на локальную сеть. Откройте приложение iCTRL, разрешите локальную сеть и переподключитесь. (localhost по-прежнему работает)"],
+        .stopConfirmTitle: [.en: "Stop iCTRL?", .zhHans: "停止 iCTRL？", .zhHant: "停止 iCTRL？", .ja: "iCTRL を停止しますか？",
+                             .ko: "iCTRL을 중지할까요?", .es: "¿Detener iCTRL?", .de: "iCTRL stoppen?", .ru: "Остановить iCTRL?"],
+        .stopConfirmBody: [.en: "An app asked to stop the server. Long press to stop it, or ignore this.",
+                           .zhHans: "有 App 请求停止服务。长按以停止，或忽略此通知。",
+                           .zhHant: "有 App 請求停止服務。長按以停止，或忽略此通知。",
+                           .ja: "アプリがサーバーの停止を要求しました。長押しで停止、または無視してください。",
+                           .ko: "앱이 서버 중지를 요청했습니다. 길게 눌러 중지하거나 무시하세요.",
+                           .es: "Una app pidió detener el servidor. Mantén pulsado para detenerlo o ignóralo.",
+                           .de: "Eine App möchte den Server stoppen. Lange drücken zum Stoppen oder ignorieren.",
+                           .ru: "Приложение просит остановить сервер. Удерживайте, чтобы остановить, или игнорируйте."],
         .authKeyLine: [.en: "Key %@ — allow only if your computer shows the same",
                        .zhHans: "密钥 %@ — 与电脑上显示的一致才允许",
                        .zhHant: "金鑰 %@ — 與電腦上顯示的一致才允許",

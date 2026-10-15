@@ -459,8 +459,12 @@ to get its menu:
 - **Remote access is off by default.** The server only answers on the device
   itself (`127.0.0.1`), e.g. an agent running in an on-device sandbox. To drive
   the phone from another machine, choose **🌐 Enable Remote Access** first.
-- **Allow** and the remote-access switch only work while the phone is
-  unlocked. iOS asks for Face ID / the passcode if it isn't.
+- **Every action except Deny needs the phone unlocked** (Allow, the
+  remote-access and nearby switches, Stop Server, Copy Logs). iOS asks for
+  Face ID / the passcode if it isn't. Copied logs are redacted.
+- Any app can open `ictrl://stop`, so it doesn't stop the server by itself: it
+  posts a **Stop iCTRL?** notification to confirm on the phone. The iCTRL app,
+  once paired with the runner, stops it over the encrypted channel instead.
 - To start again after **Stop Server**, open the runner (or tap **Start
   Server** in the iCTRL app) again.
 - The iCTRL app shows the same switch as a **Visibility** menu.
@@ -583,7 +587,7 @@ Notable behaviour:
 
 `GET /`, `GET /remote` (browser control page), `GET /stream` (live H.264),
 `GET /logs`, and `GET /logs/history?date=` expose docs, a UI and redacted logs.
-`GET /whoami` (unauthenticated) returns the device id, name and versions, and
+`GET /whoami` (unauthenticated, same-origin only) returns the device id and versions, and
 every response carries the id in an `X-ICTRL-Device` header, so clients can keep
 one key per device.
 
