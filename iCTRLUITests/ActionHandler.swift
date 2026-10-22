@@ -1703,6 +1703,7 @@ class ActionHandler {
                 lastKeyboardSeen = (bid, nowMonotonic)
             }
             tapTargetFrame = f
+            lastTapTarget = (hit.label, bid, nowMonotonic)
             let r = fastHandler.fastTap(x: cx, y: cy)
             if r.1 == nil {
                 return (["message": .string("Tapped ref \(refId) ('\(hit.label.isEmpty ? hit.identifier : hit.label)') at (\(Int(cx)),\(Int(cy)))")], nil)
@@ -1727,6 +1728,7 @@ class ActionHandler {
                 lastKeyboardSeen = (bid, nowMonotonic)   // its keyboard comes up: page must stay above it
             }
             tapTargetFrame = f
+            lastTapTarget = (label, refStore[refId]?.bundleId ?? resolveForegroundBundleId() ?? "", nowMonotonic)
             let r = fastHandler.fastTap(x: cx, y: cy)
             if r.1 != nil {
                 // Fallback to element tap only if the synthesized tap failed.
@@ -1752,6 +1754,8 @@ class ActionHandler {
             // post-tap probe would describe the new layout, not what was hit.
             let hit = elementUnder(x: x, y: y)
             if let err = alertRaisedBeforeTouch(x: x, y: y) { return (nil, err) }
+            if case .string(let l)? = hit?["label"] { lastTapTarget = (l, resolveForegroundBundleId() ?? "", nowMonotonic) }
+            else { lastTapTarget = nil }
             var r = fastHandler.fastTap(x: x, y: y)
             if var data = r.0 {
                 if var h = hit {
@@ -2144,8 +2148,7 @@ class ActionHandler {
         let bid = resolveForegroundBundleId()
         // A whole-app walk; on a slow tree it cost seconds per type call.
         if let bid = bid, isSlowTree(bid) { return nil }
-        let target: XCUIApplication = bid.map { XCUIApplication(bundleIdentifier: $0) } ?? app
-        if target.keyboards.count > 0 { return nil }
+        if keyboardUp() { return nil }
         return "Could not confirm a focused text field / visible keyboard (detection can't see all keyboards). " +
             "VERIFY BEFORE RETRYING — screenshot and check whether the text landed; typing again would enter it twice. " +
             "If it did NOT land, tap a real textfield first (find_element{element_id:\"<placeholder text>\", element_type:\"textfield\", match:\"contains\"} → tap{ref}), read again until the field is focused, then type again. " +
@@ -2168,6 +2171,14 @@ class ActionHandler {
             coordinate.tap()
             usleep(500_000)
             focusedByTap = true
+        }
+
+        if cmd.via == "keyboard" {
+            if clearFirst {
+                return (nil, JSONRPCError(code: -32602, message: "clear:true can't be combined with via:\"keyboard\": "
+                    + "clearing sends key events, which is what via:\"keyboard\" avoids. Delete with the keyboard's delete key instead.", data: nil))
+            }
+            return typeOnSoftKeyboard(text, submit: cmd.submit == true, refocusAt: nil, reason: nil)
         }
 
         // Typing into a field that already has content APPENDS, and nothing about
@@ -2224,6 +2235,10 @@ class ActionHandler {
             return r
         }
 
+        // Seen before typing, so a keyboard that is gone afterwards means the
+        // field let go of focus when the key events came (see below).
+        let keyboardBefore = !text.isEmpty && keyboardUp()
+
         let eventRecord = XCSynthesizedEventRecord(name: "Type")
         let eventPath = XCPointerEventPath(forTextInput: ())
         eventPath.typeText(text, atOffset: 0.0, typingSpeed: 60, shouldRedact: false)
@@ -2231,9 +2246,30 @@ class ActionHandler {
 
         do {
             try eventRecord.synthesize()
+            // The text goes in through a virtual hardware keyboard, which
+            // minimizes the on-screen one for a moment. A normal field keeps
+            // focus and the keyboard comes back; some custom input bars (the
+            // Xianyu chat field) end editing when the keyboard leaves, and
+            // the text never lands. Then type it again on the on-screen keys.
+            if keyboardBefore, !keyboardReturns() {
+                let point = cmd.x.flatMap { x in cmd.y.map { CGPoint(x: x, y: $0) } } ?? refocusPoint()
+                guard let point else {
+                    return (nil, JSONRPCError(code: -32603, message:
+                        "Typing failed: the field closed the keyboard instead of taking the text, and there is no recent "
+                        + "tap to focus it again. Tap the field, then type{text, via:\"keyboard\"}.", data: nil))
+                }
+                var r = typeOnSoftKeyboard(text, submit: submit, refocusAt: point,
+                                           reason: "The field dropped focus when the text was sent as key events, so it was "
+                                               + "typed again on the on-screen keyboard.")
+                if clearFirst, var d = r.0 {
+                    d["clear_warning"] = .string("The field could not be cleared first (clearing uses key events, which this field rejects); the text was appended.")
+                    r.0 = d
+                }
+                return r
+            }
             // Before Return: submitting a search hides the keyboard, which
             // read as "no focused field" and warned on text that had landed.
-            let keyboardWarning = keyboardWarningAfterType()
+            let keyboardWarning = keyboardBefore ? nil : keyboardWarningAfterType()
             if submit { sendReturnKey() }
             let prefix = clearFirst ? "Cleared then typed: " : "Typed: "
             let msg = text.isEmpty && clearFirst ? "Cleared focused field" : (prefix + text + (submit ? " + Return" : ""))
@@ -2246,6 +2282,91 @@ class ActionHandler {
                 ? "Typing failed even after tapping to focus. The tapped point may not be a text field, or the keyboard did not appear. Take a screenshot to confirm a text field is focused (keyboard visible), then retry."
                 : "Typing failed: no input field currently has keyboard focus. First tap the text field (pass x,y to this command, or call tap), wait for the keyboard, then type."
             return (nil, JSONRPCError(code: -32603, message: guidance, data: nil))
+        }
+    }
+
+    /// What the last tap landed on (its label), to find a field again after
+    /// the layout moved: a keyboard going away shifts it down.
+    private var lastTapTarget: (label: String, bundleId: String, at: TimeInterval)?
+
+    /// Where to tap to focus the field again: the element the last tap hit,
+    /// found by its label where it is now, else the last tap's point. Only a
+    /// recent tap counts.
+    private func refocusPoint() -> CGPoint? {
+        guard let tap = fastHandler.lastTap, Date().timeIntervalSince(tap.at) < 60 else { return nil }
+        if let t = lastTapTarget, !t.label.isEmpty, nowMonotonic - t.at < 60, t.bundleId == resolveForegroundBundleId(),
+           let root = ForegroundApp.boundedSnapshot(forBundleID: t.bundleId, maxDepth: Self.defaultMaxDepth,
+                                                    maxChildren: Self.childrenLadder[0]) {
+            var n = 0
+            var trunc: ObjCBool = false
+            let needle = ", label: '\(t.label)'"
+            let h = pointSize.height
+            if let body = ForegroundApp.renderBoundedSnapshot(root, maxDepth: Self.defaultMaxDepth, maxElements: 2000,
+                                                              nodesWritten: &n, truncated: &trunc) {
+                for line in body.split(separator: "\n") where line.contains(needle) {
+                    if let f = Self.frameOf(line), f[2] > 0, f[3] > 0, f[1] >= 0, f[1] + f[3] <= h {
+                        return CGPoint(x: f[0] + f[2] / 2, y: f[1] + f[3] / 2)
+                    }
+                }
+            }
+        }
+        return tap.point
+    }
+
+    /// After key-event typing: whether the keyboard is (back) up. Attaching
+    /// the virtual keyboard minimizes the on-screen one, so give it a moment.
+    private func keyboardReturns() -> Bool {
+        for i in 0..<4 {
+            if keyboardUp() { return true }
+            if i < 3 { usleep(300_000) }
+        }
+        return false
+    }
+
+    /// Type by tapping the on-screen keyboard (SoftKeyboardTyper), first
+    /// tapping `refocusAt` to bring the field and its keyboard back.
+    private func typeOnSoftKeyboard(_ text: String, submit: Bool, refocusAt: CGPoint?,
+                                    reason: String?) -> ([String: JSONValue]?, JSONRPCError?) {
+        guard let bid = resolveForegroundBundleId() else {
+            return (nil, JSONRPCError(code: -32603, message: "Typing failed: no foreground app.", data: nil))
+        }
+        let typer = SoftKeyboardTyper(bundleId: bid,
+                                      tapAll: { [fastHandler] in _ = fastHandler.tapSequence($0) },
+                                      log: { iCTRLUITests.logBuffer.append($0) })
+        if let p = refocusAt {
+            _ = fastHandler.fastTap(x: p.x, y: p.y)
+            var up = false
+            for _ in 0..<6 {
+                usleep(250_000)
+                if SoftKeyboardTyper.isKeyboard(typer.readKeys()) { up = true; break }
+            }
+            guard up else {
+                return (nil, JSONRPCError(code: -32603, message:
+                    "Typing failed: the field dropped focus when the text was sent as key events, and tapping it again at "
+                    + "(\(Int(p.x)),\(Int(p.y))) did not bring the keyboard back. Nothing was typed. Tap the field, "
+                    + "check the keyboard is up, then type{text, via:\"keyboard\"}.", data: nil))
+            }
+        }
+        let t0 = CACurrentMediaTime()
+        do {
+            let typed = try typer.type(text)
+            if submit, let r = typer.returnKey(typer.readKeys()) { _ = fastHandler.tapSequence([r.center]) }
+            iCTRLUITests.logBuffer.append(String(format: "⌨️ typed %d chars on the on-screen keyboard (%.0fms)",
+                                                 typed.count, (CACurrentMediaTime() - t0) * 1000))
+            var out: [String: JSONValue] = [
+                "message": .string("Typed: \(typed)" + (submit ? " + Return" : "")),
+                "via": .string("keyboard"),
+            ]
+            if let reason { out["note"] = .string(reason) }
+            if !typer.notes.isEmpty { out["warning"] = .string(typer.notes.joined(separator: " ")) }
+            return (out, nil)
+        } catch let f as SoftKeyboardTyper.Failure {
+            return (nil, JSONRPCError(code: -32603, message:
+                "Typing failed on the on-screen keyboard: \(f.message)"
+                + (f.typed.isEmpty ? " Nothing was typed." : " Typed so far: \"\(f.typed)\".")
+                + (reason.map { " (\($0))" } ?? ""), data: nil))
+        } catch {
+            return (nil, JSONRPCError(code: -32603, message: "Typing failed: \(error)", data: nil))
         }
     }
 
@@ -4608,17 +4729,47 @@ class ActionHandler {
     /// Read from the tree page_source already fetched when there is one. The
     /// live `keyboards.firstMatch.exists` probe walks the whole app again —
     /// on a large results list that alone can be most of a page_source.
-    private func keyboardState(body: String? = nil) -> JSONValue {
+    /// Top of the keyboard in a rendered tree, or nil. A system keyboard is a
+    /// Keyboard node; a third-party one (Gboard, Sogou…) runs in its own
+    /// process and leaves only its host in the app's tree, the element with
+    /// identifier "inputView", docked at the bottom of the screen.
+    private func keyboardTop(in tree: String) -> Double? {
+        let h = pointSize.height
+        for line in tree.split(separator: "\n") {
+            let l = line.drop(while: { $0 == " " })
+            guard l.hasPrefix("Keyboard,") || l.contains("id: 'inputView'"), let f = Self.frameOf(l) else { continue }
+            if l.hasPrefix("Keyboard,") {
+                if f[3] > 0 { return f[1] }
+            } else if f[3] >= 120, f[1] + 100 < h, f[1] + f[3] >= h - 2 {
+                return f[1]
+            }
+        }
+        return nil
+    }
+
+    /// Whether a keyboard is on screen now (see keyboardState).
+    private func keyboardUp() -> Bool {
+        // Typing follows a tap, often right after a launch: probe even then.
+        if case .object(let k) = keyboardState(probeJustLaunched: true), case .bool(true)? = k["visible"] { return true }
+        return false
+    }
+
+    /// The keyboard's top from one capped, shallow request (see keyboardState).
+    private func shallowKeyboardTop(_ bid: String) -> Double? {
+        // Five levels: a third-party keyboard's host ("inputView") sits at
+        // Application > Window > Other > Other > inputView.
+        guard let root = ForegroundApp.boundedSnapshot(forBundleID: bid, maxDepth: 5, maxChildren: 200) else { return nil }
+        var n = 0
+        var t: ObjCBool = false
+        return ForegroundApp.renderBoundedSnapshot(root, maxDepth: 5, maxElements: 800,
+                                                   nodesWritten: &n, truncated: &t).flatMap { keyboardTop(in: $0) }
+    }
+
+    private func keyboardState(body: String? = nil, probeJustLaunched: Bool = false) -> JSONValue {
         guard let bid = resolveForegroundBundleId() else { return .object(["visible": .bool(false)]) }
         var visible = false
         var top: Double = 0
-        if let body = body {
-            for line in body.split(separator: "\n") where line.drop(while: { $0 == " " }).hasPrefix("Keyboard,") {
-                guard let r = line.range(of: "{{") else { continue }
-                let v = line[r.lowerBound...].split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
-                if v.count >= 4, v[3] > 0 { visible = true; top = v[1]; break }
-            }
-        }
+        if let body = body, let t = keyboardTop(in: body) { visible = true; top = t }
         // Not in a capped tree is not proof: the 50-children cap can cut the
         // Keyboard node off, and some apps' keyboards aren't in their tree
         // (reported visible:false with the keyboard up). Ask live then,
@@ -4628,18 +4779,9 @@ class ActionHandler {
         // timeout (several AX timeouts in a row on a busy feed), while this is
         // a single request bounded by the AX timeout. The keyboard sits near
         // the top of the tree, so a few levels and a wide child cap find it.
-        if !visible, !isSlowTree(bid), !justLaunched(bid),
-           let root = ForegroundApp.boundedSnapshot(forBundleID: bid, maxDepth: 4, maxChildren: 200) {
-            var n = 0
-            var t: ObjCBool = false
-            if let shallow = ForegroundApp.renderBoundedSnapshot(root, maxDepth: 4, maxElements: 800,
-                                                                 nodesWritten: &n, truncated: &t) {
-                for line in shallow.split(separator: "\n") where line.drop(while: { $0 == " " }).hasPrefix("Keyboard,") {
-                    guard let r = line.range(of: "{{") else { continue }
-                    let v = line[r.lowerBound...].split(whereSeparator: { !"-0123456789.".contains($0) }).compactMap { Double($0) }
-                    if v.count >= 4, v[3] > 0 { visible = true; top = v[1]; break }
-                }
-            }
+        if !visible, !isSlowTree(bid), probeJustLaunched || !justLaunched(bid),
+           let t = shallowKeyboardTop(bid) {
+            visible = true; top = t
         }
         guard visible else { return .object(["visible": .bool(false)]) }
         lastKeyboardSeen = (bid, nowMonotonic)

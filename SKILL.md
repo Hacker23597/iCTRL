@@ -1,7 +1,7 @@
 ---
 name: ictrl-phone-control
 description: Control an iPhone over HTTP to automate real apps — tap, type, swipe, read the screen's view tree, launch apps, take screenshots. Use when the user asks to operate a phone, drive an iOS app, automate a mobile task (search a product, check an order, fill a form), or inspect what's on a device's screen. The service is iCTRL, JSON-RPC 2.0 on port 8200; requests are encrypted, so drive it with a client downloaded from the device (a static CLI needing no interpreter, or a Python one) rather than hand-written HTTP.
-skill_version: "1.98.14"
+skill_version: "1.98.15"
 ---
 
 # iCTRL — control an iPhone over HTTP
@@ -101,11 +101,11 @@ Most responses carry a **`hint`** (what limited the result, what to do next) —
 ## Typing and searching
 
 1. The search "bar" on a home screen is often a Button that opens a search page. `find_element` returns `is_text_input`; if false, tap it, then find the real field: `find_element{element_id:"<placeholder>", element_type:"textfield", match:"contains"}` → `tap{ref}`.
-2. `type{text, submit:true}`. `submit` presses Return/Search.
-3. **Trust success.** If `type` returned no warning, the text went in. Old content in the next read = not updated yet: read again, don't re-type.
-4. **Typing appends.** To replace a field's text use `type{text, clear:true}` or `clear_text` first. An `append_warning` in the response means you just appended to existing text.
-   If `submit` didn't trigger the search, tap the screen's own search/confirm control — don't re-type.
-5. `page_source` carries `keyboard` (`visible`, `covers_from_y`). Coordinates read before the keyboard appeared are stale: everything above it has shifted.
+2. `type{text, submit:true}`. `submit` presses Return/Search. Didn't search? Tap the screen's own search control; don't re-type.
+3. **Trust success.** A `type` with no warning went in; a failed one is an error. Old content on the next read: read again, don't re-type.
+4. **Typing appends.** To replace, `type{text, clear:true}` or `clear_text` first. `append_warning` = you appended.
+5. Some custom inputs (chat bars) drop focus on typed keys; `type` then taps the on-screen keys (`via:"keyboard"`, ~1s/char, Chinese via pinyin; never presses Send).
+6. `page_source` carries `keyboard` (`visible`, `covers_from_y`). Coordinates read before it appeared are stale: content above it shifted.
 
 ## Reading the screen
 

@@ -1170,11 +1170,19 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// client waiting for the real answer.
     // screen_text: OCR alone can take seconds on a busy or thermally
     // throttled device, pushing a normally finishing call past 6s.
-    private static let extendedTimeoutMethods: Set<String> = ["page_source", "find_and_tap", "tap_element", "collect", "screen_text"]
+    // type: a field that rejects key events is typed again on the on-screen
+    // keys, a tap per letter plus the candidate picks; and a false timeout
+    // there invites a retry that enters the text twice.
+    private static let extendedTimeoutMethods: Set<String> = ["page_source", "find_and_tap", "tap_element", "collect", "screen_text", "type"]
     private static let extendedRpcTimeout: TimeInterval = 15
 
-    private static func rpcBudget(for method: String) -> TimeInterval {
-        extendedTimeoutMethods.contains(method) ? extendedRpcTimeout : rpcTimeout
+    private static func rpcBudget(for method: String, params: [String: JSONValue]? = nil) -> TimeInterval {
+        // Typed on the on-screen keys, a character can cost a second or more
+        // (pinyin, then the candidate): the budget grows with the text.
+        if method == "type", let n = params?["text"]?.stringValue?.count {
+            return min(90, max(extendedRpcTimeout, 8 + 1.5 * Double(n)))
+        }
+        return extendedTimeoutMethods.contains(method) ? extendedRpcTimeout : rpcTimeout
     }
 
     /// Wire RPC dispatch + public logs onto a server instance.
@@ -1302,7 +1310,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             }
 
             // Watchdog: if the work doesn't finish in time, tell the client now.
-            let budget = Self.rpcBudget(for: method)
+            let budget = Self.rpcBudget(for: method, params: params)
             DispatchQueue.global().async {
                 if done.wait(timeout: .now() + budget) == .timedOut {
                     // Queued, not hung: this call never started because another
