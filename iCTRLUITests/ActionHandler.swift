@@ -433,7 +433,7 @@ class ActionHandler {
 
         if Self.uiActionMethods.contains(method), cmd.bundleId == nil {
             let coordinateBased = (cmd.x != nil && cmd.y != nil) || (cmd.fromX != nil && cmd.fromY != nil)
-                || ContinuousDragPath.startPoint(cmd.dragPathParams) != nil
+                || !ContinuousDragPath.waypoints(cmd.dragPathParams).isEmpty
             // A ref into SpringBoard is the alert's own button (find_element
             // with bundle_id springboard hands those out): refusing it "because
             // an alert is up" made the alert impossible to answer by ref.
@@ -450,14 +450,17 @@ class ActionHandler {
         // A drag on an anti-bot slider is an attempt to solve it: refused.
         if ["swipe", "drag", "scroll"].contains(method), let c = lastChallenge, nowMonotonic - c.at < 120,
            c.bid == resolveForegroundBundleId() {
-            let start = ContinuousDragPath.startPoint(cmd.dragPathParams)
+            // A path is refused if any waypoint is on the check, not just its
+            // start: it may press beside the slider and sweep across it.
+            let waypoints = ContinuousDragPath.waypoints(cmd.dragPathParams)
+            let start = waypoints.first
                 ?? cmd.fromX.flatMap { x in cmd.fromY.map { CGPoint(x: x, y: $0) } }
                 ?? cmd.x.flatMap { x in cmd.y.map { CGPoint(x: x, y: $0) } }
                 ?? CGPoint(x: pointSize.width / 2, y: pointSize.height / 2)
-            if c.area.contains(start) {
-                iCTRLUITests.logBuffer.append("🛑 \(method) refused: it starts on an anti-bot check")
+            if c.area.contains(start) || waypoints.contains(where: c.area.contains) {
+                iCTRLUITests.logBuffer.append("🛑 \(method) refused: it touches an anti-bot check")
                 return (nil, JSONRPCError(code: -32602, message:
-                    "Not done: this \(method) starts on the anti-bot check read moments ago (slider / puzzle). iCTRL " +
+                    "Not done: this \(method) touches the anti-bot check read moments ago (slider / puzzle). iCTRL " +
                     "doesn't solve verification. Close it (its 关闭 / ×), back out, or stop and report the step as blocked " +
                     "by verification.", data: nil))
             }
@@ -7847,7 +7850,9 @@ class ActionHandler {
 
     private func drag(_ cmd: ActionCommand) -> ([String: JSONValue]?, JSONRPCError?) {
         if let params = cmd.dragPathParams {
-            let (path, error) = ContinuousDragPath.parse(params, screenSize: pointSize.size)
+            let (path, error) = ContinuousDragPath.parse(params) { point, index in
+                validateCoordinate(x: Double(point.x), y: Double(point.y), context: "drag point \(index)")
+            }
             if let error = error { return (nil, error) }
             guard let path = path else { return (nil, .internalError) }
             let record = XCSynthesizedEventRecord(name: "Continuous Path Drag")

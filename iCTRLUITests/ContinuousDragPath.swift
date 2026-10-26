@@ -11,7 +11,14 @@ struct ContinuousDragPath {
     let points: [CGPoint]
     let duration: TimeInterval
 
-    static func parse(_ params: [String: JSONValue], screenSize: CGSize)
+    static let defaultDuration: TimeInterval = 1.0
+    static let durationRange: ClosedRange<TimeInterval> = 0.1...10.0
+
+    /// Bounds are checked by `checkPoint` (the caller's on-screen rule, so a
+    /// path and an endpoint drag reject the same coordinates the same way); it
+    /// gets each point with its index and returns the error to reply with.
+    static func parse(_ params: [String: JSONValue],
+                      checkPoint: (CGPoint, Int) -> JSONRPCError?)
         -> (ContinuousDragPath?, JSONRPCError?) {
         func invalid(_ message: String) -> (ContinuousDragPath?, JSONRPCError?) {
             (nil, JSONRPCError(code: -32602, message: message, data: nil))
@@ -28,61 +35,57 @@ struct ContinuousDragPath {
             guard let value = raw.doubleValue else { return invalid("drag points duration must be a number") }
             duration = value
         } else {
-            duration = 1.0
+            duration = defaultDuration
         }
-        guard duration.isFinite, (0.1...10.0).contains(duration) else {
+        guard duration.isFinite, durationRange.contains(duration) else {
             return invalid("drag points duration must be finite and between 0.1 and 10 seconds")
         }
         var points: [CGPoint] = []
-        for value in values {
+        for (index, value) in values.enumerated() {
             guard let item = value.objectValue, let x = item["x"]?.doubleValue,
                   let y = item["y"]?.doubleValue, x.isFinite, y.isFinite else {
                 return invalid("Each drag point requires finite numeric x and y")
             }
-            guard x >= 0, y >= 0, x <= screenSize.width, y <= screenSize.height else {
-                return invalid("drag point (\(x),\(y)) is outside the screen in POINTS")
-            }
-            points.append(CGPoint(x: x, y: y))
+            let point = CGPoint(x: x, y: y)
+            if let error = checkPoint(point, index) { return (nil, error) }
+            points.append(point)
         }
         return (ContinuousDragPath(points: points, duration: duration), nil)
     }
 
-    /// Match the existing drag's start-point challenge check, including for
-    /// malformed requests (which parse() will reject before touch injection).
-    static func startPoint(_ params: [String: JSONValue]?) -> CGPoint? {
-        guard case .array(let values)? = params?["points"],
-              let first = values.first?.objectValue,
-              let x = first["x"]?.doubleValue, let y = first["y"]?.doubleValue,
-              x.isFinite, y.isFinite else { return nil }
-        return CGPoint(x: x, y: y)
+    /// Every well-formed waypoint, for checks that run before parse() (system
+    /// alert routing, the anti-bot guard). Malformed entries are skipped here;
+    /// parse() rejects the request before any touch is injected.
+    static func waypoints(_ params: [String: JSONValue]?) -> [CGPoint] {
+        guard case .array(let values)? = params?["points"] else { return [] }
+        return values.compactMap { value in
+            guard let item = value.objectValue,
+                  let x = item["x"]?.doubleValue, let y = item["y"]?.doubleValue,
+                  x.isFinite, y.isFinite else { return nil }
+            return CGPoint(x: x, y: y)
+        }
     }
 
     /// A legitimate long path must not time out while its touch is still down.
-    /// Reserve up to 3s for settle plus 2s for synthesis/dispatch overhead.
+    /// Playback can run late on a busy device, so the gesture gets a quarter
+    /// more than its nominal length, then the settle cap and 3s of overhead.
     static func rpcBudget(_ params: [String: JSONValue]?, defaultBudget: TimeInterval) -> TimeInterval {
         guard case .array? = params?["points"] else { return defaultBudget }
-        let duration = params?["duration"]?.doubleValue ?? 1.0
-        guard duration.isFinite, (0.1...10.0).contains(duration) else { return defaultBudget }
-        return max(defaultBudget, duration + 5)
+        let duration = params?["duration"]?.doubleValue ?? defaultDuration
+        guard duration.isFinite, durationRange.contains(duration) else { return defaultBudget }
+        let settle = min(max(params?["settle_timeout"]?.doubleValue ?? 2, 0), 3)
+        return max(defaultBudget, duration * 1.25 + (settle.isFinite ? settle : 3) + 3)
     }
 
-    /// Equal time per segment, including zero-length segments (a hold). Samples
-    /// retain each exact waypoint and strictly increasing offsets across corners.
+    /// One move per waypoint, equal time per segment: XCTest interpolates the
+    /// finger between moves itself, so corners land exactly and playback keeps
+    /// to the requested duration. A repeated waypoint is a move to the same
+    /// point at a later offset, which holds the finger there.
     var samples: [Sample] {
-        let segmentDuration = duration / Double(points.count - 1)
-        let count = max(1, Int(ceil(segmentDuration * 60)))
-        var result: [Sample] = []
-        for index in 1..<points.count {
-            let start = points[index - 1], end = points[index]
-            for sample in 1...count {
-                let fraction = Double(sample) / Double(count)
-                let point = sample == count ? end : CGPoint(
-                    x: start.x + (end.x - start.x) * fraction,
-                    y: start.y + (end.y - start.y) * fraction)
-                result.append(Sample(point: point,
-                                     offset: (Double(index - 1) + fraction) * segmentDuration))
-            }
+        let last = points.count - 1
+        let segmentDuration = duration / Double(last)
+        return points.indices.dropFirst().map {
+            Sample(point: points[$0], offset: $0 == last ? duration : Double($0) * segmentDuration)
         }
-        return result
     }
 }

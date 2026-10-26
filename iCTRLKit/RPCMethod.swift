@@ -327,7 +327,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "drag",
-            description: "Drag between endpoints or follow points:[{x,y},...] with one uninterrupted single-finger touch. Path mode accepts 2...64 screen points and duration 0.1...10 seconds (default 1), equally timed per segment; do not combine with endpoints/refs. Endpoints may be coordinates (from_x/from_y/to_x/to_y in POINTS) OR element refs (from_ref/to_ref, which resolve to the element center). Use for reordering/sliders; for a simple scroll flick use swipe.",
+            description: "Drag between endpoints or follow points:[{x,y},...] with one uninterrupted single-finger touch. Path mode accepts 2...64 screen points and duration 0.1...10 seconds (default 1), equally timed per segment (keep each segment at least one frame, ~17ms, or the app may merge a corner away; corners may round off by 1-2 points); a repeated point holds; do not combine with endpoints/refs. Endpoints may be coordinates (from_x/from_y/to_x/to_y in POINTS) OR element refs (from_ref/to_ref, which resolve to the element center). Use for reordering/sliders; for a simple scroll flick use swipe.",
             params: [
                 RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
                 RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
@@ -377,7 +377,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.98.15"
+    static let serverVersion = "1.98.16"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///
@@ -420,6 +420,7 @@ struct RPCMethodRegistry {
         "screen_text",         // Vision OCR fallback when the AX tree has no on-screen rows
         "cli_binary",          // GET /skill/clients/cli — static aarch64-musl client
         "nearby_discovery",    // Bonjour over peer-to-peer Wi-Fi (AWDL) on port+1, when turned on
+        "drag_path",           // drag{points:[{x,y},...]} — one finger through waypoints, no lift at corners
     ]
 
     static func generateSchemaDocument() -> [String: Any] {

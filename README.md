@@ -590,10 +590,16 @@ Coordinates are screen **points**, not screenshot pixels. Supply 2–64 finite,
 nonnegative, on-screen `{x,y}` points. Do not combine `points` with
 `from_x/from_y/to_x/to_y` or `from_ref/to_ref`. Total `duration` is 0.1–10 seconds
 (default 1), divided equally between segments; repeating a waypoint holds the
-finger there for that segment. All waypoints are validated before any touch is
+finger there for that segment. Keep each segment at least one frame long
+(~17ms): the receiving app reads touches once per frame, so a shorter segment
+can merge a corner away. XCTest eases the finger between waypoints, so a corner
+may round off by 1–2 points, and very short segments (under ~50ms) stop a few
+points short of their corners. Runners that support it list `drag_path` in
+`device_info.capabilities`. All waypoints are validated before any touch is
 injected. The finger presses once at the first point and lifts once after the
-last point. The normal challenge check uses the actual path start, and long
-paths receive enough RPC time for the gesture and settle check to finish.
+last point. A path that touches an anti-bot check with any
+waypoint is refused, like a drag that starts on one. Long paths get enough RPC
+time for the gesture and the settle check to finish.
 
 Run the validation/timing tests on a Mac with the Swift toolchain:
 
