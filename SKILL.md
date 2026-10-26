@@ -133,6 +133,7 @@ Most responses carry a **`hint`** (what limited the result, what to do next) —
 ## Coordinates and screenshots
 
 - `tap`/`swipe`/`drag`, `page_source` frames and OCR boxes are all **points**.
+- `drag{points:[{x,y},...],duration?}`: one finger, 2–64 waypoints, no lift at corners. Duration 0.1–10s (default 1), equal time per segment; repeated points hold. Do not mix with endpoint coordinates/refs.
 - Screenshots are pixels: `point = pixel / scale`, using the **`scale` from that screenshot response** (default 2), not `device_info.screen_scale` (the panel's 3).
 
 ## Diagnostics

@@ -1189,6 +1189,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         if method == "type", let n = params?["text"]?.stringValue?.count {
             return min(90, max(extendedRpcTimeout, 8 + 1.5 * Double(n)))
         }
+        if method == "drag" { return ContinuousDragPath.rpcBudget(params, defaultBudget: rpcTimeout) }
         return extendedTimeoutMethods.contains(method) ? extendedRpcTimeout : rpcTimeout
     }
 
