@@ -4,14 +4,35 @@ class FastActionHandler {
     /// Where the last tap/press landed, for the settle check to watch that
     /// spot as well as the whole screen. Cleared per call by the dispatcher.
     var lastTouchPoint: CGPoint?
+    /// The last single tap and when, kept across calls: typing that has to
+    /// re-focus a field taps it again there.
+    private(set) var lastTap: (point: CGPoint, at: Date)?
     private let app: XCUIApplication
 
     init(app: XCUIApplication) {
         self.app = app
     }
 
+    /// Taps one after another in a single synthesized record: one round trip
+    /// to testmanagerd instead of one per tap, which is most of a tap's cost.
+    /// For keys on the on-screen keyboard, so `lastTap` is left alone: it has
+    /// to keep pointing at the field.
+    func tapSequence(_ points: [CGPoint], gap: TimeInterval = 0.1) -> Bool {
+        guard !points.isEmpty else { return true }
+        let record = XCSynthesizedEventRecord(name: "Key Taps")
+        for (i, p) in points.enumerated() {
+            let t = Double(i) * gap
+            let path = XCPointerEventPath(forTouchAt: p, offset: t)
+            path.pressDown(atOffset: t)
+            path.liftUp(atOffset: t + 0.04)
+            record.add(path)
+        }
+        return (try? record.synthesize()) != nil
+    }
+
     func fastTap(x: Double, y: Double) -> ([String: JSONValue]?, JSONRPCError?) {
         lastTouchPoint = CGPoint(x: x, y: y)
+        lastTap = (CGPoint(x: x, y: y), Date())
         let eventRecord = XCSynthesizedEventRecord(name: "Fast Tap")
         let point = CGPoint(x: x, y: y)
         let eventPath = XCPointerEventPath(forTouchAt: point, offset: 0.0)

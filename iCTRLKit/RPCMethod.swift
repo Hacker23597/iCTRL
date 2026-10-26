@@ -193,7 +193,7 @@ struct RPCMethodRegistry {
         ),
         RPCMethodDef(
             name: "type",
-            description: "Type text into the focused input field. A text field must already have keyboard focus — tap a real textfield first (see 'searching_and_typing'). Type always runs, but if no keyboard could be confirmed the response includes a 'warning' (keyboard detection can't see all third-party keyboards, so this is advisory, not a failure) — if the text didn't land, re-focus the field and type again. Set clear:true to EMPTY the field before typing (replace its contents); set submit:true to append Return/Search so the field's action (search/go/send) fires. See searching_and_typing guidance for the full search flow.",
+            description: "Type text into the focused input field. A text field must already have keyboard focus — tap a real textfield first (see 'searching_and_typing'). The text is sent as key events. Some custom inputs (chat bars drawn by the app) drop focus when key events arrive and never take the text: when the keyboard was up before typing and is gone after, type taps the field again and enters the text on the on-screen keyboard's keys instead (response via:\"keyboard\" plus a note; about a second per character; Han text goes in as pinyin plus the matching candidate; it never presses Return/Send unless submit:true). If that can't be done either, type fails with an error rather than reporting success. When no keyboard could be seen before typing, the response may carry an advisory 'warning'. Set clear:true to EMPTY the field before typing (replace its contents); set submit:true to append Return/Search so the field's action (search/go/send) fires. See searching_and_typing guidance for the full search flow.",
             params: [
                 RPCParamDef(name: "settle", type: "boolean", required: false, description: "Default true: after the action, wait until the screen stops changing (compares low-res frames; up to settle_timeout) and report it in `settle`. false = return right after the action."),
                 RPCParamDef(name: "settle_timeout", type: "number", required: false, description: "Max seconds to wait for the screen to settle (default 2, max 3)."),
@@ -203,8 +203,9 @@ struct RPCMethodRegistry {
                 RPCParamDef(name: "x", type: "number", required: false, description: "Tap X to focus before typing"),
                 RPCParamDef(name: "y", type: "number", required: false, description: "Tap Y to focus before typing"),
                 RPCParamDef(name: "fast", type: "boolean", required: false, description: "Use fast mode"),
+                RPCParamDef(name: "via", type: "string", required: false, description: "\"keyboard\": type by tapping the on-screen keyboard's keys right away, skipping key events (for an input known to drop focus on them). Needs the keyboard up with readable keys (system keyboards, Gboard). Can't combine with clear:true."),
             ],
-            returns: "{message, warning?} — warning present when a focused keyboard couldn't be confirmed"
+            returns: "{message, via?, note?, warning?} — via:\"keyboard\" when the text was typed on the on-screen keys; warning when a focused keyboard couldn't be confirmed or the input method changed the text (e.g. capitals lost)"
         ),
         RPCMethodDef(
             name: "clear_text",
@@ -375,7 +376,7 @@ struct RPCMethodRegistry {
     /// release that added the encrypted auth channel plus the docs/Skill,
     /// clear-text, page-source, and reliability improvements. Single source of
     /// truth for /schema AND device_info.
-    static let serverVersion = "1.98.13"
+    static let serverVersion = "1.98.15"
 
     /// When this binary was built, as "YYYY-MM-DD HH:MM".
     ///

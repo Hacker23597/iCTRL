@@ -648,6 +648,24 @@ enum RemoteHTML {
   }
   const savedKey = localStorage.getItem(STORE_KEY) || '';
   if (savedKey) tokenInput.value = savedKey;
+
+  // Stream settings are kept per browser like the key, and restored before
+  // anything can connect. A stored value that is no longer offered is ignored.
+  const STREAM_PREFS = { fps: fpsSel, quality: qSel };
+  function loadStreamPrefs() {
+    for (const [name, sel] of Object.entries(STREAM_PREFS)) {
+      let v = null;
+      try { v = localStorage.getItem('ictrl.stream.' + name); } catch (_) {}
+      if (sel && v !== null && [...sel.options].some(o => o.value === v)) sel.value = v;
+    }
+    try {
+      if (verboseChk) verboseChk.checked = localStorage.getItem('ictrl.stream.verbose') === '1';
+    } catch (_) {}
+  }
+  function saveStreamPref(name, value) {
+    try { localStorage.setItem('ictrl.stream.' + name, value); } catch (_) {}
+  }
+  loadStreamPrefs();
   let deviceInfo = null;   // {point_width, point_height}
   let dragStart = null;
 
@@ -1529,12 +1547,15 @@ enum RemoteHTML {
   // Changing FPS mid-stream: reconnect so the server sees the new ?fps=…
   // (broadcaster restarts the encoder at the new rate).
   fpsSel.addEventListener('change', () => {
+    saveStreamPref('fps', fpsSel.value);
     if (player) { setStatus(`switching to ${fpsSel.value} fps…`); connect(); }
   });
   qSel?.addEventListener('change', () => {
+    saveStreamPref('quality', qSel.value);
     if (player) { setStatus(`switching to quality ${qSel.value}…`); connect(); }
   });
   verboseChk?.addEventListener('change', () => {
+    saveStreamPref('verbose', verboseChk.checked ? '1' : '0');
     if (player) { setStatus(`verbose ${verboseChk.checked ? 'on' : 'off'}…`); connect(); }
   });
 

@@ -23,6 +23,7 @@ struct ActionCommand {
     var fromRef: String?
     var toRef: String?
     var submit: Bool?
+    var via: String?
     var clear: Bool?
     var country: String?
     var url: String?
@@ -70,6 +71,7 @@ struct ActionCommand {
         self.fromRef = params?["from_ref"]?.stringValue
         self.toRef = params?["to_ref"]?.stringValue
         self.submit = params?["submit"]?.boolValue
+        self.via = params?["via"]?.stringValue
         self.clear = params?["clear"]?.boolValue
         self.format = params?["format"]?.stringValue
         self.quality = params?["quality"]?.doubleValue

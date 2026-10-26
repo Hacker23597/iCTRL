@@ -120,7 +120,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     ///
     /// Every step is probed: the selectors are private, and a wrong assumption
     /// here is a launch-time crash rather than a slow stream.
-    private static func grabJPEGFrame() -> UIImage? {
+    private static func grabJPEGFrame() -> (image: UIImage, jpeg: Data)? {
         if jpegCaptureAvailable == false { return nil }
 
         // These selectors were read out of a current Xcode SDK; an older OS
@@ -129,7 +129,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
         // implementation raises an NSException, which `try?` does NOT catch —
         // it would abort the runner. So the whole probe runs inside an ObjC
         // @try, and any failure disables this path permanently.
-        var result: UIImage?
+        var result: (image: UIImage, jpeg: Data)?
         var sizeKB = 0
         var failStep = "unknown"
         let raised = ObjCException.catching {
@@ -166,7 +166,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                     }
                     daemonCaptureWorks = true
                     daemonCaptureFailures = 0
-                    result = img
+                    result = (img, data)
                     sizeKB = data.count / 1024
                     return
                 }
@@ -204,16 +204,16 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             guard let img = UIImage(data: data), img.cgImage != nil else {
                 failStep = "UIImage(data:) failed on \(data.count) bytes"; return
             }
-            result = img
+            result = (img, data)
             sizeKB = data.count / 1024
         }
 
-        if let img = result {
+        if let frame = result {
             if jpegCaptureAvailable == nil {
                 jpegCaptureAvailable = true
                 logBuffer.append("📷 JPEG capture active (q=\(captureJPEGQuality), \(sizeKB) KB/frame)")
             }
-            return img
+            return frame
         }
         if jpegCaptureAvailable == nil {
             jpegCaptureAvailable = false
@@ -231,10 +231,10 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// whole duration, which froze the stream for as long). Tried once the
     /// capture path has been probed on the main thread; an exception or a
     /// missing frame turns it off for good.
-    static func offMainFrame() -> UIImage? {
+    static func offMainFrame() -> VideoBroadcaster.Frame? {
         guard jpegCaptureAvailable != nil, offMainCaptureWorks != false else { return nil }
-        var img: UIImage?
-        let raised = ObjCException.catching { img = captureFrame() }
+        var img: VideoBroadcaster.Frame?
+        let raised = ObjCException.catching { img = captureFrameAndJPEG() }
         if offMainCaptureWorks == nil || img == nil {
             offMainCaptureWorks = img != nil
             logBuffer.append(img != nil ? "📷 stream capture runs off the main thread"
@@ -248,13 +248,20 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// public API. Main thread only. Shared by the video stream and the
     /// post-action settle check.
     static func captureFrame() -> UIImage? {
+        captureFrameAndJPEG()?.image
+    }
+
+    /// `captureFrame`, plus the JPEG the frame was decoded from when the fast
+    /// path produced one: the stream compares those bytes to skip a frame
+    /// that hasn't changed before paying for its decode and encode.
+    static func captureFrameAndJPEG() -> VideoBroadcaster.Frame? {
         // Fast path: ask the capture side to hand back a JPEG. The
         // default `screenshot()` produces a full-resolution bitmap
         // (~6 MB at 828x1792) that we then copy again; capture and
         // that copy are what degrade 15-20x under thermal pressure,
         // while encoding barely moves. Compressing at the source
         // keeps the big buffer out of this process entirely.
-        if let img = Self.grabJPEGFrame() { return img }
+        if let frame = Self.grabJPEGFrame() { return (frame.image, frame.jpeg) }
         // Otherwise take the bitmap directly, still skipping the
         // PNG round-trip that `.image` would do. Also private, and
         // also behind an ObjC @try: on an OS where the selector
@@ -270,8 +277,8 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                   img.cgImage != nil else { return }  // encoder needs CGImage
             fast = img
         }
-        if let img = fast { return img }
-        return shot.image
+        if let img = fast { return (img, nil) }
+        return (shot.image, nil)
     }
 
     private static var lifecycleObserved = false
@@ -1170,11 +1177,19 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
     /// client waiting for the real answer.
     // screen_text: OCR alone can take seconds on a busy or thermally
     // throttled device, pushing a normally finishing call past 6s.
-    private static let extendedTimeoutMethods: Set<String> = ["page_source", "find_and_tap", "tap_element", "collect", "screen_text"]
+    // type: a field that rejects key events is typed again on the on-screen
+    // keys, a tap per letter plus the candidate picks; and a false timeout
+    // there invites a retry that enters the text twice.
+    private static let extendedTimeoutMethods: Set<String> = ["page_source", "find_and_tap", "tap_element", "collect", "screen_text", "type"]
     private static let extendedRpcTimeout: TimeInterval = 15
 
-    private static func rpcBudget(for method: String) -> TimeInterval {
-        extendedTimeoutMethods.contains(method) ? extendedRpcTimeout : rpcTimeout
+    private static func rpcBudget(for method: String, params: [String: JSONValue]? = nil) -> TimeInterval {
+        // Typed on the on-screen keys, a character can cost a second or more
+        // (pinyin, then the candidate): the budget grows with the text.
+        if method == "type", let n = params?["text"]?.stringValue?.count {
+            return min(90, max(extendedRpcTimeout, 8 + 1.5 * Double(n)))
+        }
+        return extendedTimeoutMethods.contains(method) ? extendedRpcTimeout : rpcTimeout
     }
 
     /// Wire RPC dispatch + public logs onto a server instance.
@@ -1302,7 +1317,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             }
 
             // Watchdog: if the work doesn't finish in time, tell the client now.
-            let budget = Self.rpcBudget(for: method)
+            let budget = Self.rpcBudget(for: method, params: params)
             DispatchQueue.global().async {
                 if done.wait(timeout: .now() + budget) == .timedOut {
                     // Queued, not hung: this call never started because another
@@ -1356,12 +1371,12 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             // on the main thread — hop over there synchronously from whatever
             // queue the broadcaster ticks on.
             VideoBroadcaster.shared.configure(fps: fps, quality: quality) {
-                let grab: () -> UIImage? = { Self.captureFrame() }
+                let grab: () -> VideoBroadcaster.Frame? = { Self.captureFrameAndJPEG() }
                 if Thread.isMainThread { return grab() }
-                if let img = Self.offMainFrame() { return img }
-                var img: UIImage?
-                DispatchQueue.main.sync { img = grab() }
-                return img
+                if let frame = Self.offMainFrame() { return frame }
+                var frame: VideoBroadcaster.Frame?
+                DispatchQueue.main.sync { frame = grab() }
+                return frame
             }
             let streamer = VideoStreamer(connection: connection)
             self?.videoStreamersLock.lock()
