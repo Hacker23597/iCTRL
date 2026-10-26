@@ -64,8 +64,31 @@ final class VideoBroadcaster {
         var inited: Bool
     }
     private var subscribers: [ObjectIdentifier: Subscriber] = [:]
-    private var grabFrame: (() -> UIImage?)?
+    /// A captured screen, plus the JPEG it was decoded from when the capture
+    /// path produced one (nil on the bitmap fallback).
+    typealias Frame = (image: UIImage, jpeg: Data?)
+    private var grabFrame: (() -> Frame?)?
     private var fps: Double = 5
+
+    // Idle handling. A remote-control screen is still most of the time, and
+    // every frame costs a capture, a JPEG decode, a redraw and an encode — at
+    // 15 fps over half a CPU core, all of it repeating the same picture. So:
+    //  * a frame whose JPEG is byte-identical to the previous one is not
+    //    decoded or encoded, once the picture has been still for `settleTime`
+    //    (the frames right after a change are kept: the encoder sharpens a
+    //    new picture over several frames, and stopping early would freeze it
+    //    blurred);
+    //  * while still, capture slows to `idleInterval`, and a frame is still
+    //    sent every `heartbeat` so the player's timeline keeps moving;
+    //  * any change, an action (`nudgeFrame`) or a new viewer returns to the
+    //    full rate at once.
+    private static let settleTime: CFTimeInterval = 1.0
+    private static let idleInterval: CFTimeInterval = 0.5
+    private static let heartbeat: CFTimeInterval = 1.0
+    private var lastJPEG: Data?
+    private var stillSince: CFTimeInterval = 0
+    private var idle = false
+    private var tickInterval: CFTimeInterval = 0
 
     /// Encoder quality preset. Controls both the target bitrate (via
     /// AverageBitRate + DataRateLimits) and the encoding resolution (source
@@ -136,6 +159,7 @@ final class VideoBroadcaster {
     private var statsBytes = 0
     private var statsKeyframes = 0
     private var statsDrops = 0
+    private var statsSkipped = 0
 
     /// Configure the frame source + rate + quality. If encoding is already
     /// running with different parameters, restart the pipeline so the new
@@ -143,7 +167,7 @@ final class VideoBroadcaster {
     /// init segment + keyframe and continue).
     func configure(fps: Double,
                    quality: Quality = .auto,
-                   grabFrame: @escaping () -> UIImage?) {
+                   grabFrame: @escaping () -> Frame?) {
         queue.async {
             // Screen capture, not encoding, sets the achievable rate. With
             // the direct testmanagerd JPEG capture a frame costs a few tens
@@ -183,9 +207,11 @@ final class VideoBroadcaster {
             }
             self.subscribers[token] = sub
             if wasEmpty { self.startEncoding() }
-            else if self.initSegment == nil {
-                // Encoder is running but hasn't produced a keyframe yet — ask
-                // for one so the new subscriber gets going quickly.
+            else {
+                // The encoder is already running: a new viewer can only start
+                // decoding at a keyframe, and a still screen would otherwise
+                // not produce one for a long time.
+                self.wake()
                 self.captureAndEncode(forceKeyframe: true)
             }
         }
@@ -201,6 +227,9 @@ final class VideoBroadcaster {
     func nudgeFrame() {
         queue.async {
             guard self.timer != nil else { return }
+            // The action's effect may only show a moment later: watch at the
+            // full rate from now, whatever this capture finds.
+            self.wake()
             if CACurrentMediaTime() - self.lastFrameAt < 0.5 / self.fps { return }
             self.captureAndEncode(forceKeyframe: self.initSegment == nil)
         }
@@ -216,7 +245,7 @@ final class VideoBroadcaster {
     // MARK: encoding lifecycle (queue-confined)
 
     private func startEncoding() {
-        guard timer == nil, let grab = grabFrame, let first = grab(), let cg = first.cgImage else {
+        guard timer == nil, let grab = grabFrame, let first = grab(), let cg = first.image.cgImage else {
             log("no first frame — cannot start encoding (grabFrame returned nil)")
             return
         }
@@ -237,8 +266,10 @@ final class VideoBroadcaster {
         sps = Data(); pps = Data()
         frameIndex = 0
         streamStartAt = 0; lastFrameAt = 0
+        lastJPEG = nil; stillSince = 0; idle = false
         let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now(), repeating: 1.0 / fps)
+        tickInterval = activeInterval()
+        t.schedule(deadline: .now(), repeating: tickInterval)
         t.setEventHandler { [weak self] in self?.captureAndEncode() }
         timer = t
         t.resume()
@@ -257,19 +288,68 @@ final class VideoBroadcaster {
         statsStartAt = 0; statsFrames = 0
         statsCaptureMs = 0; statsPixbufMs = 0
         statsEncodeMs = 0; statsMuxMs = 0
-        statsBytes = 0; statsKeyframes = 0; statsDrops = 0
-        log("encoding stopped (no subscribers)")
+        statsBytes = 0; statsKeyframes = 0; statsDrops = 0; statsSkipped = 0
+        lastJPEG = nil; stillSince = 0; idle = false
+        log("encoding stopped")
+    }
+
+    /// Full-rate tick: the requested rate, capped while the device is hot so
+    /// the stream isn't what keeps it hot.
+    private func activeInterval() -> CFTimeInterval {
+        var rate = fps
+        switch ProcessInfo.processInfo.thermalState {
+        case .serious: rate = min(rate, 10)
+        case .critical: rate = min(rate, 5)
+        default: break
+        }
+        return 1.0 / rate
+    }
+
+    private func setTick(_ interval: CFTimeInterval) {
+        guard let timer, abs(interval - tickInterval) > 0.0001 else { return }
+        tickInterval = interval
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+    }
+
+    /// Back to the full rate, and treat the picture as freshly changed.
+    private func wake() {
+        stillSince = 0
+        lastJPEG = nil
+        if idle { idle = false }
+        setTick(activeInterval())
     }
 
     private func captureAndEncode(forceKeyframe: Bool = false) {
         guard let session = session, let grab = grabFrame else { return }
         let t0 = CACurrentMediaTime()
-        guard let image = grab() else {
+        guard let frame = grab() else {
             statsDrops += 1
             if VideoBroadcaster.verbose { log("f#\(frameIndex) DROP: grabFrame returned nil") }
             return
         }
         let t1 = CACurrentMediaTime()
+
+        // Still or changed? Only a byte-identical JPEG counts as still; the
+        // bitmap fallback has no bytes to compare and is always encoded.
+        if let jpeg = frame.jpeg, jpeg == lastJPEG {
+            if stillSince == 0 { stillSince = t0 }
+        } else {
+            stillSince = 0
+            if idle { idle = false; setTick(activeInterval()) }
+        }
+        lastJPEG = frame.jpeg
+        let settled = stillSince > 0 && t0 - stillSince >= Self.settleTime
+        if settled, !idle {
+            idle = true
+            setTick(Self.idleInterval)
+        } else if !idle {
+            setTick(activeInterval())   // follows the thermal state
+        }
+        if settled, !forceKeyframe, t0 - lastFrameAt < Self.heartbeat {
+            statsSkipped += 1
+            return
+        }
+        let image = frame.image
         guard let pb = pixelBuffer(from: image) else {
             statsDrops += 1
             if VideoBroadcaster.verbose { log("f#\(frameIndex) DROP: pixelBuffer conversion failed") }
@@ -291,9 +371,37 @@ final class VideoBroadcaster {
         if forceKeyframe {
             frameProps = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
         }
-        VTCompressionSessionEncodeFrame(session, imageBuffer: pb, presentationTimeStamp: pts,
-                                        duration: .invalid, frameProperties: frameProps,
-                                        sourceFrameRefcon: refcon, infoFlagsOut: nil)
+        let status = VTCompressionSessionEncodeFrame(session, imageBuffer: pb, presentationTimeStamp: pts,
+                                                     duration: .invalid, frameProperties: frameProps,
+                                                     sourceFrameRefcon: refcon, infoFlagsOut: nil)
+        if status != noErr {
+            // Rejected up front: the callback won't run, so release here.
+            Unmanaged<FrameMetric>.fromOpaque(refcon).release()
+            statsDrops += 1
+            recoverEncoder(status: status)
+        }
+    }
+
+    /// The system can take the hardware encoder away, e.g. when the runner
+    /// goes from the foreground to the background, and every later frame is
+    /// then rejected: viewers get an init segment and a black picture. Build
+    /// a new session (viewers get a fresh init segment and keyframe), at most
+    /// once a second, and keep retrying while it can't be created.
+    private var lastRecoverAt: CFTimeInterval = 0
+    private func recoverEncoder(status: OSStatus) {
+        guard !subscribers.isEmpty else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastRecoverAt >= 1.0 else { return }
+        lastRecoverAt = now
+        log("encoder lost (VT status=\(status)) — rebuilding")
+        stopEncoding()
+        startEncoding()
+        if timer == nil {
+            queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self, self.timer == nil else { return }
+                self.recoverEncoder(status: status)
+            }
+        }
     }
 
     /// Print rolling stats every ~5s of wall-clock. Cheap; called from the
@@ -302,18 +410,19 @@ final class VideoBroadcaster {
         let now = CACurrentMediaTime()
         if statsStartAt == 0 { statsStartAt = now; return }
         guard now - statsStartAt >= 5.0, statsFrames > 0 else { return }
+        let skipped = statsSkipped, still = idle
         let win = now - statsStartAt
         let n = Double(statsFrames)
         let avgCap = statsCaptureMs / n, avgPb = statsPixbufMs / n
         let avgEnc = statsEncodeMs / n,  avgMux = statsMuxMs / n
         let kbps = Double(statsBytes) * 8 / 1000 / win
-        log(String(format: "stats %.1fs: %d frames (%.1f fps), key=%d drop=%d — cap %.1fms · pb %.1fms · enc %.1fms · mux %.1fms · %.0f kbps",
-                   win, statsFrames, Double(statsFrames)/win, statsKeyframes, statsDrops,
-                   avgCap, avgPb, avgEnc, avgMux, kbps))
+        log(String(format: "stats %.1fs: %d frames (%.1f fps), key=%d drop=%d skip=%d%@ — cap %.1fms · pb %.1fms · enc %.1fms · mux %.1fms · %.0f kbps",
+                   win, statsFrames, Double(statsFrames)/win, statsKeyframes, statsDrops, skipped,
+                   still ? " (still)" : "", avgCap, avgPb, avgEnc, avgMux, kbps))
         statsStartAt = now
         statsFrames = 0; statsCaptureMs = 0; statsPixbufMs = 0
         statsEncodeMs = 0; statsMuxMs = 0; statsBytes = 0
-        statsKeyframes = 0; statsDrops = 0
+        statsKeyframes = 0; statsDrops = 0; statsSkipped = 0
     }
 
     /// Fan out a fragment. Any subscriber that hasn't been handshook yet gets
@@ -384,6 +493,7 @@ final class VideoBroadcaster {
                 if VideoBroadcaster.verbose {
                     self_.log("f#\(metric?.index ?? -1) DROP: VT status=\(status)")
                 }
+                if status == kVTInvalidSessionErr { self_.recoverEncoder(status: status) }
             }
             return
         }
