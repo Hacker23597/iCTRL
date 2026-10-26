@@ -575,6 +575,38 @@ All methods are JSON-RPC 2.0 (`POST /rpc`). Highlights:
 | **Device** | `device_info`, `home`, `lock`, `unlock`, `is_locked`, `wait` |
 | **Server** | `config` (remote access, `nearby_discovery`, `device_name`, sessions and revocation, `stop_server`), `reset`, `stream_ticket` |
 
+### Continuous single-finger paths
+
+`drag` accepts an optional `points` array to follow a polyline without lifting
+between waypoints. This supports drawing and dragging around corners. It is a
+single finger, not simultaneous multi-touch. Existing endpoint/ref calls are
+unchanged.
+
+```json
+{"method":"drag","params":{"points":[{"x":50,"y":200},{"x":150,"y":200},{"x":150,"y":300}],"duration":1.2}}
+```
+
+Coordinates are screen **points**, not screenshot pixels. Supply 2–64 finite,
+nonnegative, on-screen `{x,y}` points. Do not combine `points` with
+`from_x/from_y/to_x/to_y` or `from_ref/to_ref`. Total `duration` is 0.1–10 seconds
+(default 1), divided equally between segments; repeating a waypoint holds the
+finger there for that segment. Keep each segment at least one frame long
+(~17ms): the receiving app reads touches once per frame, so a shorter segment
+can merge a corner away. XCTest eases the finger between waypoints, so a corner
+may round off by 1–2 points, and very short segments (under ~50ms) stop a few
+points short of their corners. Runners that support it list `drag_path` in
+`device_info.capabilities`. All waypoints are validated before any touch is
+injected. The finger presses once at the first point and lifts once after the
+last point. A path that touches an anti-bot check with any
+waypoint is refused, like a drag that starts on one. Long paths get enough RPC
+time for the gesture and the settle check to finish.
+
+Run the validation/timing tests on a Mac with the Swift toolchain:
+
+```sh
+./Scripts/test-continuous-drag.sh
+```
+
 Notable behaviour:
 
 - **`page_source{visible_only, max_children}`** — on a recycling list (chat
