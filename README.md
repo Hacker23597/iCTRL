@@ -662,9 +662,27 @@ runner:
 - aligns the `.xctest` bundle id, re-signs inside out, and verifies that every
   embedded binary is signed before packaging.
 
-To publish a build, run `Scripts/package-release.sh`. It writes `release/` copies
-stripped of your provisioning profile (your name, team id and device UDIDs) and
-ad-hoc signed. Whoever installs them re-signs anyway.
+### Release builds
+
+To build the IPAs for a GitHub release, run:
+
+```bash
+make ipa UNSIGNED=1   # → release/iCTRL.ipa + release/iCTRLUITests-Runner.ipa
+```
+
+This mode needs no keychain, certificate or `Config/Local.xcconfig`. Xcode
+signing is off, and the runner is ad-hoc signed after the same post-processing:
+shim, icon, URL scheme, Bonjour type. `Scripts/package-release.sh` then checks
+that no provisioning profile or team id is left, and ad-hoc signs both apps
+into `release/`.
+
+Whoever installs the IPAs re-signs them (SideStore, `Scripts/sign-ipa.sh`).
+`UNSIGNED=1` is for publishing only; use the default signed `make ipa` for
+local debugging.
+
+`Scripts/package-release.sh` also works on its own. It turns a signed build into
+`release/` copies, stripped of your provisioning profile (your name, team id and
+device UDIDs) and ad-hoc signed.
 
 ## Project layout
 

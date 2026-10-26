@@ -19,6 +19,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="${1:-$REPO/release}"
 mkdir -p "$OUT_DIR"
+LOCAL_TEAM="$(sed -nE 's/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]]*([A-Z0-9]+).*/\1/p' \
+    "$REPO/Config/Local.xcconfig" 2>/dev/null | head -1 || true)"
 
 strip_one() {
     local ipa="$1" work app name team
@@ -27,7 +29,10 @@ strip_one() {
     app="$(find "$work/Payload" -maxdepth 1 -name '*.app' -type d | head -1)"
     name="$(basename "$ipa")"
     # The team the build was signed with — read before the signature is replaced.
-    team="$(codesign -dv "$app" 2>&1 | awk -F= '/^TeamIdentifier/ { print $2 }')"
+    # An unsigned (`make ipa UNSIGNED=1`) or ad-hoc build has none; fall back to
+    # the local signing config so the leftover check below still means something.
+    team="$( (codesign -dv "$app" 2>&1 || true) | awk -F= '/^TeamIdentifier/ && $2 != "not set" { print $2 }')"
+    [[ -n "$team" ]] || team="$LOCAL_TEAM"
 
     # Profiles anywhere in the bundle, not just the top level.
     find "$app" -name 'embedded.mobileprovision' -delete

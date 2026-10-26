@@ -2,7 +2,26 @@
 
 PROJECT       = iCTRL.xcodeproj
 SCHEME        = iCTRL
+
+# UNSIGNED=1 builds for publishing only (GitHub Releases): no keychain, no team,
+# no provisioning profile. The runner is ad-hoc signed and both IPAs go through
+# Scripts/package-release.sh into release/. Whoever installs them re-signs
+# (SideStore, Scripts/sign-ipa.sh). Local debugging keeps the signed default.
+UNSIGNED     ?=
+ifeq ($(UNSIGNED),1)
+# Own derived data, so a signed build's products (and their signatures) are
+# never picked up by an unsigned one, or the other way round.
+DERIVED_DATA  = build/unsigned
+SIGNING_DEPS  =
+# Bundle ids come from the committed defaults, not from a local override.
+BUNDLE_PREFIX = $(shell sed -nE 's/^ICTRL_BUNDLE_PREFIX[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/p' Config/Signing.xcconfig)
+SIGNING_FLAGS = CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
+                DEVELOPMENT_TEAM= ICTRL_BUNDLE_PREFIX=$(BUNDLE_PREFIX)
+else
 DERIVED_DATA  = build
+SIGNING_DEPS  = Config/Local.xcconfig
+SIGNING_FLAGS = -allowProvisioningUpdates
+endif
 BUILD_DIR     = $(DERIVED_DATA)/Build/Products/Debug-iphoneos
 
 MAIN_APP      = iCTRL.app
@@ -26,7 +45,7 @@ RUNNER_IPA    = iCTRLUITests-Runner.ipa
 Config/Local.xcconfig:
 	@./Scripts/setup-signing.sh
 
-$(PROJECT)/project.pbxproj: project.yml Config/Signing.xcconfig Config/Local.xcconfig
+$(PROJECT)/project.pbxproj: project.yml Config/Signing.xcconfig $(SIGNING_DEPS)
 	@command -v xcodegen >/dev/null || { echo "❌ xcodegen not found — brew install xcodegen"; exit 1; }
 	xcodegen generate --quiet
 
@@ -42,7 +61,7 @@ build:
 		-derivedDataPath $(DERIVED_DATA) \
 		-scheme $(SCHEME) \
 		-destination "generic/platform=iOS" \
-		-allowProvisioningUpdates \
+		$(SIGNING_FLAGS) \
 		ARCHS=arm64
 	@echo ""
 	@echo "✅ Build completed"
@@ -162,20 +181,26 @@ ipa: build
 	@# app — this reflects the Xcode project's automatic signing (team + cert),
 	@# so the re-sign can never drift from the build. Match by the cert's SHA-1 in
 	@# the keychain to pin the exact identity.
+	@# UNSIGNED=1 has no identity to read: sign ad-hoc, with no entitlements to keep.
 	@set -e; \
 	APP="$(BUILD_DIR)/$(RUNNER_APP)"; \
-	AUTH="$$(codesign -dvv "$$APP" 2>&1 | sed -n 's/^Authority=//p' | head -1)"; \
-	if [ -z "$$AUTH" ]; then echo "🔴 could not read signing identity from $$APP"; exit 1; fi; \
-	SHA="$$(security find-identity -v -p codesigning 2>/dev/null | grep -F "$$AUTH" | head -1 | awk '{print $$2}')"; \
-	IDENT="$${SHA:-$$AUTH}"; \
-	echo "   using: $$AUTH ($$IDENT)"; \
+	if [ "$(UNSIGNED)" = 1 ]; then \
+		IDENT=-; KEEP=; \
+		echo "   using: ad-hoc (UNSIGNED=1)"; \
+	else \
+		AUTH="$$(codesign -dvv "$$APP" 2>&1 | sed -n 's/^Authority=//p' | head -1)"; \
+		if [ -z "$$AUTH" ]; then echo "🔴 could not read signing identity from $$APP"; exit 1; fi; \
+		SHA="$$(security find-identity -v -p codesigning 2>/dev/null | grep -F "$$AUTH" | head -1 | awk '{print $$2}')"; \
+		IDENT="$${SHA:-$$AUTH}"; KEEP=--preserve-metadata=entitlements; \
+		echo "   using: $$AUTH ($$IDENT)"; \
+	fi; \
 	for dylib in "$$APP/Frameworks/"*.dylib; do \
 		[ -f "$$dylib" ] || continue; \
 		echo "   signing $$(basename "$$dylib")"; \
 		codesign --force --sign "$$IDENT" "$$dylib"; \
 	done; \
 	codesign --force --sign "$$IDENT" "$$APP/PlugIns/$(XCTEST_BUNDLE)"; \
-	codesign --force --sign "$$IDENT" --preserve-metadata=entitlements "$$APP"
+	codesign --force --sign "$$IDENT" $$KEEP "$$APP"
 	@# Everything dyld loads must carry a signature — an unsigned dylib in
 	@# Frameworks/ makes the runner die at launch with "mapped file has no
 	@# cdhash", which looks nothing like a signing problem from the device side.
@@ -212,19 +237,28 @@ ipa: build
 	@echo "  $(MAIN_IPA)  — Settings & control UI"
 	@echo "  $(RUNNER_IPA)  — XCTest automation engine"
 	@echo "════════════════════════════════════════"
+	@# The main app is still unsigned here; package-release.sh ad-hoc signs it
+	@# and checks both packages for a profile or team id before writing release/.
+	@if [ "$(UNSIGNED)" = 1 ]; then \
+		echo ""; echo "🚚 Packaging for release (UNSIGNED=1)..."; \
+		./Scripts/package-release.sh; \
+	fi
 
 # ──────────────────────────────────────────────
 clean:
-	rm -rf $(DERIVED_DATA)
+	@# All of build/, so both the signed and the UNSIGNED=1 derived data go.
+	rm -rf build
 	rm -f $(MAIN_IPA) $(RUNNER_IPA)
 	@echo "✅ Cleaned"
 
 help:
 	@echo "iCTRL Build System"
 	@echo ""
-	@echo "  make build   Build both apps with Xcode signing"
-	@echo "  make ipa     Build + package both IPAs"
-	@echo "  make clean   Remove build artifacts"
+	@echo "  make build              Build both apps with Xcode signing"
+	@echo "  make ipa                Build + package both IPAs (signed, for local use)"
+	@echo "  make ipa UNSIGNED=1     Release build: no keychain or team, ad-hoc signed,"
+	@echo "                          stripped into release/ (for GitHub Releases only)"
+	@echo "  make clean              Remove build artifacts"
 
 # The idevice xcframework is a 215MB release asset, not vendored (see
 # Scripts/fetch-idevice.sh). Fetch it on demand so a fresh clone builds.
